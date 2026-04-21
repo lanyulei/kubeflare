@@ -1,0 +1,82 @@
+service:
+  name: kubeflare
+  environment: production
+
+http:
+  address: ":8080"
+  read_timeout: 30s
+  read_header_timeout: 10s
+  write_timeout: 0s
+  idle_timeout: 90s
+  shutdown_timeout: 20s
+  drain_timeout: 5s
+  api_request_timeout: 10s
+  max_header_bytes: 1048576
+  allowed_origins:
+    - "*"
+  allow_headers:
+    - Authorization
+    - Content-Type
+    - X-Request-Id
+    - X-Kubeflare-Cluster
+  allow_methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - OPTIONS
+  readiness_timeout: 2s
+
+auth:
+  bootstrap_tokens:
+    change-me-admin-token:
+      subject: admin
+      roles:
+        - admin
+        - proxy
+
+database:
+  enabled: true
+  dsn: postgres://postgres:postgres@127.0.0.1:5432/kubeflare?sslmode=disable
+  max_open_conns: 40
+  max_idle_conns: 20
+  conn_max_lifetime: 30m
+  conn_max_idle_time: 10m
+  query_timeout: 5s
+  health_check_timeout: 2s
+
+redis:
+  enabled: true
+  address: 127.0.0.1:6379
+  db: 0
+  dial_timeout: 2s
+  read_timeout: 2s
+  write_timeout: 2s
+  pool_timeout: 4s
+  min_idle_conns: 4
+  max_idle_conns: 16
+  pool_size: 32
+  cache_ttl: 2m
+  health_check_timeout: 2s
+
+proxy:
+  default_cluster_id: ""
+  allowed_roles:
+    - admin
+    - proxy
+  cluster_cache_ttl: 30s
+  dial_timeout: 5s
+  tls_handshake_timeout: 5s
+  response_header_timeout: 30s
+  idle_conn_timeout: 90s
+  max_idle_conns: 256
+  max_idle_conns_per_host: 64
+  max_conns_per_host: 256
+  flush_interval: 200ms
+
+observability:
+  log_level: info
+  log_format: text
+  tracing:
+    enabled: false

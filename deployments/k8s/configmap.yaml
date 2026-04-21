@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubeflare-config
+data:
+  config.yaml: |
+    service:
+      name: kubeflare
+      environment: production
+    http:
+      address: ":8080"
+    auth:
+      bootstrap_tokens:
+        replace-me:
+          subject: admin
+          roles: ["admin", "proxy"]
+    database:
+      enabled: true
+      dsn: postgres://postgres:postgres@postgres:5432/kubeflare?sslmode=disable
+    redis:
+      enabled: true
+      address: redis:6379
