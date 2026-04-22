@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	stdErrors "errors"
 	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"gorm.io/gorm"
 
 	"github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
@@ -53,12 +55,9 @@ func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (domain.
 		TLSServerName:       strings.TrimSpace(req.TLSServerName),
 		SkipTLSVerify:       req.SkipTLSVerify,
 		Default:             req.Default,
-		Enabled:             req.Enabled || !req.Enabled && !req.Default,
+		Enabled:             boolValue(req.Enabled, true),
 		CreatedAt:           time.Now().UTC(),
 		UpdatedAt:           time.Now().UTC(),
-	}
-	if !req.Enabled {
-		cluster.Enabled = true
 	}
 
 	created, err := s.repo.Create(ctx, cluster)
@@ -74,8 +73,14 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 		return domain.Cluster{}, err
 	}
 
+	trimmedID := strings.TrimSpace(id)
+	existing, err := s.repo.Get(ctx, trimmedID)
+	if err != nil {
+		return domain.Cluster{}, mapRepositoryError(err, "cluster not found")
+	}
+
 	cluster := domain.Cluster{
-		ID:                  strings.TrimSpace(id),
+		ID:                  trimmedID,
 		Name:                strings.TrimSpace(req.Name),
 		APIEndpoint:         strings.TrimSpace(req.APIEndpoint),
 		UpstreamBearerToken: req.UpstreamBearerToken,
@@ -83,7 +88,7 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 		TLSServerName:       strings.TrimSpace(req.TLSServerName),
 		SkipTLSVerify:       req.SkipTLSVerify,
 		Default:             req.Default,
-		Enabled:             req.Enabled,
+		Enabled:             boolValue(req.Enabled, existing.Enabled),
 		UpdatedAt:           time.Now().UTC(),
 	}
 
@@ -96,10 +101,11 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
-	if err := s.repo.Delete(ctx, strings.TrimSpace(id)); err != nil {
+	trimmedID := strings.TrimSpace(id)
+	if err := s.repo.Delete(ctx, trimmedID); err != nil {
 		return mapRepositoryError(err, "cluster not found")
 	}
-	s.invalidate(id)
+	s.invalidate(trimmedID)
 	return nil
 }
 
@@ -114,11 +120,19 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 		return nil
 	}
 
-	if strings.Contains(strings.ToLower(err.Error()), "not found") {
+	if stdErrors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(strings.ToLower(err.Error()), "not found") {
 		return &sharedErrors.AppError{
 			Code:    sharedErrors.CodeNotFound,
 			Message: notFoundMessage,
 			Status:  404,
+			Err:     err,
+		}
+	}
+	if stdErrors.Is(err, gorm.ErrDuplicatedKey) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeConflict,
+			Message: "cluster already exists",
+			Status:  409,
 			Err:     err,
 		}
 	}
@@ -130,4 +144,11 @@ func newID() string {
 	var buf [12]byte
 	_, _ = rand.Read(buf[:])
 	return hex.EncodeToString(buf[:])
+}
+
+func boolValue(value *bool, defaultValue bool) bool {
+	if value == nil {
+		return defaultValue
+	}
+	return *value
 }

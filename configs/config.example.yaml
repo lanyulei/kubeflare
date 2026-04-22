@@ -3,7 +3,7 @@ service:
   environment: production
 
 http:
-  address: ":8080"
+  address: ":8000"
   read_timeout: 30s
   read_header_timeout: 10s
   write_timeout: 0s
@@ -13,7 +13,7 @@ http:
   api_request_timeout: 10s
   max_header_bytes: 1048576
   allowed_origins:
-    - "*"
+    - https://kubeflare.example.com
   allow_headers:
     - Authorization
     - Content-Type
@@ -29,16 +29,15 @@ http:
   readiness_timeout: 2s
 
 auth:
-  bootstrap_tokens:
-    change-me-admin-token:
-      subject: admin
-      roles:
-        - admin
-        - proxy
+  bootstrap_token: ${KUBEFLARE_BOOTSTRAP_TOKEN}
+  bootstrap_subject: admin
+  bootstrap_roles:
+    - admin
+    - proxy
 
 database:
   enabled: true
-  dsn: postgres://postgres:postgres@127.0.0.1:5432/kubeflare?sslmode=disable
+  dsn: postgres://kubeflare:${KUBEFLARE_DB_PASSWORD}@127.0.0.1:5432/kubeflare?sslmode=disable
   max_open_conns: 40
   max_idle_conns: 20
   conn_max_lifetime: 30m
@@ -49,6 +48,7 @@ database:
 redis:
   enabled: true
   address: 127.0.0.1:6379
+  password: ${KUBEFLARE_REDIS_PASSWORD}
   db: 0
   dial_timeout: 2s
   read_timeout: 2s
@@ -66,6 +66,7 @@ proxy:
     - admin
     - proxy
   cluster_cache_ttl: 30s
+  encryption_key: ${KUBEFLARE_PROXY_ENCRYPTION_KEY}
   dial_timeout: 5s
   tls_handshake_timeout: 5s
   response_header_timeout: 30s

@@ -13,6 +13,7 @@ import (
 
 	clusterdomain "github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	kubeproxyapp "github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
+	"github.com/lanyulei/kubeflare/internal/platform/secrets"
 )
 
 type CachedRegistry struct {
@@ -20,6 +21,7 @@ type CachedRegistry struct {
 	repo   clusterdomain.Repository
 	redis  *redis.Client
 	ttl    time.Duration
+	crypt  secrets.Encryptor
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -39,12 +41,19 @@ type redisTarget struct {
 	SkipTLSVerify       bool   `json:"skip_tls_verify"`
 }
 
-func NewCachedRegistry(logger *slog.Logger, repo clusterdomain.Repository, redisClient *redis.Client, ttl time.Duration) *CachedRegistry {
+func NewCachedRegistry(
+	logger *slog.Logger,
+	repo clusterdomain.Repository,
+	redisClient *redis.Client,
+	ttl time.Duration,
+	encryptor secrets.Encryptor,
+) *CachedRegistry {
 	return &CachedRegistry{
 		logger: logger,
 		repo:   repo,
 		redis:  redisClient,
 		ttl:    ttl,
+		crypt:  encryptor,
 		cache:  map[string]cacheEntry{},
 	}
 }
@@ -86,15 +95,29 @@ func (r *CachedRegistry) ResolveCluster(ctx context.Context, clusterID string) (
 }
 
 func (r *CachedRegistry) Invalidate(clusterIDs ...string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	validIDs := make([]string, 0, len(clusterIDs))
 
+	r.mu.Lock()
 	for _, clusterID := range clusterIDs {
+		if clusterID == "" {
+			continue
+		}
+
 		delete(r.cache, clusterID)
-		if r.redis != nil {
-			if err := r.redis.Del(context.Background(), redisKey(clusterID)).Err(); err != nil {
-				r.logger.Warn("delete cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", err))
-			}
+		validIDs = append(validIDs, clusterID)
+	}
+	r.mu.Unlock()
+
+	if r.redis == nil {
+		return
+	}
+
+	for _, clusterID := range validIDs {
+		deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := r.redis.Del(deleteCtx, redisKey(clusterID)).Err()
+		cancel()
+		if err != nil {
+			r.logger.Warn("delete cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", err))
 		}
 	}
 }
@@ -128,6 +151,14 @@ func (r *CachedRegistry) fromRedis(ctx context.Context, clusterID string) (kubep
 	payload, err := r.redis.Get(ctx, redisKey(clusterID)).Bytes()
 	if err != nil {
 		return kubeproxyapp.ClusterTarget{}, false
+	}
+
+	if r.crypt != nil {
+		decrypted, decryptErr := r.crypt.Decrypt(string(payload))
+		if decryptErr != nil {
+			return kubeproxyapp.ClusterTarget{}, false
+		}
+		payload = []byte(decrypted)
 	}
 
 	var stored redisTarget
@@ -167,7 +198,18 @@ func (r *CachedRegistry) saveRedis(ctx context.Context, clusterID string, target
 		return
 	}
 
-	_ = r.redis.Set(ctx, redisKey(clusterID), payload, r.ttl).Err()
+	if r.crypt != nil {
+		encrypted, encryptErr := r.crypt.Encrypt(string(payload))
+		if encryptErr != nil {
+			r.logger.Warn("encrypt cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", encryptErr))
+			return
+		}
+		payload = []byte(encrypted)
+	}
+
+	if err := r.redis.Set(ctx, redisKey(clusterID), payload, r.ttl).Err(); err != nil {
+		r.logger.Warn("store cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", err))
+	}
 }
 
 func redisKey(clusterID string) string {

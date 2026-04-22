@@ -37,16 +37,31 @@ func CORSGin(cfg CORSConfig) gin.HandlerFunc {
 }
 
 func applyCORS(header http.Header, cfg CORSConfig, origin string) {
-	if len(cfg.AllowedOrigins) == 0 {
+	if len(cfg.AllowedOrigins) == 0 || origin == "" {
 		return
 	}
 
-	allowedOrigin := "*"
+	addVaryHeader(header, "Origin")
+	addVaryHeader(header, "Access-Control-Request-Method")
+	addVaryHeader(header, "Access-Control-Request-Headers")
+
+	allowedOrigin := ""
 	for _, candidate := range cfg.AllowedOrigins {
-		if candidate == "*" || candidate == origin {
+		if candidate == "*" {
+			if cfg.AllowCredentials {
+				allowedOrigin = origin
+			} else {
+				allowedOrigin = candidate
+			}
+			break
+		}
+		if candidate == origin {
 			allowedOrigin = candidate
 			break
 		}
+	}
+	if allowedOrigin == "" {
+		return
 	}
 
 	header.Set("Access-Control-Allow-Origin", allowedOrigin)
@@ -55,4 +70,13 @@ func applyCORS(header http.Header, cfg CORSConfig, origin string) {
 	if cfg.AllowCredentials {
 		header.Set("Access-Control-Allow-Credentials", "true")
 	}
+}
+
+func addVaryHeader(header http.Header, value string) {
+	for _, existing := range header.Values("Vary") {
+		if existing == value {
+			return
+		}
+	}
+	header.Add("Vary", value)
 }

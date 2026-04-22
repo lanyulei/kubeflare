@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
@@ -34,7 +35,7 @@ import (
 func New(ctx context.Context, cfg config.Config) (*App, error) {
 	logger := logpkg.New(cfg.Observability)
 
-	traceShutdown, err := tracepkg.Setup(ctx, cfg.Observability.Tracing)
+	traceShutdown, err := tracepkg.Setup(ctx, cfg.Service.Name, cfg.Observability.Tracing)
 	if err != nil {
 		return nil, err
 	}
@@ -56,10 +57,22 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 
-	encryptor := secrets.NoopEncryptor{}
-	userRepo := iampostgres.NewUserRepository(gormDB)
-	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, encryptor)
-	clusterRegistry := application.NewCachedRegistry(logger, clusterRepo, redisClient, cfg.Proxy.ClusterCacheTTL)
+	var encryptor secrets.Encryptor = secrets.NoopEncryptor{}
+	if cfg.Proxy.EncryptionKey != "" {
+		encryptor, err = secrets.NewAESGCMEncryptor(cfg.Proxy.EncryptionKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	clusterCacheTTL := cfg.Proxy.ClusterCacheTTL
+	if clusterCacheTTL <= 0 {
+		clusterCacheTTL = cfg.Redis.CacheTTL
+	}
+
+	userRepo := iampostgres.NewUserRepository(gormDB, cfg.Database.QueryTimeout)
+	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, encryptor, cfg.Database.QueryTimeout)
+	clusterRegistry := application.NewCachedRegistry(logger, clusterRepo, redisClient, clusterCacheTTL, encryptor)
 
 	authenticator := middleware.NewStaticTokenAuthenticator(buildBootstrapPrincipals(cfg))
 	iamService := iamapplication.NewService(userRepo, validator)
@@ -86,7 +99,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		health.FuncChecker{
 			CheckName: "postgres",
 			CheckFunc: func(ctx context.Context) error {
-				return db.Ping(ctx, gormDB)
+				pingCtx, cancel := db.WithTimeout(ctx, cfg.Database.HealthCheckTimeout)
+				defer cancel()
+				return db.Ping(pingCtx, gormDB)
 			},
 		},
 		health.FuncChecker{
@@ -95,15 +110,23 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 				if redisClient == nil {
 					return nil
 				}
-				return redisClient.Ping(ctx).Err()
+				pingCtx, cancel := context.WithTimeout(ctx, cfg.Redis.HealthCheckTimeout)
+				defer cancel()
+				return redisClient.Ping(pingCtx).Err()
 			},
 		},
 	)
+
+	var pprofHandler http.Handler
+	if cfg.HTTP.EnablePprof {
+		pprofHandler = NewPprofHandler()
+	}
 
 	rootHandler := NewRootHandler(RootHandlerOptions{
 		LivezHandler:   healthManager.LiveHandler(),
 		ReadyzHandler:  healthManager.ReadyHandler(),
 		MetricsHandler: metricsRegistry.Handler(),
+		PprofHandler:   pprofHandler,
 		APIHandler:     apiHandler,
 		KAPIHandler:    proxyHandler,
 		KAPIsHandler:   proxyHandler,
@@ -125,6 +148,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		Health:     healthManager,
 		drainDelay: cfg.HTTP.DrainTimeout,
 		shutdowners: []func(context.Context) error{
+			func(context.Context) error {
+				transportPool.CloseIdleConnections()
+				return nil
+			},
 			traceShutdown,
 			func(context.Context) error { return cache.Close(redisClient) },
 			func(context.Context) error { return db.Close(gormDB) },
@@ -171,19 +198,27 @@ func newAPIHandler(
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
-		handler = http.TimeoutHandler(handler, cfg.HTTP.APIRequestTimeout, `{"code":"TIMEOUT","message":"request timed out"}`)
+		handler = middleware.TimeoutHTTP(cfg.HTTP.APIRequestTimeout, handler)
 	}
 	return handler, nil
 }
 
 func buildBootstrapPrincipals(cfg config.Config) map[string]middleware.Principal {
-	principals := make(map[string]middleware.Principal, len(cfg.Auth.BootstrapTokens))
+	principals := make(map[string]middleware.Principal, len(cfg.Auth.BootstrapTokens)+1)
 	for token, principal := range cfg.Auth.BootstrapTokens {
 		principals[token] = middleware.Principal{
 			Subject: principal.Subject,
 			Roles:   principal.Roles,
 		}
 	}
+
+	if token := strings.TrimSpace(cfg.Auth.BootstrapToken); token != "" {
+		principals[token] = middleware.Principal{
+			Subject: strings.TrimSpace(cfg.Auth.BootstrapSubject),
+			Roles:   append([]string(nil), cfg.Auth.BootstrapRoles...),
+		}
+	}
+
 	return principals
 }
 

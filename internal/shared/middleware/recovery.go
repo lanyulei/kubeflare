@@ -15,7 +15,12 @@ func RecoverHTTP(logger *slog.Logger, next http.Handler) http.Handler {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.Error("panic recovered", slog.Any("panic", recovered), slog.String("path", r.URL.Path))
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				requestID, _ := RequestIDFromContext(r.Context())
+				response.HTTPError(w, requestID, &sharedErrors.AppError{
+					Code:    sharedErrors.CodeInternal,
+					Message: "internal server error",
+					Status:  http.StatusInternalServerError,
+				})
 			}
 		}()
 		next.ServeHTTP(w, r)

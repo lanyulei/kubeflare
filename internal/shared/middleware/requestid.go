@@ -20,6 +20,7 @@ func RequestIDHTTP(next http.Handler) http.Handler {
 			requestID = newRequestID()
 		}
 
+		r.Header.Set(RequestIDHeader, requestID)
 		w.Header().Set(RequestIDHeader, requestID)
 		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))

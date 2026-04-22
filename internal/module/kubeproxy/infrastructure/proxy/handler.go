@@ -3,7 +3,6 @@ package proxy
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
+	"github.com/lanyulei/kubeflare/internal/shared/response"
 )
 
 type HandlerOptions struct {
@@ -27,19 +27,19 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := middleware.PrincipalFromContext(r.Context())
 		if !ok {
-			writeJSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", middleware.ErrUnauthorized)
+			writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", middleware.ErrUnauthorized)
 			return
 		}
 
 		clusterID, err := application.ResolveClusterID(r, opts.DefaultClusterID)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "CLUSTER_REQUIRED", err)
+			writeJSONError(w, r, http.StatusBadRequest, "CLUSTER_REQUIRED", err)
 			return
 		}
 
 		target, err := opts.Registry.ResolveCluster(r.Context(), clusterID)
 		if err != nil {
-			writeJSONError(w, http.StatusNotFound, "CLUSTER_NOT_FOUND", err)
+			writeJSONError(w, r, http.StatusNotFound, "CLUSTER_NOT_FOUND", err)
 			return
 		}
 
@@ -51,20 +51,20 @@ func NewHandler(opts HandlerOptions) http.Handler {
 					status = http.StatusUnauthorized
 					code = "UNAUTHORIZED"
 				}
-				writeJSONError(w, status, code, err)
+				writeJSONError(w, r, status, code, err)
 				return
 			}
 		}
 
 		rewrittenPath, err := application.RewritePath(r.URL.Path)
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "INVALID_PROXY_PATH", err)
+			writeJSONError(w, r, http.StatusBadRequest, "INVALID_PROXY_PATH", err)
 			return
 		}
 
 		transport, err := resolveTransport(opts, target)
 		if err != nil {
-			writeJSONError(w, http.StatusBadGateway, "INVALID_CLUSTER_TRANSPORT", err)
+			writeJSONError(w, r, http.StatusBadGateway, "INVALID_CLUSTER_TRANSPORT", err)
 			return
 		}
 
@@ -73,7 +73,7 @@ func NewHandler(opts HandlerOptions) http.Handler {
 		proxy.Transport = transport
 		proxy.FlushInterval = opts.FlushInterval
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-			writeJSONError(w, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", err)
+			writeJSONError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", err)
 		}
 		proxy.Director = func(req *http.Request) {
 			originalDirector(req)
@@ -102,16 +102,20 @@ func resolveTransport(opts HandlerOptions, target application.ClusterTarget) (ht
 	return http.DefaultTransport, nil
 }
 
-func writeJSONError(w http.ResponseWriter, status int, code string, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"code":    code,
-		"message": err.Error(),
-	})
+func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code string, err error) {
+	requestID, _ := middleware.RequestIDFromContext(r.Context())
+	response.HTTPStatusError(w, status, code, err.Error(), requestID)
 }
 
-func NewTransport(base http.Transport, target application.ClusterTarget) (http.RoundTripper, error) {
+func NewTransport(base *http.Transport, target application.ClusterTarget) (http.RoundTripper, error) {
+	if base == nil {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("default transport is not *http.Transport")
+		}
+		base = defaultTransport
+	}
+
 	transport := base.Clone()
 	if !target.SkipTLSVerify && target.CACertPEM == "" && target.TLSServerName == "" {
 		return transport, nil

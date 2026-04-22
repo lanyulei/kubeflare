@@ -8,7 +8,7 @@ type CreateClusterRequest struct {
 	TLSServerName       string `json:"tls_server_name"`
 	SkipTLSVerify       bool   `json:"skip_tls_verify"`
 	Default             bool   `json:"default"`
-	Enabled             bool   `json:"enabled"`
+	Enabled             *bool  `json:"enabled"`
 }
 
 type UpdateClusterRequest = CreateClusterRequest

@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
+	stdErrors "errors"
 	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"gorm.io/gorm"
 
 	"github.com/lanyulei/kubeflare/internal/module/iam/domain"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
@@ -40,11 +41,16 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest) (domain.Use
 		return domain.User{}, err
 	}
 
+	roles, err := normalizeRoles(req.Roles)
+	if err != nil {
+		return domain.User{}, err
+	}
+
 	return s.repo.Create(ctx, domain.User{
 		ID:        newID(),
 		Name:      strings.TrimSpace(req.Name),
 		Email:     strings.ToLower(strings.TrimSpace(req.Email)),
-		Roles:     trimSlice(req.Roles),
+		Roles:     roles,
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	})
@@ -55,11 +61,16 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateUserRequest) 
 		return domain.User{}, err
 	}
 
+	roles, err := normalizeRoles(req.Roles)
+	if err != nil {
+		return domain.User{}, err
+	}
+
 	user := domain.User{
 		ID:        strings.TrimSpace(id),
 		Name:      strings.TrimSpace(req.Name),
 		Email:     strings.ToLower(strings.TrimSpace(req.Email)),
-		Roles:     trimSlice(req.Roles),
+		Roles:     roles,
 		UpdatedAt: time.Now().UTC(),
 	}
 
@@ -82,11 +93,19 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 		return nil
 	}
 
-	if strings.Contains(strings.ToLower(err.Error()), "not found") {
+	if stdErrors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(strings.ToLower(err.Error()), "not found") {
 		return &sharedErrors.AppError{
 			Code:    sharedErrors.CodeNotFound,
 			Message: notFoundMessage,
 			Status:  404,
+			Err:     err,
+		}
+	}
+	if stdErrors.Is(err, gorm.ErrDuplicatedKey) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeConflict,
+			Message: "user already exists",
+			Status:  409,
 			Err:     err,
 		}
 	}
@@ -100,7 +119,7 @@ func newID() string {
 	return hex.EncodeToString(buf[:])
 }
 
-func trimSlice(values []string) []string {
+func normalizeRoles(values []string) ([]string, error) {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
@@ -109,9 +128,11 @@ func trimSlice(values []string) []string {
 		}
 	}
 	if len(out) == 0 {
-		return []string{"viewer"}
+		return nil, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeValidation,
+			Message: "roles must contain at least one non-empty value",
+			Status:  400,
+		}
 	}
-	return out
+	return out, nil
 }
-
-var errNotFound = errors.New("not found")

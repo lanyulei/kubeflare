@@ -51,6 +51,13 @@ func Ping(ctx context.Context, gormDB *gorm.DB) error {
 	return sqlDB.PingContext(ctx)
 }
 
+func WithTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func Close(gormDB *gorm.DB) error {
 	if gormDB == nil {
 		return nil

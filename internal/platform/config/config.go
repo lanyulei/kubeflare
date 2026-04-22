@@ -37,7 +37,10 @@ type HTTPConfig struct {
 }
 
 type AuthConfig struct {
-	BootstrapTokens map[string]BootstrapPrincipal `koanf:"bootstrap_tokens"`
+	BootstrapTokens  map[string]BootstrapPrincipal `koanf:"bootstrap_tokens"`
+	BootstrapToken   string                        `koanf:"bootstrap_token"`
+	BootstrapSubject string                        `koanf:"bootstrap_subject"`
+	BootstrapRoles   []string                      `koanf:"bootstrap_roles"`
 }
 
 type BootstrapPrincipal struct {
@@ -77,6 +80,7 @@ type ProxyConfig struct {
 	DefaultClusterID      string        `koanf:"default_cluster_id"`
 	AllowedRoles          []string      `koanf:"allowed_roles"`
 	ClusterCacheTTL       time.Duration `koanf:"cluster_cache_ttl"`
+	EncryptionKey         string        `koanf:"encryption_key"`
 	DialTimeout           time.Duration `koanf:"dial_timeout"`
 	TLSHandshakeTimeout   time.Duration `koanf:"tls_handshake_timeout"`
 	ResponseHeaderTimeout time.Duration `koanf:"response_header_timeout"`
@@ -146,6 +150,7 @@ func Default() Config {
 		Proxy: ProxyConfig{
 			AllowedRoles:          []string{"admin", "proxy"},
 			ClusterCacheTTL:       30 * time.Second,
+			EncryptionKey:         "",
 			DialTimeout:           5 * time.Second,
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,

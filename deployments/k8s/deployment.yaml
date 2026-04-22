@@ -12,6 +12,7 @@ spec:
       labels:
         app: kubeflare
     spec:
+      terminationGracePeriodSeconds: 30
       containers:
         - name: kubeflare
           image: kubeflare:latest
@@ -38,6 +39,26 @@ spec:
               value: "true"
             - name: KUBEFLARE_REDIS__ENABLED
               value: "true"
+            - name: KUBEFLARE_DATABASE__DSN
+              valueFrom:
+                secretKeyRef:
+                  name: kubeflare-secrets
+                  key: KUBEFLARE_DATABASE__DSN
+            - name: KUBEFLARE_AUTH__BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubeflare-secrets
+                  key: KUBEFLARE_AUTH__BOOTSTRAP_TOKEN
+            - name: KUBEFLARE_REDIS__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kubeflare-secrets
+                  key: KUBEFLARE_REDIS__PASSWORD
+            - name: KUBEFLARE_PROXY__ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kubeflare-secrets
+                  key: KUBEFLARE_PROXY__ENCRYPTION_KEY
           volumeMounts:
             - name: config
               mountPath: /etc/kubeflare

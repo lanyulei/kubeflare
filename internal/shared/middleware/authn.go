@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -49,13 +48,15 @@ func AuthenticateHTTP(authenticator Authenticator, next http.Handler) http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok {
-			writeAuthError(w, ErrUnauthorized)
+			requestID, _ := RequestIDFromContext(r.Context())
+			writeAuthError(w, requestID, ErrUnauthorized)
 			return
 		}
 
 		principal, err := authenticator.Authenticate(r.Context(), token)
 		if err != nil {
-			writeAuthError(w, err)
+			requestID, _ := RequestIDFromContext(r.Context())
+			writeAuthError(w, requestID, err)
 			return
 		}
 
@@ -143,11 +144,11 @@ func bearerToken(header string) (string, bool) {
 	return token, token != ""
 }
 
-func writeAuthError(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"code":    "UNAUTHORIZED",
-		"message": err.Error(),
+func writeAuthError(w http.ResponseWriter, requestID string, err error) {
+	response.HTTPError(w, requestID, &sharedErrors.AppError{
+		Code:    sharedErrors.CodeUnauthorized,
+		Message: err.Error(),
+		Status:  http.StatusUnauthorized,
+		Err:     err,
 	})
 }

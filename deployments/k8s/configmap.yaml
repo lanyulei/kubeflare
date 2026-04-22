@@ -9,14 +9,13 @@ data:
       environment: production
     http:
       address: ":8080"
+      allowed_origins:
+        - https://kubeflare.example.com
     auth:
-      bootstrap_tokens:
-        replace-me:
-          subject: admin
-          roles: ["admin", "proxy"]
+      bootstrap_subject: admin
+      bootstrap_roles: ["admin", "proxy"]
     database:
       enabled: true
-      dsn: postgres://postgres:postgres@postgres:5432/kubeflare?sslmode=disable
     redis:
       enabled: true
       address: redis:6379

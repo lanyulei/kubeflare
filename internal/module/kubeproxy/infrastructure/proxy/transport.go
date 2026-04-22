@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"sync"
@@ -11,13 +13,13 @@ import (
 )
 
 type TransportPool struct {
-	base  http.Transport
+	base  *http.Transport
 	cache sync.Map
 }
 
 func NewTransportPool(cfg configpkg.ProxyConfig) *TransportPool {
 	return &TransportPool{
-		base: http.Transport{
+		base: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     true,
 			DialContext:           (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -32,7 +34,7 @@ func NewTransportPool(cfg configpkg.ProxyConfig) *TransportPool {
 }
 
 func (p *TransportPool) For(target application.ClusterTarget) (http.RoundTripper, error) {
-	key := target.ID + "|" + target.BaseURL.Host + "|" + target.TLSServerName
+	key := transportCacheKey(target)
 	if transport, ok := p.cache.Load(key); ok {
 		return transport.(http.RoundTripper), nil
 	}
@@ -43,4 +45,30 @@ func (p *TransportPool) For(target application.ClusterTarget) (http.RoundTripper
 	}
 	p.cache.Store(key, transport)
 	return transport, nil
+}
+
+func transportCacheKey(target application.ClusterTarget) string {
+	certHash := sha256.Sum256([]byte(target.CACertPEM))
+	return target.ID + "|" + target.BaseURL.Host + "|" + target.TLSServerName + "|" + hex.EncodeToString(certHash[:]) + "|" + boolString(target.SkipTLSVerify)
+}
+
+func boolString(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+func (p *TransportPool) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+
+	p.base.CloseIdleConnections()
+	p.cache.Range(func(_, value any) bool {
+		if transport, ok := value.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+		return true
+	})
 }
