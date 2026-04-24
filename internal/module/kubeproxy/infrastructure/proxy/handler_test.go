@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,7 +25,7 @@ func TestHandlerProxiesKAPIRequests(t *testing.T) {
 	var seenUser string
 
 	handler := middleware.AuthenticateHTTP(
-		middleware.NewStaticTokenAuthenticator(map[string]middleware.Principal{
+		testAuthenticator(map[string]middleware.Principal{
 			"proxy-token": {Subject: "user-1", Roles: []string{"proxy"}},
 		}),
 		NewHandler(HandlerOptions{
@@ -75,7 +76,7 @@ func TestHandlerRejectsPrincipalWithoutProxyRole(t *testing.T) {
 	}
 
 	handler := middleware.AuthenticateHTTP(
-		middleware.NewStaticTokenAuthenticator(map[string]middleware.Principal{
+		testAuthenticator(map[string]middleware.Principal{
 			"user-token": {Subject: "user-2", Roles: []string{"viewer"}},
 		}),
 		NewHandler(HandlerOptions{
@@ -98,8 +99,58 @@ func TestHandlerRejectsPrincipalWithoutProxyRole(t *testing.T) {
 	}
 }
 
+func TestHandlerAllowsIsAdminPrincipalWithoutProxyRole(t *testing.T) {
+	t.Parallel()
+
+	targetURL, err := url.Parse("https://cluster.example.com")
+	if err != nil {
+		t.Fatalf("url.Parse returned error: %v", err)
+	}
+
+	handler := middleware.AuthenticateHTTP(
+		testAuthenticator(map[string]middleware.Principal{
+			"admin-token": {Subject: "user-3", Roles: []string{"viewer"}, IsAdmin: true},
+		}),
+		NewHandler(HandlerOptions{
+			DefaultClusterID: "prod",
+			Registry: application.StaticClusterRegistry(map[string]application.ClusterTarget{
+				"prod": {ID: "prod", BaseURL: *targetURL},
+			}),
+			Authorizer: application.RoleAuthorizer{AllowedRoles: []string{"proxy", "admin"}},
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			}),
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/kapi/v1/nodes", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status code %d", rr.Code)
+	}
+}
+
 type roundTripFunc func(req *http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type testAuthenticator map[string]middleware.Principal
+
+func (a testAuthenticator) Authenticate(_ context.Context, token string) (middleware.Principal, error) {
+	principal, ok := a[token]
+	if !ok {
+		return middleware.Principal{}, middleware.ErrUnauthorized
+	}
+	return principal, nil
 }

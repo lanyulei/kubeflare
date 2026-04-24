@@ -1,7 +1,9 @@
 package errors
 
+import "strconv"
+
 type AppError struct {
-	Code    string `json:"code"`
+	Code    int    `json:"code"`
 	Message string `json:"message"`
 	Status  int    `json:"-"`
 	Err     error  `json:"-"`
@@ -14,7 +16,7 @@ func (e *AppError) Error() string {
 	if e.Err != nil {
 		return e.Err.Error()
 	}
-	return e.Code
+	return strconv.Itoa(e.Code)
 }
 
 func (e *AppError) Unwrap() error {

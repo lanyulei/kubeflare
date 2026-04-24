@@ -28,11 +28,31 @@ func Validate(cfg Config) error {
 	if cfg.Redis.Enabled && cfg.Redis.Address == "" {
 		return errors.New("redis.address is required when redis is enabled")
 	}
-	if cfg.Auth.BootstrapToken != "" && cfg.Auth.BootstrapSubject == "" {
-		return errors.New("auth.bootstrap_subject is required when auth.bootstrap_token is set")
+	if cfg.Auth.TokenTTL < 0 {
+		return errors.New("auth.token_ttl must not be negative")
 	}
-	if cfg.Auth.BootstrapToken != "" && len(cfg.Auth.BootstrapRoles) == 0 {
-		return errors.New("auth.bootstrap_roles must not be empty when auth.bootstrap_token is set")
+	if cfg.Auth.RefreshTokenTTL < 0 {
+		return errors.New("auth.refresh_token_ttl must not be negative")
+	}
+	if cfg.Auth.MaxFailedAttempts < 0 {
+		return errors.New("auth.max_failed_attempts must not be negative")
+	}
+	if cfg.Auth.LockoutDuration < 0 {
+		return errors.New("auth.lockout_duration must not be negative")
+	}
+	if cfg.Auth.CaptchaFailureTrigger < 0 {
+		return errors.New("auth.captcha_failure_trigger must not be negative")
+	}
+	if cfg.Auth.CaptchaTTL < 0 {
+		return errors.New("auth.captcha_ttl must not be negative")
+	}
+	if cfg.Auth.SigningKey == "" && cfg.Proxy.EncryptionKey == "" {
+		return errors.New("auth.signing_key or proxy.encryption_key is required")
+	}
+	if cfg.Auth.OIDC.Enabled {
+		if cfg.Auth.OIDC.IssuerURL == "" || cfg.Auth.OIDC.ClientID == "" || cfg.Auth.OIDC.ClientSecret == "" || cfg.Auth.OIDC.RedirectURL == "" {
+			return errors.New("auth.oidc issuer_url, client_id, client_secret, and redirect_url are required when oidc is enabled")
+		}
 	}
 	if len(cfg.Proxy.AllowedRoles) == 0 {
 		return fmt.Errorf("proxy.allowed_roles must not be empty")

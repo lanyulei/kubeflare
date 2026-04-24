@@ -122,7 +122,7 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 
 	if stdErrors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(strings.ToLower(err.Error()), "not found") {
 		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeNotFound,
+			Code:    sharedErrors.CodeClusterNotFound,
 			Message: notFoundMessage,
 			Status:  404,
 			Err:     err,
@@ -130,7 +130,7 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 	}
 	if stdErrors.Is(err, gorm.ErrDuplicatedKey) {
 		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeConflict,
+			Code:    sharedErrors.CodeClusterAlreadyExists,
 			Message: "cluster already exists",
 			Status:  409,
 			Err:     err,

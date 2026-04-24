@@ -15,7 +15,7 @@ func TestRewritePath(t *testing.T) {
 		{name: "rewrite kapi child", input: "/kapi/v1/pods", want: "/api/v1/pods"},
 		{name: "rewrite kapis root", input: "/kapis", want: "/apis"},
 		{name: "rewrite kapis child", input: "/kapis/apps/v1/deployments", want: "/apis/apps/v1/deployments"},
-		{name: "unsupported prefix", input: "/api/v1/users", wantErr: true},
+		{name: "unsupported prefix", input: "/api/v1/user", wantErr: true},
 	}
 
 	for _, tc := range testCases {

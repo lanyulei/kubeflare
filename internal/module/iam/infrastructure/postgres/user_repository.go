@@ -18,17 +18,40 @@ type UserRepository struct {
 }
 
 type userRecord struct {
-	ID        string         `gorm:"primaryKey;size:32"`
-	Name      string         `gorm:"size:64;not null"`
-	Email     string         `gorm:"size:255;not null"`
-	Roles     string         `gorm:"type:text;not null"`
-	CreatedAt time.Time      `gorm:"not null"`
-	UpdatedAt time.Time      `gorm:"not null"`
-	DeletedAt gorm.DeletedAt `gorm:"index"`
+	ID         int64          `gorm:"primaryKey;autoIncrement"`
+	LegacyID   *string        `gorm:"size:32"`
+	Username   string         `gorm:"size:64;not null"`
+	Nickname   string         `gorm:"size:64;not null"`
+	Password   string         `gorm:"size:255;not null"`
+	Email      string         `gorm:"size:255;not null;default:''"`
+	Phone      string         `gorm:"size:32;not null;default:''"`
+	Avatar     string         `gorm:"size:512;not null;default:''"`
+	IsAdmin    bool           `gorm:"not null;default:false"`
+	Status     int            `gorm:"not null;default:1"`
+	Roles      string         `gorm:"type:text;not null;default:'user'"`
+	MFAEnabled bool           `gorm:"not null;default:false"`
+	MFASecret  string         `gorm:"size:512;not null;default:''"`
+	CreatedAt  time.Time      `gorm:"not null"`
+	UpdatedAt  time.Time      `gorm:"not null"`
+	DeletedAt  gorm.DeletedAt `gorm:"index"`
+}
+
+type externalIdentityRecord struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement"`
+	UserID    int64     `gorm:"not null;index"`
+	Provider  string    `gorm:"size:255;not null;index:idx_iam_external_identities_provider_subject,unique"`
+	Subject   string    `gorm:"size:255;not null;index:idx_iam_external_identities_provider_subject,unique"`
+	Email     string    `gorm:"size:255;not null;default:''"`
+	CreatedAt time.Time `gorm:"not null"`
+	UpdatedAt time.Time `gorm:"not null"`
 }
 
 func (userRecord) TableName() string {
 	return "iam_users"
+}
+
+func (externalIdentityRecord) TableName() string {
+	return "iam_external_identities"
 }
 
 func NewUserRepository(db *gorm.DB, timeout time.Duration) *UserRepository {
@@ -39,11 +62,12 @@ func (r *UserRepository) List(ctx context.Context) ([]domain.User, error) {
 	if r.db == nil {
 		return []domain.User{}, nil
 	}
+
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	var records []userRecord
-	if err := r.db.WithContext(queryCtx).Order("created_at DESC").Find(&records).Error; err != nil {
+	if err := r.db.WithContext(queryCtx).Order("id DESC").Find(&records).Error; err != nil {
 		return nil, err
 	}
 
@@ -54,10 +78,11 @@ func (r *UserRepository) List(ctx context.Context) ([]domain.User, error) {
 	return users, nil
 }
 
-func (r *UserRepository) Get(ctx context.Context, id string) (domain.User, error) {
+func (r *UserRepository) Get(ctx context.Context, id int64) (domain.User, error) {
 	if r.db == nil {
 		return domain.User{}, errors.New("user not found")
 	}
+
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -68,10 +93,41 @@ func (r *UserRepository) Get(ctx context.Context, id string) (domain.User, error
 	return toDomainUser(record), nil
 }
 
+func (r *UserRepository) GetByLegacyID(ctx context.Context, legacyID string) (domain.User, error) {
+	if r.db == nil {
+		return domain.User{}, errors.New("user not found")
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record userRecord
+	if err := r.db.WithContext(queryCtx).First(&record, "legacy_id = ?", legacyID).Error; err != nil {
+		return domain.User{}, err
+	}
+	return toDomainUser(record), nil
+}
+
+func (r *UserRepository) GetByUsername(ctx context.Context, username string) (domain.User, error) {
+	if r.db == nil {
+		return domain.User{}, errors.New("user not found")
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record userRecord
+	if err := r.db.WithContext(queryCtx).First(&record, "username = ?", username).Error; err != nil {
+		return domain.User{}, err
+	}
+	return toDomainUser(record), nil
+}
+
 func (r *UserRepository) Create(ctx context.Context, user domain.User) (domain.User, error) {
 	if r.db == nil {
 		return user, nil
 	}
+
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -86,6 +142,7 @@ func (r *UserRepository) Update(ctx context.Context, user domain.User) (domain.U
 	if r.db == nil {
 		return user, nil
 	}
+
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -94,20 +151,30 @@ func (r *UserRepository) Update(ctx context.Context, user domain.User) (domain.U
 		return domain.User{}, err
 	}
 
-	record.Name = user.Name
+	record.Username = user.Username
+	record.Nickname = user.Nickname
+	record.Password = user.Password
 	record.Email = user.Email
+	record.Phone = user.Phone
+	record.Avatar = user.Avatar
+	record.IsAdmin = user.IsAdmin
+	record.Status = user.Status
 	record.Roles = strings.Join(user.Roles, ",")
+	record.MFAEnabled = user.MFAEnabled
+	record.MFASecret = user.MFASecret
 	record.UpdatedAt = user.UpdatedAt
+
 	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
 		return domain.User{}, err
 	}
 	return toDomainUser(record), nil
 }
 
-func (r *UserRepository) Delete(ctx context.Context, id string) error {
+func (r *UserRepository) Delete(ctx context.Context, id int64) error {
 	if r.db == nil {
 		return nil
 	}
+
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -115,30 +182,133 @@ func (r *UserRepository) Delete(ctx context.Context, id string) error {
 	return deleteResultError(result.Error, result.RowsAffected)
 }
 
-func toDomainUser(record userRecord) domain.User {
-	roles := strings.Split(record.Roles, ",")
-	if record.Roles == "" {
-		roles = nil
+func (r *UserRepository) GetExternalIdentity(ctx context.Context, provider string, subject string) (domain.ExternalIdentity, error) {
+	if r.db == nil {
+		return domain.ExternalIdentity{}, errors.New("external identity not found")
 	}
 
-	return domain.User{
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record externalIdentityRecord
+	if err := r.db.WithContext(queryCtx).First(&record, "provider = ? AND subject = ?", provider, subject).Error; err != nil {
+		return domain.ExternalIdentity{}, err
+	}
+	return toDomainExternalIdentity(record), nil
+}
+
+func (r *UserRepository) CreateExternalIdentity(ctx context.Context, identity domain.ExternalIdentity) error {
+	if r.db == nil {
+		return nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	record := fromDomainExternalIdentity(identity)
+	return r.db.WithContext(queryCtx).Create(&record).Error
+}
+
+func (r *UserRepository) CreateWithExternalIdentity(ctx context.Context, user domain.User, identity domain.ExternalIdentity) (domain.User, error) {
+	if r.db == nil {
+		return user, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var createdUser domain.User
+	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
+		userRecord := fromDomainUser(user)
+		if err := tx.Create(&userRecord).Error; err != nil {
+			return err
+		}
+		createdUser = toDomainUser(userRecord)
+		identity.UserID = createdUser.ID
+		identityRecord := fromDomainExternalIdentity(identity)
+		return tx.Create(&identityRecord).Error
+	})
+	if err != nil {
+		return domain.User{}, err
+	}
+	return createdUser, nil
+}
+
+func toDomainUser(record userRecord) domain.User {
+	roles := []string(nil)
+	if strings.TrimSpace(record.Roles) != "" {
+		roles = strings.Split(record.Roles, ",")
+	}
+
+	user := domain.User{
+		ID:         record.ID,
+		LegacyID:   record.LegacyID,
+		Username:   record.Username,
+		Nickname:   record.Nickname,
+		Password:   record.Password,
+		Email:      record.Email,
+		Phone:      record.Phone,
+		Avatar:     record.Avatar,
+		IsAdmin:    record.IsAdmin,
+		Status:     record.Status,
+		Roles:      roles,
+		MFAEnabled: record.MFAEnabled,
+		MFASecret:  record.MFASecret,
+		CreatedAt:  record.CreatedAt,
+		UpdatedAt:  record.UpdatedAt,
+	}
+	if record.DeletedAt.Valid {
+		deletedAt := record.DeletedAt.Time
+		user.DeletedAt = &deletedAt
+	}
+	return user
+}
+
+func fromDomainUser(user domain.User) userRecord {
+	record := userRecord{
+		ID:         user.ID,
+		LegacyID:   user.LegacyID,
+		Username:   user.Username,
+		Nickname:   user.Nickname,
+		Password:   user.Password,
+		Email:      user.Email,
+		Phone:      user.Phone,
+		Avatar:     user.Avatar,
+		IsAdmin:    user.IsAdmin,
+		Status:     user.Status,
+		Roles:      strings.Join(user.Roles, ","),
+		MFAEnabled: user.MFAEnabled,
+		MFASecret:  user.MFASecret,
+		CreatedAt:  user.CreatedAt,
+		UpdatedAt:  user.UpdatedAt,
+	}
+	if user.DeletedAt != nil {
+		record.DeletedAt = gorm.DeletedAt{Time: *user.DeletedAt, Valid: true}
+	}
+	return record
+}
+
+func toDomainExternalIdentity(record externalIdentityRecord) domain.ExternalIdentity {
+	return domain.ExternalIdentity{
 		ID:        record.ID,
-		Name:      record.Name,
+		UserID:    record.UserID,
+		Provider:  record.Provider,
+		Subject:   record.Subject,
 		Email:     record.Email,
-		Roles:     roles,
 		CreatedAt: record.CreatedAt,
 		UpdatedAt: record.UpdatedAt,
 	}
 }
 
-func fromDomainUser(user domain.User) userRecord {
-	return userRecord{
-		ID:        user.ID,
-		Name:      user.Name,
-		Email:     user.Email,
-		Roles:     strings.Join(user.Roles, ","),
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
+func fromDomainExternalIdentity(identity domain.ExternalIdentity) externalIdentityRecord {
+	return externalIdentityRecord{
+		ID:        identity.ID,
+		UserID:    identity.UserID,
+		Provider:  identity.Provider,
+		Subject:   identity.Subject,
+		Email:     identity.Email,
+		CreatedAt: identity.CreatedAt,
+		UpdatedAt: identity.UpdatedAt,
 	}
 }
 

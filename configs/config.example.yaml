@@ -19,6 +19,7 @@ http:
     - Content-Type
     - X-Request-Id
     - X-Kubeflare-Cluster
+    - X-Kubeflare-CSRF
   allow_methods:
     - GET
     - POST
@@ -29,11 +30,25 @@ http:
   readiness_timeout: 2s
 
 auth:
-  bootstrap_token: ${KUBEFLARE_BOOTSTRAP_TOKEN}
-  bootstrap_subject: admin
-  bootstrap_roles:
-    - admin
-    - proxy
+  signing_key: ${KUBEFLARE_AUTH_SIGNING_KEY}
+  token_ttl: 24h
+  refresh_token_ttl: 168h
+  max_failed_attempts: 5
+  lockout_duration: 15m
+  captcha_failure_trigger: 3
+  captcha_ttl: 5m
+  cookie_secure: true
+  cookie_domain: ""
+  oidc:
+    enabled: false
+    issuer_url: ""
+    client_id: ""
+    client_secret: ""
+    redirect_url: ""
+    scopes:
+      - openid
+      - profile
+      - email
 
 database:
   enabled: true

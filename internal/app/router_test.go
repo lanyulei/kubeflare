@@ -42,7 +42,7 @@ func TestNewRootHandlerRoutesRequestsByPrefix(t *testing.T) {
 		{path: "/livez", want: http.StatusNoContent},
 		{path: "/readyz", want: http.StatusNoContent},
 		{path: "/metrics", want: http.StatusOK, body: "metrics"},
-		{path: "/api/v1/users", want: http.StatusAccepted, body: "api"},
+		{path: "/api/v1/user", want: http.StatusAccepted, body: "api"},
 		{path: "/kapi/v1/pods", want: http.StatusCreated, body: "kapi"},
 		{path: "/kapis/apps/v1/deployments", want: http.StatusOK, body: "kapis"},
 	}

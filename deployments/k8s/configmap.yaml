@@ -11,9 +11,6 @@ data:
       address: ":8080"
       allowed_origins:
         - https://kubeflare.example.com
-    auth:
-      bootstrap_subject: admin
-      bootstrap_roles: ["admin", "proxy"]
     database:
       enabled: true
     redis:

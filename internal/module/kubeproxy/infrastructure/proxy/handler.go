@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
+	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 	"github.com/lanyulei/kubeflare/internal/shared/response"
 )
@@ -27,29 +28,29 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := middleware.PrincipalFromContext(r.Context())
 		if !ok {
-			writeJSONError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", middleware.ErrUnauthorized)
+			writeJSONError(w, r, http.StatusUnauthorized, sharedErrors.CodeUnauthorized, middleware.ErrUnauthorized)
 			return
 		}
 
 		clusterID, err := application.ResolveClusterID(r, opts.DefaultClusterID)
 		if err != nil {
-			writeJSONError(w, r, http.StatusBadRequest, "CLUSTER_REQUIRED", err)
+			writeJSONError(w, r, http.StatusBadRequest, sharedErrors.CodeClusterRequired, err)
 			return
 		}
 
 		target, err := opts.Registry.ResolveCluster(r.Context(), clusterID)
 		if err != nil {
-			writeJSONError(w, r, http.StatusNotFound, "CLUSTER_NOT_FOUND", err)
+			writeJSONError(w, r, http.StatusNotFound, sharedErrors.CodeClusterNotFound, err)
 			return
 		}
 
 		if opts.Authorizer != nil {
 			if err := opts.Authorizer.AuthorizeProxyRequest(r.Context(), principal, clusterID, r); err != nil {
 				status := http.StatusForbidden
-				code := "FORBIDDEN"
+				code := sharedErrors.CodeForbidden
 				if errors.Is(err, middleware.ErrUnauthorized) {
 					status = http.StatusUnauthorized
-					code = "UNAUTHORIZED"
+					code = sharedErrors.CodeUnauthorized
 				}
 				writeJSONError(w, r, status, code, err)
 				return
@@ -58,13 +59,13 @@ func NewHandler(opts HandlerOptions) http.Handler {
 
 		rewrittenPath, err := application.RewritePath(r.URL.Path)
 		if err != nil {
-			writeJSONError(w, r, http.StatusBadRequest, "INVALID_PROXY_PATH", err)
+			writeJSONError(w, r, http.StatusBadRequest, sharedErrors.CodeInvalidProxyPath, err)
 			return
 		}
 
 		transport, err := resolveTransport(opts, target)
 		if err != nil {
-			writeJSONError(w, r, http.StatusBadGateway, "INVALID_CLUSTER_TRANSPORT", err)
+			writeJSONError(w, r, http.StatusBadGateway, sharedErrors.CodeInvalidClusterTransport, err)
 			return
 		}
 
@@ -73,7 +74,7 @@ func NewHandler(opts HandlerOptions) http.Handler {
 		proxy.Transport = transport
 		proxy.FlushInterval = opts.FlushInterval
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-			writeJSONError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", err)
+			writeJSONError(w, r, http.StatusBadGateway, sharedErrors.CodeUpstreamUnavailable, err)
 		}
 		proxy.Director = func(req *http.Request) {
 			originalDirector(req)
@@ -102,7 +103,7 @@ func resolveTransport(opts HandlerOptions, target application.ClusterTarget) (ht
 	return http.DefaultTransport, nil
 }
 
-func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code string, err error) {
+func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code int, err error) {
 	requestID, _ := middleware.RequestIDFromContext(r.Context())
 	response.HTTPStatusError(w, status, code, err.Error(), requestID)
 }

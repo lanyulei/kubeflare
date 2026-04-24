@@ -16,7 +16,7 @@ func HTTPError(w http.ResponseWriter, requestID string, err error) {
 	})
 }
 
-func HTTPStatusError(w http.ResponseWriter, status int, code, message, requestID string) {
+func HTTPStatusError(w http.ResponseWriter, status int, code int, message, requestID string) {
 	WriteHTTPEnvelope(w, status, Envelope{
 		Code:      code,
 		Message:   message,

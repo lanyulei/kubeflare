@@ -67,8 +67,6 @@ func envKeyToPath(key string) string {
 
 func normalizeEnvValue(path string, value string) interface{} {
 	switch {
-	case path == "auth.bootstrap_roles":
-		return splitEnvList(value)
 	case path == "http.trusted_proxies":
 		return splitEnvList(value)
 	case path == "http.allowed_origins":
@@ -78,6 +76,8 @@ func normalizeEnvValue(path string, value string) interface{} {
 	case path == "http.allow_methods":
 		return splitEnvList(value)
 	case path == "proxy.allowed_roles":
+		return splitEnvList(value)
+	case path == "auth.oidc.scopes":
 		return splitEnvList(value)
 	case strings.HasSuffix(path, ".roles"):
 		return splitEnvList(value)

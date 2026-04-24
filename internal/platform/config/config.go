@@ -37,15 +37,25 @@ type HTTPConfig struct {
 }
 
 type AuthConfig struct {
-	BootstrapTokens  map[string]BootstrapPrincipal `koanf:"bootstrap_tokens"`
-	BootstrapToken   string                        `koanf:"bootstrap_token"`
-	BootstrapSubject string                        `koanf:"bootstrap_subject"`
-	BootstrapRoles   []string                      `koanf:"bootstrap_roles"`
+	SigningKey            string        `koanf:"signing_key"`
+	TokenTTL              time.Duration `koanf:"token_ttl"`
+	RefreshTokenTTL       time.Duration `koanf:"refresh_token_ttl"`
+	MaxFailedAttempts     int           `koanf:"max_failed_attempts"`
+	LockoutDuration       time.Duration `koanf:"lockout_duration"`
+	CaptchaFailureTrigger int           `koanf:"captcha_failure_trigger"`
+	CaptchaTTL            time.Duration `koanf:"captcha_ttl"`
+	CookieSecure          bool          `koanf:"cookie_secure"`
+	CookieDomain          string        `koanf:"cookie_domain"`
+	OIDC                  OIDCConfig    `koanf:"oidc"`
 }
 
-type BootstrapPrincipal struct {
-	Subject string   `koanf:"subject"`
-	Roles   []string `koanf:"roles"`
+type OIDCConfig struct {
+	Enabled      bool     `koanf:"enabled"`
+	IssuerURL    string   `koanf:"issuer_url"`
+	ClientID     string   `koanf:"client_id"`
+	ClientSecret string   `koanf:"client_secret"`
+	RedirectURL  string   `koanf:"redirect_url"`
+	Scopes       []string `koanf:"scopes"`
 }
 
 type DatabaseConfig struct {
@@ -123,9 +133,21 @@ func Default() Config {
 				"Content-Type",
 				"X-Request-Id",
 				"X-Kubeflare-Cluster",
+				"X-Kubeflare-CSRF",
 			},
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 			ReadinessTimeout: 2 * time.Second,
+		},
+		Auth: AuthConfig{
+			TokenTTL:              24 * time.Hour,
+			RefreshTokenTTL:       7 * 24 * time.Hour,
+			MaxFailedAttempts:     5,
+			LockoutDuration:       15 * time.Minute,
+			CaptchaFailureTrigger: 3,
+			CaptchaTTL:            5 * time.Minute,
+			OIDC: OIDCConfig{
+				Scopes: []string{"openid", "profile", "email"},
+			},
 		},
 		Database: DatabaseConfig{
 			MaxOpenConns:       40,

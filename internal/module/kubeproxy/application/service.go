@@ -44,6 +44,10 @@ type RoleAuthorizer struct {
 }
 
 func (a RoleAuthorizer) AuthorizeProxyRequest(_ context.Context, principal middleware.Principal, _ string, _ *http.Request) error {
+	if principal.IsAdmin {
+		return nil
+	}
+
 	allowed := make(map[string]struct{}, len(a.AllowedRoles))
 	for _, role := range a.AllowedRoles {
 		allowed[role] = struct{}{}
