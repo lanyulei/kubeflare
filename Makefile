@@ -1,5 +1,11 @@
 APP_NAME := kubeflare
 MIGRATIONS_DIR ?= migrations/postgres
+
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
+
 DATABASE_DSN ?= $(KUBEFLARE_DATABASE__DSN)
 
 .PHONY: tidy test build run migrate

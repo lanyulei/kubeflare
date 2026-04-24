@@ -30,7 +30,7 @@ http:
   readiness_timeout: 2s
 
 auth:
-  signing_key: ${KUBEFLARE_AUTH_SIGNING_KEY}
+  signing_key: ${KUBEFLARE_AUTH__SIGNING_KEY}
   token_ttl: 24h
   refresh_token_ttl: 168h
   max_failed_attempts: 5
@@ -52,7 +52,7 @@ auth:
 
 database:
   enabled: true
-  dsn: postgres://kubeflare:${KUBEFLARE_DB_PASSWORD}@127.0.0.1:5432/kubeflare?sslmode=disable
+  dsn: postgres://postgres:${KUBEFLARE_DB_PASSWORD}@127.0.0.1:5432/kubeflare?sslmode=disable
   max_open_conns: 40
   max_idle_conns: 20
   conn_max_lifetime: 30m
@@ -81,7 +81,7 @@ proxy:
     - admin
     - proxy
   cluster_cache_ttl: 30s
-  encryption_key: ${KUBEFLARE_PROXY_ENCRYPTION_KEY}
+  encryption_key: ${KUBEFLARE_PROXY__ENCRYPTION_KEY}
   dial_timeout: 5s
   tls_handshake_timeout: 5s
   response_header_timeout: 30s
