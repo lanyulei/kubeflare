@@ -51,3 +51,4 @@ AGENTS.md
 .DS_Store
 /.cache
 /.claude
+/data
