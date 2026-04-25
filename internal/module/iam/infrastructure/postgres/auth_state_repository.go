@@ -56,23 +56,23 @@ type oidcStateRecord struct {
 }
 
 func (authSessionRecord) TableName() string {
-	return "iam_auth_sessions"
+	return "iam_auth_session"
 }
 
 func (revokedTokenRecord) TableName() string {
-	return "iam_revoked_tokens"
+	return "iam_revoked_token"
 }
 
 func (refreshTokenRecord) TableName() string {
-	return "iam_refresh_tokens"
+	return "iam_refresh_token"
 }
 
 func (loginFailureRecord) TableName() string {
-	return "iam_login_failures"
+	return "iam_login_failure"
 }
 
 func (oidcStateRecord) TableName() string {
-	return "iam_oidc_states"
+	return "iam_oidc_state"
 }
 
 func NewAuthStateRepository(db *gorm.DB, timeout time.Duration) *AuthStateRepository {
@@ -365,8 +365,8 @@ func (r *AuthStateRepository) IncrementLoginFailure(ctx context.Context, key str
 	err := r.db.WithContext(queryCtx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "key"}},
 		DoUpdates: clause.Assignments(map[string]any{
-			"count":        gorm.Expr("CASE WHEN iam_login_failures.expires_at <= ? THEN 1 ELSE iam_login_failures.count + 1 END", now),
-			"locked_until": gorm.Expr("CASE WHEN iam_login_failures.expires_at <= ? THEN ? ELSE iam_login_failures.locked_until END", now, now),
+			"count":        gorm.Expr("CASE WHEN iam_login_failure.expires_at <= ? THEN 1 ELSE iam_login_failure.count + 1 END", now),
+			"locked_until": gorm.Expr("CASE WHEN iam_login_failure.expires_at <= ? THEN ? ELSE iam_login_failure.locked_until END", now, now),
 			"expires_at":   expiresAt,
 			"updated_at":   now,
 		}),

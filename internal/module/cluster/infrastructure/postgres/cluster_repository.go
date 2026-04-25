@@ -34,7 +34,7 @@ type clusterRecord struct {
 }
 
 func (clusterRecord) TableName() string {
-	return "clusters"
+	return "cluster"
 }
 
 func NewClusterRepository(db *gorm.DB, encryptor secrets.Encryptor, timeout time.Duration) *ClusterRepository {
@@ -53,15 +53,15 @@ func (r *ClusterRepository) List(ctx context.Context) ([]domain.Cluster, error) 
 		return nil, err
 	}
 
-	clusters := make([]domain.Cluster, 0, len(records))
+	clusterList := make([]domain.Cluster, 0, len(records))
 	for _, record := range records {
 		cluster, err := r.toDomain(record)
 		if err != nil {
 			return nil, err
 		}
-		clusters = append(clusters, cluster)
+		clusterList = append(clusterList, cluster)
 	}
-	return clusters, nil
+	return clusterList, nil
 }
 
 func (r *ClusterRepository) Get(ctx context.Context, id string) (domain.Cluster, error) {

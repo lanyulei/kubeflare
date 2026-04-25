@@ -126,7 +126,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		}
 	}
 	clusterService := application.NewService(clusterRepo, validator, clusterRegistry)
-	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/uploads")
+	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 
 	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, clusterService, uploadService)
 	if err != nil {

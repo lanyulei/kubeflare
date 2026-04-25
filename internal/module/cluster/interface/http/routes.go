@@ -7,11 +7,11 @@ import (
 )
 
 func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
-	clusters := group.Group("/clusters")
-	clusters.Use(middleware.RequireRolesGin("admin"))
-	clusters.GET("", handler.List)
-	clusters.POST("", handler.Create)
-	clusters.GET("/:clusterID", handler.Get)
-	clusters.PUT("/:clusterID", handler.Update)
-	clusters.DELETE("/:clusterID", handler.Delete)
+	cluster := group.Group("/cluster")
+	cluster.Use(middleware.RequireRolesGin("admin"))
+	cluster.GET("", handler.List)
+	cluster.POST("", handler.Create)
+	cluster.GET("/:clusterID", handler.Get)
+	cluster.PUT("/:clusterID", handler.Update)
+	cluster.DELETE("/:clusterID", handler.Delete)
 }

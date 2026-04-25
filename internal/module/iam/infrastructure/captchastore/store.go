@@ -27,7 +27,7 @@ type captchaRecord struct {
 }
 
 func (captchaRecord) TableName() string {
-	return "iam_captcha_challenges"
+	return "iam_captcha_challenge"
 }
 
 func NewStore(redisClient *goredis.Client, gormDB *gorm.DB, ttl time.Duration, timeout time.Duration) *Store {

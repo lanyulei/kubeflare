@@ -1,3 +1,9 @@
-DROP INDEX IF EXISTS idx_clusters_default_true;
-DROP TABLE IF EXISTS clusters;
-DROP TABLE IF EXISTS iam_users;
+DROP TABLE IF EXISTS iam_external_identity;
+DROP TABLE IF EXISTS iam_oidc_state;
+DROP TABLE IF EXISTS iam_captcha_challenge;
+DROP TABLE IF EXISTS iam_login_failure;
+DROP TABLE IF EXISTS iam_refresh_token;
+DROP TABLE IF EXISTS iam_revoked_token;
+DROP TABLE IF EXISTS iam_auth_session;
+DROP TABLE IF EXISTS cluster;
+DROP TABLE IF EXISTS iam_user;

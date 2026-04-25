@@ -7,12 +7,12 @@ import (
 )
 
 func RegisterPublicRoutes(group *gin.RouterGroup, handler *Handler) {
-	uploads := group.Group("/uploads")
-	uploads.GET("/:type/:filename", handler.Get)
+	upload := group.Group("/upload")
+	upload.GET("/:type/:filename", handler.Get)
 }
 
 func RegisterProtectedRoutes(group *gin.RouterGroup, handler *Handler) {
-	uploads := group.Group("/uploads")
-	uploads.Use(middleware.RequireRolesGin("admin"))
-	uploads.POST("/:type", handler.Upload)
+	upload := group.Group("/upload")
+	upload.Use(middleware.RequireRolesGin("admin"))
+	upload.POST("/:type", handler.Upload)
 }

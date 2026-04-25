@@ -40,19 +40,19 @@ type userRecord struct {
 type externalIdentityRecord struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement"`
 	UserID    int64     `gorm:"not null;index"`
-	Provider  string    `gorm:"size:255;not null;index:idx_iam_external_identities_provider_subject,unique"`
-	Subject   string    `gorm:"size:255;not null;index:idx_iam_external_identities_provider_subject,unique"`
+	Provider  string    `gorm:"size:255;not null;index:idx_iam_external_identity_provider_subject,unique"`
+	Subject   string    `gorm:"size:255;not null;index:idx_iam_external_identity_provider_subject,unique"`
 	Email     string    `gorm:"size:255;not null;default:''"`
 	CreatedAt time.Time `gorm:"not null"`
 	UpdatedAt time.Time `gorm:"not null"`
 }
 
 func (userRecord) TableName() string {
-	return "iam_users"
+	return "iam_user"
 }
 
 func (externalIdentityRecord) TableName() string {
-	return "iam_external_identities"
+	return "iam_external_identity"
 }
 
 func NewUserRepository(db *gorm.DB, timeout time.Duration) *UserRepository {
