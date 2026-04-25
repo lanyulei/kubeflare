@@ -2,8 +2,6 @@ package http
 
 import (
 	"github.com/gin-gonic/gin"
-
-	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 )
 
 func RegisterPublicRoutes(group *gin.RouterGroup, handler *Handler) {
@@ -28,7 +26,6 @@ func RegisterProtectedRoutes(group *gin.RouterGroup, handler *Handler) {
 
 func RegisterAdminRoutes(group *gin.RouterGroup, handler *Handler) {
 	users := group.Group("/user")
-	users.Use(middleware.RequireRolesGin("admin"))
 	users.GET("", handler.List)
 	users.POST("", handler.Create)
 	users.GET("/:userID", handler.Get)

@@ -26,14 +26,13 @@ func TestHandlerProxiesKAPIRequests(t *testing.T) {
 
 	handler := middleware.AuthenticateHTTP(
 		testAuthenticator(map[string]middleware.Principal{
-			"proxy-token": {Subject: "user-1", Roles: []string{"proxy"}},
+			"proxy-token": {Subject: "user-1"},
 		}),
 		NewHandler(HandlerOptions{
 			DefaultClusterID: "prod",
 			Registry: application.StaticClusterRegistry(map[string]application.ClusterTarget{
 				"prod": {ID: "prod", BaseURL: *targetURL},
 			}),
-			Authorizer: application.RoleAuthorizer{AllowedRoles: []string{"proxy", "admin"}},
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				seenPath = req.URL.Path
 				seenUser = req.Header.Get("X-Kubeflare-User")
@@ -67,7 +66,7 @@ func TestHandlerProxiesKAPIRequests(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsPrincipalWithoutProxyRole(t *testing.T) {
+func TestHandlerAllowsAuthenticatedPrincipalWithoutProxyRole(t *testing.T) {
 	t.Parallel()
 
 	targetURL, err := url.Parse("https://cluster.example.com")
@@ -77,46 +76,13 @@ func TestHandlerRejectsPrincipalWithoutProxyRole(t *testing.T) {
 
 	handler := middleware.AuthenticateHTTP(
 		testAuthenticator(map[string]middleware.Principal{
-			"user-token": {Subject: "user-2", Roles: []string{"viewer"}},
+			"user-token": {Subject: "user-2"},
 		}),
 		NewHandler(HandlerOptions{
 			DefaultClusterID: "prod",
 			Registry: application.StaticClusterRegistry(map[string]application.ClusterTarget{
 				"prod": {ID: "prod", BaseURL: *targetURL},
 			}),
-			Authorizer: application.RoleAuthorizer{AllowedRoles: []string{"proxy", "admin"}},
-		}),
-	)
-
-	req := httptest.NewRequest(http.MethodGet, "/kapis/apps/v1/deployments", nil)
-	req.Header.Set("Authorization", "Bearer user-token")
-	rr := httptest.NewRecorder()
-
-	handler.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("unexpected status code %d", rr.Code)
-	}
-}
-
-func TestHandlerAllowsIsAdminPrincipalWithoutProxyRole(t *testing.T) {
-	t.Parallel()
-
-	targetURL, err := url.Parse("https://cluster.example.com")
-	if err != nil {
-		t.Fatalf("url.Parse returned error: %v", err)
-	}
-
-	handler := middleware.AuthenticateHTTP(
-		testAuthenticator(map[string]middleware.Principal{
-			"admin-token": {Subject: "user-3", Roles: []string{"viewer"}, IsAdmin: true},
-		}),
-		NewHandler(HandlerOptions{
-			DefaultClusterID: "prod",
-			Registry: application.StaticClusterRegistry(map[string]application.ClusterTarget{
-				"prod": {ID: "prod", BaseURL: *targetURL},
-			}),
-			Authorizer: application.RoleAuthorizer{AllowedRoles: []string{"proxy", "admin"}},
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusAccepted,
@@ -128,8 +94,8 @@ func TestHandlerAllowsIsAdminPrincipalWithoutProxyRole(t *testing.T) {
 		}),
 	)
 
-	req := httptest.NewRequest(http.MethodGet, "/kapi/v1/nodes", nil)
-	req.Header.Set("Authorization", "Bearer admin-token")
+	req := httptest.NewRequest(http.MethodGet, "/kapis/apps/v1/deployments", nil)
+	req.Header.Set("Authorization", "Bearer user-token")
 	rr := httptest.NewRecorder()
 
 	handler.ServeHTTP(rr, req)

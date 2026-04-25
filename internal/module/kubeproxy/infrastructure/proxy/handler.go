@@ -3,7 +3,6 @@ package proxy
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -18,7 +17,6 @@ import (
 type HandlerOptions struct {
 	DefaultClusterID string
 	Registry         application.ClusterRegistry
-	Authorizer       application.Authorizer
 	Transport        http.RoundTripper
 	TransportBuilder func(target application.ClusterTarget) (http.RoundTripper, error)
 	FlushInterval    time.Duration
@@ -42,19 +40,6 @@ func NewHandler(opts HandlerOptions) http.Handler {
 		if err != nil {
 			writeJSONError(w, r, http.StatusNotFound, sharedErrors.CodeClusterNotFound, err)
 			return
-		}
-
-		if opts.Authorizer != nil {
-			if err := opts.Authorizer.AuthorizeProxyRequest(r.Context(), principal, clusterID, r); err != nil {
-				status := http.StatusForbidden
-				code := sharedErrors.CodeForbidden
-				if errors.Is(err, middleware.ErrUnauthorized) {
-					status = http.StatusUnauthorized
-					code = sharedErrors.CodeUnauthorized
-				}
-				writeJSONError(w, r, status, code, err)
-				return
-			}
 		}
 
 		rewrittenPath, err := application.RewritePath(r.URL.Path)

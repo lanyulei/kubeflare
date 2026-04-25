@@ -20,9 +20,7 @@ import (
 )
 
 type Principal struct {
-	Subject string   `json:"subject"`
-	Roles   []string `json:"roles,omitempty"`
-	IsAdmin bool     `json:"is_admin"`
+	Subject string `json:"subject"`
 }
 
 type Authenticator interface {
@@ -125,16 +123,15 @@ func NewSignedTokenManagerWithOptions(secret string, accessTTL time.Duration, re
 	}
 }
 
-func (m *SignedTokenManager) IssueToken(ctx context.Context, subject string, roles []string) (string, error) {
-	pair, err := m.IssueTokenPair(ctx, subject, roles)
+func (m *SignedTokenManager) IssueToken(ctx context.Context, subject string) (string, error) {
+	pair, err := m.IssueTokenPair(ctx, subject)
 	if err != nil {
 		return "", err
 	}
 	return pair.AccessToken, nil
 }
 
-func (m *SignedTokenManager) IssueTokenPair(ctx context.Context, subject string, roles []string) (TokenPair, error) {
-	_ = roles
+func (m *SignedTokenManager) IssueTokenPair(ctx context.Context, subject string) (TokenPair, error) {
 	sessionID := newTokenID()
 	now := time.Now().UTC()
 	sessionExpiresAt := now.Add(m.refreshTTL)
@@ -411,45 +408,6 @@ func AuthenticateGin(authenticator Authenticator) gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Set("principal", principal)
 		c.Next()
-	}
-}
-
-func RequireRolesGin(roles ...string) gin.HandlerFunc {
-	allowed := make(map[string]struct{}, len(roles))
-	for _, role := range roles {
-		allowed[role] = struct{}{}
-	}
-
-	return func(c *gin.Context) {
-		principal, ok := PrincipalFromContext(c.Request.Context())
-		if !ok {
-			response.Error(c, &sharedErrors.AppError{
-				Code:    sharedErrors.CodeUnauthorized,
-				Message: ErrUnauthorized.Error(),
-				Status:  http.StatusUnauthorized,
-				Err:     ErrUnauthorized,
-			})
-			return
-		}
-
-		if principal.IsAdmin {
-			c.Next()
-			return
-		}
-
-		for _, role := range principal.Roles {
-			if _, ok := allowed[role]; ok {
-				c.Next()
-				return
-			}
-		}
-
-		response.Error(c, &sharedErrors.AppError{
-			Code:    sharedErrors.CodeForbidden,
-			Message: "forbidden",
-			Status:  http.StatusForbidden,
-			Err:     errors.New("forbidden"),
-		})
 	}
 }
 

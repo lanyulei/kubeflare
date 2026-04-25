@@ -24,7 +24,6 @@ import (
 	iampostgres "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/postgres"
 	iamredis "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/redis"
 	iamhttp "github.com/lanyulei/kubeflare/internal/module/iam/interface/http"
-	kubeproxyapp "github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
 	kubeproxy "github.com/lanyulei/kubeflare/internal/module/kubeproxy/infrastructure/proxy"
 	uploadapplication "github.com/lanyulei/kubeflare/internal/module/upload/application"
 	uploadlocal "github.com/lanyulei/kubeflare/internal/module/upload/infrastructure/local"
@@ -139,9 +138,6 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	proxyHandler := middleware.RequireCSRFHTTP(middleware.AuthenticateHTTP(authenticator, kubeproxy.NewHandler(kubeproxy.HandlerOptions{
 		DefaultClusterID: cfg.Proxy.DefaultClusterID,
 		Registry:         clusterRegistry,
-		Authorizer: kubeproxyapp.RoleAuthorizer{
-			AllowedRoles: cfg.Proxy.AllowedRoles,
-		},
 		TransportBuilder: transportPool.For,
 		FlushInterval:    cfg.Proxy.FlushInterval,
 	})))
@@ -259,8 +255,6 @@ func newAPIHandler(
 			"service":     cfg.Service.Name,
 			"environment": cfg.Service.Environment,
 			"subject":     principal.Subject,
-			"roles":       principal.Roles,
-			"is_admin":    principal.IsAdmin,
 		})
 	})
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
@@ -316,8 +310,6 @@ func (r userPrincipalResolver) ResolvePrincipal(ctx context.Context, subject str
 
 	return middleware.Principal{
 		Subject: subject,
-		Roles:   append([]string(nil), user.Roles...),
-		IsAdmin: user.IsAdmin,
 	}, nil
 }
 

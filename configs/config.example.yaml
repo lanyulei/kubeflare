@@ -77,9 +77,6 @@ redis:
 
 proxy:
   default_cluster_id: ""
-  allowed_roles:
-    - admin
-    - proxy
   cluster_cache_ttl: 30s
   encryption_key: ${KUBEFLARE_PROXY__ENCRYPTION_KEY}
   dial_timeout: 5s

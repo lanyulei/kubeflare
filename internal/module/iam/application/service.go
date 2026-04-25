@@ -27,8 +27,8 @@ const (
 )
 
 type TokenIssuer interface {
-	IssueToken(ctx context.Context, subject string, roles []string) (string, error)
-	IssueTokenPair(ctx context.Context, subject string, roles []string) (middleware.TokenPair, error)
+	IssueToken(ctx context.Context, subject string) (string, error)
+	IssueTokenPair(ctx context.Context, subject string) (middleware.TokenPair, error)
 	RefreshToken(ctx context.Context, refreshToken string) (middleware.TokenPair, error)
 	RefreshTokenSubject(ctx context.Context, refreshToken string) (middleware.TokenSubject, error)
 	RevokeToken(ctx context.Context, token string) error
@@ -208,7 +208,7 @@ func (s *Service) LoginWithOptions(ctx context.Context, req LoginRequest, opts L
 		}
 	}
 
-	pair, err := s.tokenIssuer.IssueTokenPair(ctx, userSubject(user), user.Roles)
+	pair, err := s.tokenIssuer.IssueTokenPair(ctx, userSubject(user))
 	if err != nil {
 		return LoginResponse{}, err
 	}
@@ -355,9 +355,7 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest) (domain.Use
 		Phone:     strings.TrimSpace(req.Phone),
 		Avatar:    strings.TrimSpace(req.Avatar),
 		Remarks:   strings.TrimSpace(req.Remarks),
-		IsAdmin:   normalizeIsAdmin(req.IsAdmin, false),
 		Status:    normalizeStatus(req.Status, USER_STATUS_ACTIVE),
-		Roles:     []string{"user"},
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
@@ -388,7 +386,6 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateUserRequest) 
 	existing.Phone = strings.TrimSpace(req.Phone)
 	existing.Avatar = strings.TrimSpace(req.Avatar)
 	existing.Remarks = strings.TrimSpace(req.Remarks)
-	existing.IsAdmin = normalizeIsAdmin(req.IsAdmin, existing.IsAdmin)
 	existing.Status = normalizeStatus(req.Status, existing.Status)
 	existing.UpdatedAt = time.Now().UTC()
 
@@ -693,13 +690,6 @@ func normalizeNickname(value string) (string, error) {
 }
 
 func normalizeStatus(value *int, defaultValue int) int {
-	if value == nil {
-		return defaultValue
-	}
-	return *value
-}
-
-func normalizeIsAdmin(value *bool, defaultValue bool) bool {
 	if value == nil {
 		return defaultValue
 	}

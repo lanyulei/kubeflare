@@ -31,7 +31,7 @@ func TestResolveUserPrefersLegacyIDBeforeNumericPrimaryKey(t *testing.T) {
 	}
 }
 
-func TestCreateAndUpdatePreserveIsAdminFlag(t *testing.T) {
+func TestCreateAndUpdateUser(t *testing.T) {
 	t.Parallel()
 
 	userRepo := &memoryUserRepository{
@@ -41,28 +41,24 @@ func TestCreateAndUpdatePreserveIsAdminFlag(t *testing.T) {
 				Username: "origin",
 				Nickname: "Origin",
 				Status:   USER_STATUS_ACTIVE,
-				Roles:    []string{"user"},
 			},
 		},
 		nextID: 2,
 	}
 	service := NewService(userRepo, validator.New(), nil)
 
-	isAdmin := true
 	created, err := service.Create(context.Background(), CreateUserRequest{
 		Username: "superman",
 		Nickname: "Super Man",
 		Password: "password-123",
-		IsAdmin:  &isAdmin,
 	})
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	if !created.IsAdmin {
-		t.Fatal("expected created user to be admin")
+	if created.Username != "superman" {
+		t.Fatalf("expected created username superman, got %q", created.Username)
 	}
 
-	isAdmin = false
 	updated, err := service.Update(context.Background(), "1", UpdateUserRequest{
 		Username: "origin",
 		Nickname: "Origin Updated",
@@ -70,13 +66,12 @@ func TestCreateAndUpdatePreserveIsAdminFlag(t *testing.T) {
 		Phone:    "",
 		Avatar:   "",
 		Status:   intPtr(USER_STATUS_ACTIVE),
-		IsAdmin:  &isAdmin,
 	})
 	if err != nil {
 		t.Fatalf("update user: %v", err)
 	}
-	if updated.IsAdmin {
-		t.Fatal("expected updated user admin flag to be false")
+	if updated.Nickname != "Origin Updated" {
+		t.Fatalf("expected updated nickname, got %q", updated.Nickname)
 	}
 }
 

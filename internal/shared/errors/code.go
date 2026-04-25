@@ -14,7 +14,6 @@ const (
 
 	CodeUserNotFound      = 40101
 	CodeUserAlreadyExists = 40102
-	CodeUserInvalidRoles  = 40103
 
 	CodeClusterNotFound         = 40301
 	CodeClusterAlreadyExists    = 40302

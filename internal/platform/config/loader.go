@@ -75,11 +75,7 @@ func normalizeEnvValue(path string, value string) interface{} {
 		return splitEnvList(value)
 	case path == "http.allow_methods":
 		return splitEnvList(value)
-	case path == "proxy.allowed_roles":
-		return splitEnvList(value)
 	case path == "auth.oidc.scopes":
-		return splitEnvList(value)
-	case strings.HasSuffix(path, ".roles"):
 		return splitEnvList(value)
 	default:
 		return value

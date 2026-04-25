@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"fmt"
 )
 
 func Validate(cfg Config) error {
@@ -53,9 +52,6 @@ func Validate(cfg Config) error {
 		if cfg.Auth.OIDC.IssuerURL == "" || cfg.Auth.OIDC.ClientID == "" || cfg.Auth.OIDC.ClientSecret == "" || cfg.Auth.OIDC.RedirectURL == "" {
 			return errors.New("auth.oidc issuer_url, client_id, client_secret, and redirect_url are required when oidc is enabled")
 		}
-	}
-	if len(cfg.Proxy.AllowedRoles) == 0 {
-		return fmt.Errorf("proxy.allowed_roles must not be empty")
 	}
 	if cfg.Upload.RootDir == "" {
 		return errors.New("upload.root_dir is required")

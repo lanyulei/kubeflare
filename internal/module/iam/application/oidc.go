@@ -115,7 +115,7 @@ func (s *OIDCService) Callback(ctx context.Context, state string, code string) (
 	if err != nil {
 		return LoginResponse{}, err
 	}
-	pair, err := s.tokenIssuer.IssueTokenPair(ctx, userSubject(user), user.Roles)
+	pair, err := s.tokenIssuer.IssueTokenPair(ctx, userSubject(user))
 	if err != nil {
 		return LoginResponse{}, err
 	}
@@ -185,7 +185,6 @@ func (s *OIDCService) resolveOrCreateUser(ctx context.Context, claims oidcClaims
 		Password:  password,
 		Email:     normalizeEmail(claims.Email),
 		Status:    USER_STATUS_ACTIVE,
-		Roles:     []string{"user"},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}, domain.ExternalIdentity{

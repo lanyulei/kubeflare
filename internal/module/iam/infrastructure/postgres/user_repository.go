@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -27,9 +26,7 @@ type userRecord struct {
 	Phone      string         `gorm:"size:32;not null;default:''"`
 	Avatar     string         `gorm:"size:512;not null;default:''"`
 	Remarks    string         `gorm:"size:512;not null;default:''"`
-	IsAdmin    bool           `gorm:"not null;default:false"`
 	Status     int            `gorm:"not null;default:1"`
-	Roles      string         `gorm:"type:text;not null;default:'user'"`
 	MFAEnabled bool           `gorm:"not null;default:false"`
 	MFASecret  string         `gorm:"size:512;not null;default:''"`
 	CreatedAt  time.Time      `gorm:"not null"`
@@ -159,9 +156,7 @@ func (r *UserRepository) Update(ctx context.Context, user domain.User) (domain.U
 	record.Phone = user.Phone
 	record.Avatar = user.Avatar
 	record.Remarks = user.Remarks
-	record.IsAdmin = user.IsAdmin
 	record.Status = user.Status
-	record.Roles = strings.Join(user.Roles, ",")
 	record.MFAEnabled = user.MFAEnabled
 	record.MFASecret = user.MFASecret
 	record.UpdatedAt = user.UpdatedAt
@@ -237,11 +232,6 @@ func (r *UserRepository) CreateWithExternalIdentity(ctx context.Context, user do
 }
 
 func toDomainUser(record userRecord) domain.User {
-	roles := []string(nil)
-	if strings.TrimSpace(record.Roles) != "" {
-		roles = strings.Split(record.Roles, ",")
-	}
-
 	user := domain.User{
 		ID:         record.ID,
 		LegacyID:   record.LegacyID,
@@ -252,9 +242,7 @@ func toDomainUser(record userRecord) domain.User {
 		Phone:      record.Phone,
 		Avatar:     record.Avatar,
 		Remarks:    record.Remarks,
-		IsAdmin:    record.IsAdmin,
 		Status:     record.Status,
-		Roles:      roles,
 		MFAEnabled: record.MFAEnabled,
 		MFASecret:  record.MFASecret,
 		CreatedAt:  record.CreatedAt,
@@ -278,9 +266,7 @@ func fromDomainUser(user domain.User) userRecord {
 		Phone:      user.Phone,
 		Avatar:     user.Avatar,
 		Remarks:    user.Remarks,
-		IsAdmin:    user.IsAdmin,
 		Status:     user.Status,
-		Roles:      strings.Join(user.Roles, ","),
 		MFAEnabled: user.MFAEnabled,
 		MFASecret:  user.MFASecret,
 		CreatedAt:  user.CreatedAt,

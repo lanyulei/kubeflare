@@ -8,9 +8,7 @@ CREATE TABLE IF NOT EXISTS iam_user (
     phone VARCHAR(32) NOT NULL DEFAULT '',
     avatar VARCHAR(512) NOT NULL DEFAULT '',
     remarks VARCHAR(512) NOT NULL DEFAULT '',
-    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
     status SMALLINT NOT NULL DEFAULT 1,
-    roles TEXT NOT NULL DEFAULT 'user',
     mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     mfa_secret VARCHAR(512) NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -160,9 +158,7 @@ INSERT INTO iam_user (
     email,
     phone,
     avatar,
-    is_admin,
     status,
-    roles,
     created_at,
     updated_at
 )
@@ -173,9 +169,7 @@ SELECT
     '',
     '',
     '',
-    TRUE,
     1,
-    'admin',
     NOW(),
     NOW()
 WHERE NOT EXISTS (

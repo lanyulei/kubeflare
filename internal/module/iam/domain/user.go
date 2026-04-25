@@ -12,9 +12,7 @@ type User struct {
 	Phone      string     `json:"phone,omitempty"`
 	Avatar     string     `json:"avatar,omitempty"`
 	Remarks    string     `json:"remarks,omitempty"`
-	IsAdmin    bool       `json:"is_admin"`
 	Status     int        `json:"status"`
-	Roles      []string   `json:"-"`
 	MFAEnabled bool       `json:"mfa_enabled"`
 	MFASecret  string     `json:"-"`
 	CreatedAt  time.Time  `json:"create_time"`

@@ -89,7 +89,6 @@ type RedisConfig struct {
 
 type ProxyConfig struct {
 	DefaultClusterID      string        `koanf:"default_cluster_id"`
-	AllowedRoles          []string      `koanf:"allowed_roles"`
 	ClusterCacheTTL       time.Duration `koanf:"cluster_cache_ttl"`
 	EncryptionKey         string        `koanf:"encryption_key"`
 	DialTimeout           time.Duration `koanf:"dial_timeout"`
@@ -175,7 +174,6 @@ func Default() Config {
 			HealthCheckTimeout: 2 * time.Second,
 		},
 		Proxy: ProxyConfig{
-			AllowedRoles:          []string{"admin", "proxy"},
 			ClusterCacheTTL:       30 * time.Second,
 			EncryptionKey:         "",
 			DialTimeout:           5 * time.Second,

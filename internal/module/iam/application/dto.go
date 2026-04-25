@@ -57,7 +57,6 @@ type CreateUserRequest struct {
 	Phone    string `json:"phone" validate:"omitempty,max=32"`
 	Avatar   string `json:"avatar" validate:"omitempty,max=512"`
 	Remarks  string `json:"remarks" validate:"omitempty,max=512"`
-	IsAdmin  *bool  `json:"is_admin"`
 	Status   *int   `json:"status" validate:"omitempty,oneof=0 1"`
 }
 
@@ -69,7 +68,6 @@ type UpdateUserRequest struct {
 	Phone    string `json:"phone" validate:"omitempty,max=32"`
 	Avatar   string `json:"avatar" validate:"omitempty,max=512"`
 	Remarks  string `json:"remarks" validate:"omitempty,max=512"`
-	IsAdmin  *bool  `json:"is_admin"`
 	Status   *int   `json:"status" validate:"omitempty,oneof=0 1"`
 }
 
