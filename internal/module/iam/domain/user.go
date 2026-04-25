@@ -11,6 +11,7 @@ type User struct {
 	Email      string     `json:"email,omitempty"`
 	Phone      string     `json:"phone,omitempty"`
 	Avatar     string     `json:"avatar,omitempty"`
+	Remarks    string     `json:"remarks,omitempty"`
 	IsAdmin    bool       `json:"is_admin"`
 	Status     int        `json:"status"`
 	Roles      []string   `json:"-"`

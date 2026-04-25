@@ -56,6 +56,7 @@ type CreateUserRequest struct {
 	Email    string `json:"email" validate:"omitempty,email,max=255"`
 	Phone    string `json:"phone" validate:"omitempty,max=32"`
 	Avatar   string `json:"avatar" validate:"omitempty,max=512"`
+	Remarks  string `json:"remarks" validate:"omitempty,max=512"`
 	IsAdmin  *bool  `json:"is_admin"`
 	Status   *int   `json:"status" validate:"omitempty,oneof=0 1"`
 }
@@ -67,6 +68,7 @@ type UpdateUserRequest struct {
 	Email    string `json:"email" validate:"omitempty,email,max=255"`
 	Phone    string `json:"phone" validate:"omitempty,max=32"`
 	Avatar   string `json:"avatar" validate:"omitempty,max=512"`
+	Remarks  string `json:"remarks" validate:"omitempty,max=512"`
 	IsAdmin  *bool  `json:"is_admin"`
 	Status   *int   `json:"status" validate:"omitempty,oneof=0 1"`
 }
@@ -76,6 +78,7 @@ type UpdateCurrentUserRequest struct {
 	Email    string `json:"email" validate:"omitempty,email,max=255"`
 	Phone    string `json:"phone" validate:"omitempty,max=32"`
 	Avatar   string `json:"avatar" validate:"omitempty,max=512"`
+	Remarks  string `json:"remarks" validate:"omitempty,max=512"`
 }
 
 type UpdateCurrentPasswordRequest struct {

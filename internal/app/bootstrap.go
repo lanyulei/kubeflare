@@ -26,6 +26,9 @@ import (
 	iamhttp "github.com/lanyulei/kubeflare/internal/module/iam/interface/http"
 	kubeproxyapp "github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
 	kubeproxy "github.com/lanyulei/kubeflare/internal/module/kubeproxy/infrastructure/proxy"
+	uploadapplication "github.com/lanyulei/kubeflare/internal/module/upload/application"
+	uploadlocal "github.com/lanyulei/kubeflare/internal/module/upload/infrastructure/local"
+	uploadhttp "github.com/lanyulei/kubeflare/internal/module/upload/interface/http"
 	"github.com/lanyulei/kubeflare/internal/platform/cache"
 	"github.com/lanyulei/kubeflare/internal/platform/config"
 	"github.com/lanyulei/kubeflare/internal/platform/db"
@@ -95,6 +98,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, encryptor, cfg.Database.QueryTimeout)
 	clusterRegistry := application.NewCachedRegistry(logger, clusterRepo, redisClient, clusterCacheTTL, encryptor)
+	uploadRepo := uploadlocal.NewFileRepository(cfg.Upload.RootDir)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
 	authenticator := middleware.NewSignedTokenAuthenticator(tokenManager, userPrincipalResolver{repo: userRepo})
@@ -122,8 +126,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		}
 	}
 	clusterService := application.NewService(clusterRepo, validator, clusterRegistry)
+	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/uploads")
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, clusterService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, clusterService, uploadService)
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +222,7 @@ func newAPIHandler(
 	iamService *iamapplication.Service,
 	oidcService *iamapplication.OIDCService,
 	clusterService *application.Service,
+	uploadService *uploadapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -241,6 +247,8 @@ func newAPIHandler(
 		Domain: cfg.Auth.CookieDomain,
 	})
 	iamhttp.RegisterPublicRoutes(api, iamHandler)
+	uploadHandler := uploadhttp.NewHandler(uploadService)
+	uploadhttp.RegisterPublicRoutes(api, uploadHandler)
 
 	protectedAPI := api.Group("")
 	protectedAPI.Use(middleware.AuthenticateGin(authenticator))
@@ -258,6 +266,7 @@ func newAPIHandler(
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
 	iamhttp.RegisterAdminRoutes(protectedAPI, iamHandler)
 	clusterhttp.RegisterRoutes(protectedAPI, clusterhttp.NewHandler(clusterService))
+	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {

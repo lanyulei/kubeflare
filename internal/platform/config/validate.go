@@ -57,6 +57,9 @@ func Validate(cfg Config) error {
 	if len(cfg.Proxy.AllowedRoles) == 0 {
 		return fmt.Errorf("proxy.allowed_roles must not be empty")
 	}
+	if cfg.Upload.RootDir == "" {
+		return errors.New("upload.root_dir is required")
+	}
 	if (cfg.Database.Enabled || cfg.Redis.Enabled) && cfg.Proxy.EncryptionKey == "" {
 		return errors.New("proxy.encryption_key is required when database or redis is enabled")
 	}

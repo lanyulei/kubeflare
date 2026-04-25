@@ -91,6 +91,9 @@ proxy:
   max_conns_per_host: 256
   flush_interval: 200ms
 
+upload:
+  root_dir: data/uploads
+
 observability:
   log_level: info
   log_format: text

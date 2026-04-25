@@ -354,6 +354,7 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest) (domain.Use
 		Email:     normalizeEmail(req.Email),
 		Phone:     strings.TrimSpace(req.Phone),
 		Avatar:    strings.TrimSpace(req.Avatar),
+		Remarks:   strings.TrimSpace(req.Remarks),
 		IsAdmin:   normalizeIsAdmin(req.IsAdmin, false),
 		Status:    normalizeStatus(req.Status, USER_STATUS_ACTIVE),
 		Roles:     []string{"user"},
@@ -386,6 +387,7 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateUserRequest) 
 	existing.Email = normalizeEmail(req.Email)
 	existing.Phone = strings.TrimSpace(req.Phone)
 	existing.Avatar = strings.TrimSpace(req.Avatar)
+	existing.Remarks = strings.TrimSpace(req.Remarks)
 	existing.IsAdmin = normalizeIsAdmin(req.IsAdmin, existing.IsAdmin)
 	existing.Status = normalizeStatus(req.Status, existing.Status)
 	existing.UpdatedAt = time.Now().UTC()
@@ -449,6 +451,7 @@ func (s *Service) UpdateCurrent(ctx context.Context, subject string, req UpdateC
 	existing.Email = normalizeEmail(req.Email)
 	existing.Phone = strings.TrimSpace(req.Phone)
 	existing.Avatar = strings.TrimSpace(req.Avatar)
+	existing.Remarks = strings.TrimSpace(req.Remarks)
 	existing.UpdatedAt = time.Now().UTC()
 
 	updated, err := s.repo.Update(ctx, existing)

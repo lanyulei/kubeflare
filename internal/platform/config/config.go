@@ -9,6 +9,7 @@ type Config struct {
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
 	Proxy         ProxyConfig         `koanf:"proxy"`
+	Upload        UploadConfig        `koanf:"upload"`
 	Observability ObservabilityConfig `koanf:"observability"`
 }
 
@@ -101,6 +102,10 @@ type ProxyConfig struct {
 	FlushInterval         time.Duration `koanf:"flush_interval"`
 }
 
+type UploadConfig struct {
+	RootDir string `koanf:"root_dir"`
+}
+
 type ObservabilityConfig struct {
 	LogLevel  string        `koanf:"log_level"`
 	LogFormat string        `koanf:"log_format"`
@@ -181,6 +186,9 @@ func Default() Config {
 			MaxIdleConnsPerHost:   64,
 			MaxConnsPerHost:       256,
 			FlushInterval:         200 * time.Millisecond,
+		},
+		Upload: UploadConfig{
+			RootDir: "data/uploads",
 		},
 		Observability: ObservabilityConfig{
 			LogLevel:  "info",

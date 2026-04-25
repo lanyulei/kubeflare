@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS iam_users (
     email VARCHAR(255) NOT NULL DEFAULT '',
     phone VARCHAR(32) NOT NULL DEFAULT '',
     avatar VARCHAR(512) NOT NULL DEFAULT '',
+    remarks VARCHAR(512) NOT NULL DEFAULT '',
     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
     status SMALLINT NOT NULL DEFAULT 1,
     roles TEXT NOT NULL DEFAULT 'user',
@@ -24,7 +25,7 @@ BEGIN
         FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'iam_users_legacy'
     ) THEN
-        INSERT INTO iam_users (legacy_id, username, nickname, password, email, phone, avatar, is_admin, status, roles, created_at, updated_at, deleted_at)
+        INSERT INTO iam_users (legacy_id, username, nickname, password, email, phone, avatar, remarks, is_admin, status, roles, created_at, updated_at, deleted_at)
         SELECT
             id AS legacy_id,
             CASE
@@ -36,6 +37,7 @@ BEGIN
             LOWER(COALESCE(BTRIM(email), '')) AS email,
             '' AS phone,
             '' AS avatar,
+            '' AS remarks,
             EXISTS (
                 SELECT 1
                 FROM unnest(string_to_array(COALESCE(roles, ''), ',')) AS role_item

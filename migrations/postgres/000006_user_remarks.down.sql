@@ -1,0 +1,2 @@
+ALTER TABLE IF EXISTS iam_users
+    DROP COLUMN IF EXISTS remarks;
