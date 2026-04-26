@@ -9,10 +9,21 @@ import (
 type ClusterTarget struct {
 	ID                  string
 	BaseURL             url.URL
+	AuthType            string
 	UpstreamBearerToken string
 	CACertPEM           string
+	ClientCertPEM       string
+	ClientKeyPEM        string
+	Username            string
+	Password            string
 	TLSServerName       string
 	SkipTLSVerify       bool
+	ProxyURL            string
+	DisableCompression  bool
+	ImpersonateUser     string
+	ImpersonateUID      string
+	ImpersonateGroups   string
+	ImpersonateExtra    string
 	Enabled             bool
 }
 

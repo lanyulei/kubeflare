@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	stdErrors "errors"
 	"fmt"
 	"net/http"
@@ -78,7 +79,10 @@ func NewHandler(opts HandlerOptions) http.Handler {
 			deleteImpersonationHeaders(req.Header)
 			if target.UpstreamBearerToken != "" {
 				req.Header.Set("Authorization", "Bearer "+target.UpstreamBearerToken)
+			} else if target.Username != "" || target.Password != "" {
+				req.SetBasicAuth(target.Username, target.Password)
 			}
+			setImpersonationHeaders(req.Header, target)
 			req.Header.Set("X-Kubeflare-User", principal.Subject)
 			req.Header.Set(application.HeaderClusterID, target.ID)
 		}
@@ -87,10 +91,49 @@ func NewHandler(opts HandlerOptions) http.Handler {
 	})
 }
 
+func setImpersonationHeaders(header http.Header, target application.ClusterTarget) {
+	if target.ImpersonateUser != "" {
+		header.Set("Impersonate-User", target.ImpersonateUser)
+	}
+	if target.ImpersonateUID != "" {
+		header.Set("Impersonate-Uid", target.ImpersonateUID)
+	}
+	for _, group := range splitCSV(target.ImpersonateGroups) {
+		header.Add("Impersonate-Group", group)
+	}
+	if target.ImpersonateExtra == "" {
+		return
+	}
+	var values map[string][]string
+	if err := json.Unmarshal([]byte(target.ImpersonateExtra), &values); err != nil {
+		return
+	}
+	for name, items := range values {
+		headerName := "Impersonate-Extra-" + name
+		for _, item := range items {
+			header.Add(headerName, item)
+		}
+	}
+}
+
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := strings.TrimSpace(part); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 func deleteImpersonationHeaders(header http.Header) {
 	for name := range header {
 		canonicalName := http.CanonicalHeaderKey(name)
-		if canonicalName == "Impersonate-User" || canonicalName == "Impersonate-Group" ||
+		if canonicalName == "Impersonate-User" || canonicalName == "Impersonate-Uid" || canonicalName == "Impersonate-Group" ||
 			strings.HasPrefix(canonicalName, "Impersonate-Extra-") {
 			header.Del(name)
 		}
@@ -137,7 +180,16 @@ func NewTransport(base *http.Transport, target application.ClusterTarget) (http.
 	}
 
 	transport := base.Clone()
-	if !target.SkipTLSVerify && target.CACertPEM == "" && target.TLSServerName == "" {
+	if target.ProxyURL != "" {
+		proxyURL, err := url.Parse(target.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy url: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	transport.DisableCompression = target.DisableCompression
+
+	if !target.SkipTLSVerify && target.CACertPEM == "" && target.TLSServerName == "" && target.ClientCertPEM == "" && target.ClientKeyPEM == "" {
 		return transport, nil
 	}
 
@@ -153,6 +205,13 @@ func NewTransport(base *http.Transport, target application.ClusterTarget) (http.
 			return nil, fmt.Errorf("append cluster ca certs")
 		}
 		tlsConfig.RootCAs = pool
+	}
+	if target.ClientCertPEM != "" || target.ClientKeyPEM != "" {
+		cert, err := tls.X509KeyPair([]byte(target.ClientCertPEM), []byte(target.ClientKeyPEM))
+		if err != nil {
+			return nil, fmt.Errorf("load client certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
 	transport.TLSClientConfig = tlsConfig

@@ -11,6 +11,7 @@ func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	cluster.Use(middleware.RequireRolesGin(middleware.RoleAdmin))
 	cluster.GET("", handler.List)
 	cluster.POST("", handler.Create)
+	cluster.POST("/import", handler.ImportKubeconfig)
 	cluster.GET("/:clusterID", handler.Get)
 	cluster.PUT("/:clusterID", handler.Update)
 	cluster.DELETE("/:clusterID", handler.Delete)

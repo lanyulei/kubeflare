@@ -36,10 +36,21 @@ type cacheEntry struct {
 type redisTarget struct {
 	ID                  string `json:"id"`
 	BaseURL             string `json:"base_url"`
+	AuthType            string `json:"auth_type"`
 	UpstreamBearerToken string `json:"upstream_bearer_token"`
 	CACertPEM           string `json:"ca_cert_pem"`
+	ClientCertPEM       string `json:"client_cert_pem"`
+	ClientKeyPEM        string `json:"client_key_pem"`
+	Username            string `json:"username"`
+	Password            string `json:"password"`
 	TLSServerName       string `json:"tls_server_name"`
 	SkipTLSVerify       bool   `json:"skip_tls_verify"`
+	ProxyURL            string `json:"proxy_url"`
+	DisableCompression  bool   `json:"disable_compression"`
+	ImpersonateUser     string `json:"impersonate_user"`
+	ImpersonateUID      string `json:"impersonate_uid"`
+	ImpersonateGroups   string `json:"impersonate_groups"`
+	ImpersonateExtra    string `json:"impersonate_extra"`
 	Enabled             *bool  `json:"enabled"`
 }
 
@@ -200,10 +211,21 @@ func (r *CachedRegistry) fromRedis(ctx context.Context, clusterID string) (kubep
 	return kubeproxyapp.ClusterTarget{
 		ID:                  stored.ID,
 		BaseURL:             *baseURL,
+		AuthType:            stored.AuthType,
 		UpstreamBearerToken: stored.UpstreamBearerToken,
 		CACertPEM:           stored.CACertPEM,
+		ClientCertPEM:       stored.ClientCertPEM,
+		ClientKeyPEM:        stored.ClientKeyPEM,
+		Username:            stored.Username,
+		Password:            stored.Password,
 		TLSServerName:       stored.TLSServerName,
 		SkipTLSVerify:       stored.SkipTLSVerify,
+		ProxyURL:            stored.ProxyURL,
+		DisableCompression:  stored.DisableCompression,
+		ImpersonateUser:     stored.ImpersonateUser,
+		ImpersonateUID:      stored.ImpersonateUID,
+		ImpersonateGroups:   stored.ImpersonateGroups,
+		ImpersonateExtra:    stored.ImpersonateExtra,
 		Enabled:             true,
 	}, true
 }
@@ -216,10 +238,21 @@ func (r *CachedRegistry) saveRedis(ctx context.Context, clusterID string, target
 	payload, err := json.Marshal(redisTarget{
 		ID:                  target.ID,
 		BaseURL:             target.BaseURL.String(),
+		AuthType:            target.AuthType,
 		UpstreamBearerToken: target.UpstreamBearerToken,
 		CACertPEM:           target.CACertPEM,
+		ClientCertPEM:       target.ClientCertPEM,
+		ClientKeyPEM:        target.ClientKeyPEM,
+		Username:            target.Username,
+		Password:            target.Password,
 		TLSServerName:       target.TLSServerName,
 		SkipTLSVerify:       target.SkipTLSVerify,
+		ProxyURL:            target.ProxyURL,
+		DisableCompression:  target.DisableCompression,
+		ImpersonateUser:     target.ImpersonateUser,
+		ImpersonateUID:      target.ImpersonateUID,
+		ImpersonateGroups:   target.ImpersonateGroups,
+		ImpersonateExtra:    target.ImpersonateExtra,
 		Enabled:             boolPointer(target.Enabled),
 	})
 	if err != nil {
@@ -260,10 +293,21 @@ func toClusterTarget(cluster clusterdomain.Cluster) (kubeproxyapp.ClusterTarget,
 	return kubeproxyapp.ClusterTarget{
 		ID:                  cluster.ID,
 		BaseURL:             *baseURL,
+		AuthType:            cluster.AuthType,
 		UpstreamBearerToken: cluster.UpstreamBearerToken,
 		CACertPEM:           cluster.CACertPEM,
+		ClientCertPEM:       cluster.ClientCertPEM,
+		ClientKeyPEM:        cluster.ClientKeyPEM,
+		Username:            cluster.Username,
+		Password:            cluster.Password,
 		TLSServerName:       cluster.TLSServerName,
 		SkipTLSVerify:       cluster.SkipTLSVerify,
+		ProxyURL:            cluster.ProxyURL,
+		DisableCompression:  cluster.DisableCompression,
+		ImpersonateUser:     cluster.ImpersonateUser,
+		ImpersonateUID:      cluster.ImpersonateUID,
+		ImpersonateGroups:   cluster.ImpersonateGroups,
+		ImpersonateExtra:    cluster.ImpersonateExtra,
 		Enabled:             cluster.Enabled,
 	}, nil
 }
