@@ -5,5 +5,4 @@ DROP TABLE IF EXISTS iam_login_failure;
 DROP TABLE IF EXISTS iam_refresh_token;
 DROP TABLE IF EXISTS iam_revoked_token;
 DROP TABLE IF EXISTS iam_auth_session;
-DROP TABLE IF EXISTS cluster;
 DROP TABLE IF EXISTS iam_user;

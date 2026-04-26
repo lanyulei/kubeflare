@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -15,9 +14,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/lanyulei/kubeflare/internal/module/cluster/application"
-	clusterpostgres "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/postgres"
-	clusterhttp "github.com/lanyulei/kubeflare/internal/module/cluster/interface/http"
 	iamapplication "github.com/lanyulei/kubeflare/internal/module/iam/application"
 	iamdomain "github.com/lanyulei/kubeflare/internal/module/iam/domain"
 	iamauthstate "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/authstate"
@@ -25,7 +21,6 @@ import (
 	iampostgres "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/postgres"
 	iamredis "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/redis"
 	iamhttp "github.com/lanyulei/kubeflare/internal/module/iam/interface/http"
-	kubeproxy "github.com/lanyulei/kubeflare/internal/module/kubeproxy/infrastructure/proxy"
 	uploadapplication "github.com/lanyulei/kubeflare/internal/module/upload/application"
 	uploadlocal "github.com/lanyulei/kubeflare/internal/module/upload/infrastructure/local"
 	uploadhttp "github.com/lanyulei/kubeflare/internal/module/upload/interface/http"
@@ -68,24 +63,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 
 	var encryptor secrets.Encryptor = secrets.NoopEncryptor{}
-	if cfg.Service.Environment == "production" && strings.TrimSpace(cfg.Proxy.EncryptionKey) == "" {
-		return nil, errors.New("proxy encryption key is required in production")
-	}
-	if cfg.Proxy.EncryptionKey != "" {
-		encryptor, err = secrets.NewAESGCMEncryptor(cfg.Proxy.EncryptionKey)
-		if err != nil {
-			return nil, err
-		}
-	}
 
-	clusterCacheTTL := cfg.Proxy.ClusterCacheTTL
-	if clusterCacheTTL <= 0 {
-		clusterCacheTTL = cfg.Redis.CacheTTL
-	}
 	authSigningKey := strings.TrimSpace(cfg.Auth.SigningKey)
-	if authSigningKey == "" {
-		authSigningKey = strings.TrimSpace(cfg.Proxy.EncryptionKey)
-	}
 
 	userRepo := iampostgres.NewUserRepository(gormDB, cfg.Database.QueryTimeout)
 	authStateRepo := iampostgres.NewAuthStateRepository(gormDB, cfg.Database.QueryTimeout)
@@ -99,8 +78,6 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	} else if redisClient != nil {
 		authStateStore = iamredis.NewAuthStateStore(redisClient)
 	}
-	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, encryptor, cfg.Database.QueryTimeout)
-	clusterRegistry := application.NewCachedRegistry(logger, clusterRepo, redisClient, clusterCacheTTL, encryptor)
 	uploadRepo := uploadlocal.NewFileRepository(cfg.Upload.RootDir)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
@@ -128,23 +105,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			return nil, err
 		}
 	}
-	clusterService := application.NewService(clusterRepo, validator, clusterRegistry)
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, clusterService, uploadService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService)
 	if err != nil {
 		return nil, err
 	}
 	authCleanupCtx, stopAuthCleanup := context.WithCancel(context.Background())
 	go runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore)
-
-	transportPool := kubeproxy.NewTransportPool(cfg.Proxy)
-	proxyHandler := middleware.RequireCSRFHTTP(middleware.AuthenticateHTTP(authenticator, kubeproxy.NewHandler(kubeproxy.HandlerOptions{
-		DefaultClusterID: cfg.Proxy.DefaultClusterID,
-		Registry:         clusterRegistry,
-		TransportBuilder: transportPool.For,
-		FlushInterval:    cfg.Proxy.FlushInterval,
-	})))
 
 	healthManager := health.NewManager(
 		cfg.HTTP.ReadinessTimeout,
@@ -180,8 +148,6 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		MetricsHandler: metricsRegistry.Handler(),
 		PprofHandler:   pprofHandler,
 		APIHandler:     apiHandler,
-		KAPIHandler:    proxyHandler,
-		KAPIsHandler:   proxyHandler,
 	})
 
 	rootHandler = metrics.InstrumentHTTP(metricsRegistry, rootHandler)
@@ -201,10 +167,6 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		drainDelay: cfg.HTTP.DrainTimeout,
 		shutdowners: []func(context.Context) error{
 			func(context.Context) error {
-				transportPool.CloseIdleConnections()
-				return nil
-			},
-			func(context.Context) error {
 				stopAuthCleanup()
 				return nil
 			},
@@ -221,7 +183,6 @@ func newAPIHandler(
 	authenticator middleware.Authenticator,
 	iamService *iamapplication.Service,
 	oidcService *iamapplication.OIDCService,
-	clusterService *application.Service,
 	uploadService *uploadapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
@@ -263,7 +224,6 @@ func newAPIHandler(
 	})
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
 	iamhttp.RegisterAdminRoutes(protectedAPI, iamHandler)
-	clusterhttp.RegisterRoutes(protectedAPI, clusterhttp.NewHandler(clusterService))
 	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
 
 	var handler http.Handler = engine

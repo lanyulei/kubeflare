@@ -14,12 +14,4 @@ const (
 
 	CodeUserNotFound      = 40101
 	CodeUserAlreadyExists = 40102
-
-	CodeClusterNotFound         = 40301
-	CodeClusterAlreadyExists    = 40302
-	CodeClusterRequired         = 40303
-	CodeInvalidProxyPath        = 40304
-	CodeInvalidClusterTransport = 40305
-	CodeUpstreamUnavailable     = 40306
-	CodeClusterDisabled         = 40307
 )

@@ -8,7 +8,6 @@ type Config struct {
 	Auth          AuthConfig          `koanf:"auth"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
-	Proxy         ProxyConfig         `koanf:"proxy"`
 	Upload        UploadConfig        `koanf:"upload"`
 	Observability ObservabilityConfig `koanf:"observability"`
 }
@@ -87,20 +86,6 @@ type RedisConfig struct {
 	HealthCheckTimeout time.Duration `koanf:"health_check_timeout"`
 }
 
-type ProxyConfig struct {
-	DefaultClusterID      string        `koanf:"default_cluster_id"`
-	ClusterCacheTTL       time.Duration `koanf:"cluster_cache_ttl"`
-	EncryptionKey         string        `koanf:"encryption_key"`
-	DialTimeout           time.Duration `koanf:"dial_timeout"`
-	TLSHandshakeTimeout   time.Duration `koanf:"tls_handshake_timeout"`
-	ResponseHeaderTimeout time.Duration `koanf:"response_header_timeout"`
-	IdleConnTimeout       time.Duration `koanf:"idle_conn_timeout"`
-	MaxIdleConns          int           `koanf:"max_idle_conns"`
-	MaxIdleConnsPerHost   int           `koanf:"max_idle_conns_per_host"`
-	MaxConnsPerHost       int           `koanf:"max_conns_per_host"`
-	FlushInterval         time.Duration `koanf:"flush_interval"`
-}
-
 type UploadConfig struct {
 	RootDir string `koanf:"root_dir"`
 }
@@ -136,7 +121,6 @@ func Default() Config {
 				"Authorization",
 				"Content-Type",
 				"X-Request-Id",
-				"X-Kubeflare-Cluster",
 				"X-Kubeflare-CSRF",
 			},
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -172,18 +156,6 @@ func Default() Config {
 			PoolSize:           32,
 			CacheTTL:           2 * time.Minute,
 			HealthCheckTimeout: 2 * time.Second,
-		},
-		Proxy: ProxyConfig{
-			ClusterCacheTTL:       30 * time.Second,
-			EncryptionKey:         "",
-			DialTimeout:           5 * time.Second,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-			MaxIdleConns:          256,
-			MaxIdleConnsPerHost:   64,
-			MaxConnsPerHost:       256,
-			FlushInterval:         200 * time.Millisecond,
 		},
 		Upload: UploadConfig{
 			RootDir: "data/uploads",

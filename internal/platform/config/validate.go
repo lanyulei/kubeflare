@@ -45,8 +45,8 @@ func Validate(cfg Config) error {
 	if cfg.Auth.CaptchaTTL < 0 {
 		return errors.New("auth.captcha_ttl must not be negative")
 	}
-	if cfg.Auth.SigningKey == "" && cfg.Proxy.EncryptionKey == "" {
-		return errors.New("auth.signing_key or proxy.encryption_key is required")
+	if cfg.Auth.SigningKey == "" {
+		return errors.New("auth.signing_key is required")
 	}
 	if cfg.Auth.OIDC.Enabled {
 		if cfg.Auth.OIDC.IssuerURL == "" || cfg.Auth.OIDC.ClientID == "" || cfg.Auth.OIDC.ClientSecret == "" || cfg.Auth.OIDC.RedirectURL == "" {
@@ -55,9 +55,6 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Upload.RootDir == "" {
 		return errors.New("upload.root_dir is required")
-	}
-	if (cfg.Database.Enabled || cfg.Redis.Enabled) && cfg.Proxy.EncryptionKey == "" {
-		return errors.New("proxy.encryption_key is required when database or redis is enabled")
 	}
 	return nil
 }

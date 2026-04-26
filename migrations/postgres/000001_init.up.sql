@@ -16,43 +16,6 @@ CREATE TABLE IF NOT EXISTS iam_user (
     deleted_at TIMESTAMPTZ
 );
 
-CREATE TABLE IF NOT EXISTS cluster (
-    id VARCHAR(32) PRIMARY KEY,
-    name VARCHAR(128) NOT NULL,
-    api_endpoint VARCHAR(255) NOT NULL,
-    auth_type VARCHAR(32) NOT NULL DEFAULT 'bearer_token',
-    upstream_bearer_token TEXT,
-    ca_cert_pem TEXT,
-    client_cert_pem TEXT,
-    client_key_pem TEXT,
-    username TEXT,
-    password TEXT,
-    auth_provider_config TEXT,
-    exec_config TEXT,
-    kubeconfig_raw TEXT,
-    tls_server_name VARCHAR(255),
-    skip_tls_verify BOOLEAN NOT NULL DEFAULT FALSE,
-    proxy_url VARCHAR(1024),
-    disable_compression BOOLEAN NOT NULL DEFAULT FALSE,
-    impersonate_user VARCHAR(255),
-    impersonate_uid VARCHAR(255),
-    impersonate_groups TEXT,
-    impersonate_extra TEXT,
-    namespace VARCHAR(255),
-    source_context VARCHAR(255),
-    source_cluster VARCHAR(255),
-    source_user VARCHAR(255),
-    "default" BOOLEAN NOT NULL DEFAULT FALSE,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_cluster_default_enabled
-        CHECK (NOT "default" OR enabled),
-    CONSTRAINT chk_cluster_auth_type
-        CHECK (auth_type IN ('bearer_token', 'client_certificate', 'basic', 'auth_provider', 'exec'))
-);
-
 CREATE TABLE IF NOT EXISTS iam_auth_session (
     id VARCHAR(64) PRIMARY KEY,
     subject VARCHAR(128) NOT NULL,
@@ -123,21 +86,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_iam_user_username_active
 CREATE UNIQUE INDEX IF NOT EXISTS idx_iam_user_email_active
     ON iam_user (email)
     WHERE deleted_at IS NULL AND email <> '';
-
-CREATE INDEX IF NOT EXISTS idx_cluster_deleted_at
-    ON cluster (deleted_at);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_name_active
-    ON cluster (name)
-    WHERE deleted_at IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_api_endpoint_active
-    ON cluster (api_endpoint)
-    WHERE deleted_at IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_default_true
-    ON cluster ("default")
-    WHERE "default" = TRUE AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_iam_auth_session_subject
     ON iam_auth_session (subject);

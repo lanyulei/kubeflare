@@ -24,14 +24,6 @@ func TestNewRootHandlerRoutesRequestsByPrefix(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte("api"))
 		}),
-		KAPIHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte("kapi"))
-		}),
-		KAPIsHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("kapis"))
-		}),
 	})
 
 	testCases := []struct {
@@ -43,8 +35,6 @@ func TestNewRootHandlerRoutesRequestsByPrefix(t *testing.T) {
 		{path: "/readyz", want: http.StatusNoContent},
 		{path: "/metrics", want: http.StatusOK, body: "metrics"},
 		{path: "/api/v1/user", want: http.StatusAccepted, body: "api"},
-		{path: "/kapi/v1/pods", want: http.StatusCreated, body: "kapi"},
-		{path: "/kapis/apps/v1/deployments", want: http.StatusOK, body: "kapis"},
 	}
 
 	for _, tc := range testCases {

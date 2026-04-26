@@ -72,13 +72,13 @@ func TestHTTPStatusErrorWritesIntegerCode(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 
-	HTTPStatusError(rr, http.StatusBadRequest, sharedErrors.CodeClusterRequired, "cluster id is required", "req-3")
+	HTTPStatusError(rr, http.StatusBadRequest, sharedErrors.CodeBadRequest, "bad request", "req-3")
 
 	var body Envelope
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if body.Code != sharedErrors.CodeClusterRequired {
-		t.Fatalf("code = %d, want %d", body.Code, sharedErrors.CodeClusterRequired)
+	if body.Code != sharedErrors.CodeBadRequest {
+		t.Fatalf("code = %d, want %d", body.Code, sharedErrors.CodeBadRequest)
 	}
 }
