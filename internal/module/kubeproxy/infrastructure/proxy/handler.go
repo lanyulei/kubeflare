@@ -3,9 +3,12 @@ package proxy
 import (
 	"crypto/tls"
 	"crypto/x509"
+	stdErrors "errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
@@ -29,6 +32,10 @@ func NewHandler(opts HandlerOptions) http.Handler {
 			writeJSONError(w, r, http.StatusUnauthorized, sharedErrors.CodeUnauthorized, middleware.ErrUnauthorized)
 			return
 		}
+		if !middleware.HasRole(principal, middleware.RoleAdmin) {
+			writeJSONError(w, r, http.StatusForbidden, sharedErrors.CodeForbidden, fmt.Errorf("forbidden"))
+			return
+		}
 
 		clusterID, err := application.ResolveClusterID(r, opts.DefaultClusterID)
 		if err != nil {
@@ -38,7 +45,7 @@ func NewHandler(opts HandlerOptions) http.Handler {
 
 		target, err := opts.Registry.ResolveCluster(r.Context(), clusterID)
 		if err != nil {
-			writeJSONError(w, r, http.StatusNotFound, sharedErrors.CodeClusterNotFound, err)
+			writeRegistryError(w, r, err)
 			return
 		}
 
@@ -64,9 +71,11 @@ func NewHandler(opts HandlerOptions) http.Handler {
 		proxy.Director = func(req *http.Request) {
 			originalDirector(req)
 			req.URL.Path = rewrittenPath
-			req.URL.RawPath = rewrittenPath
+			req.URL.RawPath = ""
+			req.URL.RawQuery = withoutClusterQuery(req.URL.Query()).Encode()
 			req.Host = target.BaseURL.Host
 			req.Header.Del("Authorization")
+			deleteImpersonationHeaders(req.Header)
 			if target.UpstreamBearerToken != "" {
 				req.Header.Set("Authorization", "Bearer "+target.UpstreamBearerToken)
 			}
@@ -76,6 +85,21 @@ func NewHandler(opts HandlerOptions) http.Handler {
 
 		proxy.ServeHTTP(w, r)
 	})
+}
+
+func deleteImpersonationHeaders(header http.Header) {
+	for name := range header {
+		canonicalName := http.CanonicalHeaderKey(name)
+		if canonicalName == "Impersonate-User" || canonicalName == "Impersonate-Group" ||
+			strings.HasPrefix(canonicalName, "Impersonate-Extra-") {
+			header.Del(name)
+		}
+	}
+}
+
+func withoutClusterQuery(values url.Values) url.Values {
+	delete(values, "cluster")
+	return values
 }
 
 func resolveTransport(opts HandlerOptions, target application.ClusterTarget) (http.RoundTripper, error) {
@@ -91,6 +115,16 @@ func resolveTransport(opts HandlerOptions, target application.ClusterTarget) (ht
 func writeJSONError(w http.ResponseWriter, r *http.Request, status int, code int, err error) {
 	requestID, _ := middleware.RequestIDFromContext(r.Context())
 	response.HTTPStatusError(w, status, code, err.Error(), requestID)
+}
+
+func writeRegistryError(w http.ResponseWriter, r *http.Request, err error) {
+	requestID, _ := middleware.RequestIDFromContext(r.Context())
+	var appErr *sharedErrors.AppError
+	if stdErrors.As(err, &appErr) {
+		response.HTTPError(w, requestID, appErr)
+		return
+	}
+	response.HTTPStatusError(w, http.StatusNotFound, sharedErrors.CodeClusterNotFound, "cluster not found", requestID)
 }
 
 func NewTransport(base *http.Transport, target application.ClusterTarget) (http.RoundTripper, error) {

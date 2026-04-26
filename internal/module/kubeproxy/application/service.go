@@ -13,6 +13,7 @@ type ClusterTarget struct {
 	CACertPEM           string
 	TLSServerName       string
 	SkipTLSVerify       bool
+	Enabled             bool
 }
 
 type ClusterRegistry interface {

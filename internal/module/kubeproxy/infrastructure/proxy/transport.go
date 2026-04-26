@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
@@ -15,7 +16,10 @@ import (
 type TransportPool struct {
 	base  *http.Transport
 	cache sync.Map
+	size  atomic.Int64
 }
+
+const maxCachedTransports = 512
 
 func NewTransportPool(cfg configpkg.ProxyConfig) *TransportPool {
 	return &TransportPool{
@@ -43,7 +47,16 @@ func (p *TransportPool) For(target application.ClusterTarget) (http.RoundTripper
 	if err != nil {
 		return nil, err
 	}
-	p.cache.Store(key, transport)
+	actual, loaded := p.cache.LoadOrStore(key, transport)
+	if loaded {
+		if closable, ok := transport.(*http.Transport); ok {
+			closable.CloseIdleConnections()
+		}
+		return actual.(http.RoundTripper), nil
+	}
+	if p.size.Add(1) > maxCachedTransports {
+		p.clearCachedTransports()
+	}
 	return transport, nil
 }
 
@@ -65,10 +78,24 @@ func (p *TransportPool) CloseIdleConnections() {
 	}
 
 	p.base.CloseIdleConnections()
-	p.cache.Range(func(_, value any) bool {
+	p.closeCachedTransports(false)
+}
+
+func (p *TransportPool) clearCachedTransports() {
+	p.closeCachedTransports(true)
+}
+
+func (p *TransportPool) closeCachedTransports(deleteEntries bool) {
+	p.cache.Range(func(key, value any) bool {
 		if transport, ok := value.(*http.Transport); ok {
 			transport.CloseIdleConnections()
 		}
+		if deleteEntries {
+			p.cache.Delete(key)
+		}
 		return true
 	})
+	if deleteEntries {
+		p.size.Store(0)
+	}
 }

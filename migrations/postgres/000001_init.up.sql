@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS cluster (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_cluster_default_enabled
+        CHECK (NOT "default" OR enabled)
 );
 
 CREATE TABLE IF NOT EXISTS iam_auth_session (
@@ -104,6 +106,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_iam_user_email_active
 
 CREATE INDEX IF NOT EXISTS idx_cluster_deleted_at
     ON cluster (deleted_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_name_active
+    ON cluster (name)
+    WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_api_endpoint_active
+    ON cluster (api_endpoint)
+    WHERE deleted_at IS NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_default_true
     ON cluster ("default")

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -67,6 +68,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 
 	var encryptor secrets.Encryptor = secrets.NoopEncryptor{}
+	if cfg.Service.Environment == "production" && strings.TrimSpace(cfg.Proxy.EncryptionKey) == "" {
+		return nil, errors.New("proxy encryption key is required in production")
+	}
 	if cfg.Proxy.EncryptionKey != "" {
 		encryptor, err = secrets.NewAESGCMEncryptor(cfg.Proxy.EncryptionKey)
 		if err != nil {
@@ -310,7 +314,15 @@ func (r userPrincipalResolver) ResolvePrincipal(ctx context.Context, subject str
 
 	return middleware.Principal{
 		Subject: subject,
+		Roles:   rolesForUser(user),
 	}, nil
+}
+
+func rolesForUser(user iamdomain.User) []string {
+	if strings.EqualFold(strings.TrimSpace(user.Username), "admin") {
+		return []string{middleware.RoleAdmin}
+	}
+	return nil
 }
 
 func resolvePrincipalUser(ctx context.Context, repo iamdomain.Repository, subject string) (iamdomain.User, error) {

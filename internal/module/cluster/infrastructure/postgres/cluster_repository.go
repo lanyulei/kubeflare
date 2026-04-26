@@ -38,6 +38,9 @@ func (clusterRecord) TableName() string {
 }
 
 func NewClusterRepository(db *gorm.DB, encryptor secrets.Encryptor, timeout time.Duration) *ClusterRepository {
+	if encryptor == nil {
+		encryptor = secrets.NoopEncryptor{}
+	}
 	return &ClusterRepository{db: db, encryptor: encryptor, timeout: timeout}
 }
 
@@ -55,11 +58,7 @@ func (r *ClusterRepository) List(ctx context.Context) ([]domain.Cluster, error) 
 
 	clusterList := make([]domain.Cluster, 0, len(records))
 	for _, record := range records {
-		cluster, err := r.toDomain(record)
-		if err != nil {
-			return nil, err
-		}
-		clusterList = append(clusterList, cluster)
+		clusterList = append(clusterList, toDomainCluster(record))
 	}
 	return clusterList, nil
 }
@@ -75,7 +74,7 @@ func (r *ClusterRepository) Get(ctx context.Context, id string) (domain.Cluster,
 	if err := r.db.WithContext(queryCtx).First(&record, "id = ?", id).Error; err != nil {
 		return domain.Cluster{}, err
 	}
-	return r.toDomain(record)
+	return toDomainCluster(record), nil
 }
 
 func (r *ClusterRepository) FindDefault(ctx context.Context) (domain.Cluster, error) {
@@ -87,6 +86,20 @@ func (r *ClusterRepository) FindDefault(ctx context.Context) (domain.Cluster, er
 
 	var record clusterRecord
 	if err := r.db.WithContext(queryCtx).First(&record, "\"default\" = ? AND enabled = ?", true, true).Error; err != nil {
+		return domain.Cluster{}, err
+	}
+	return toDomainCluster(record), nil
+}
+
+func (r *ClusterRepository) GetSecret(ctx context.Context, id string) (domain.Cluster, error) {
+	if r.db == nil {
+		return domain.Cluster{}, errors.New("cluster not found")
+	}
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record clusterRecord
+	if err := r.db.WithContext(queryCtx).First(&record, "id = ?", id).Error; err != nil {
 		return domain.Cluster{}, err
 	}
 	return r.toDomain(record)
@@ -106,7 +119,7 @@ func (r *ClusterRepository) Create(ctx context.Context, cluster domain.Cluster) 
 
 	if err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		if cluster.Default {
-			if err := tx.Model(&clusterRecord{}).Where("\"default\" = ?", true).Update("default", false).Error; err != nil {
+			if err := tx.Model(&clusterRecord{}).Where("\"default\" = ? AND id <> ?", true, cluster.ID).Update("default", false).Error; err != nil {
 				return err
 			}
 		}
@@ -132,7 +145,7 @@ func (r *ClusterRepository) Update(ctx context.Context, cluster domain.Cluster) 
 
 	if err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		if cluster.Default {
-			if err := tx.Model(&clusterRecord{}).Where("\"default\" = ?", true).Update("default", false).Error; err != nil {
+			if err := tx.Model(&clusterRecord{}).Where("\"default\" = ? AND id <> ?", true, cluster.ID).Update("default", false).Error; err != nil {
 				return err
 			}
 		}
@@ -179,6 +192,20 @@ func (r *ClusterRepository) toDomain(record clusterRecord) (domain.Cluster, erro
 		CreatedAt:           record.CreatedAt,
 		UpdatedAt:           record.UpdatedAt,
 	}, nil
+}
+
+func toDomainCluster(record clusterRecord) domain.Cluster {
+	return domain.Cluster{
+		ID:            record.ID,
+		Name:          record.Name,
+		APIEndpoint:   record.APIEndpoint,
+		TLSServerName: record.TLSServerName,
+		SkipTLSVerify: record.SkipTLSVerify,
+		Default:       record.Default,
+		Enabled:       record.Enabled,
+		CreatedAt:     record.CreatedAt,
+		UpdatedAt:     record.UpdatedAt,
+	}
 }
 
 func (r *ClusterRepository) fromDomain(cluster domain.Cluster) (clusterRecord, error) {

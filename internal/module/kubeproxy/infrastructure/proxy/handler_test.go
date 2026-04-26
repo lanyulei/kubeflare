@@ -26,7 +26,7 @@ func TestHandlerProxiesKAPIRequests(t *testing.T) {
 
 	handler := middleware.AuthenticateHTTP(
 		testAuthenticator(map[string]middleware.Principal{
-			"proxy-token": {Subject: "user-1"},
+			"proxy-token": {Subject: "user-1", Roles: []string{middleware.RoleAdmin}},
 		}),
 		NewHandler(HandlerOptions{
 			DefaultClusterID: "prod",
@@ -66,7 +66,7 @@ func TestHandlerProxiesKAPIRequests(t *testing.T) {
 	}
 }
 
-func TestHandlerAllowsAuthenticatedPrincipalWithoutProxyRole(t *testing.T) {
+func TestHandlerRejectsAuthenticatedPrincipalWithoutProxyRole(t *testing.T) {
 	t.Parallel()
 
 	targetURL, err := url.Parse("https://cluster.example.com")
@@ -100,7 +100,7 @@ func TestHandlerAllowsAuthenticatedPrincipalWithoutProxyRole(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusAccepted {
+	if rr.Code != http.StatusForbidden {
 		t.Fatalf("unexpected status code %d", rr.Code)
 	}
 }

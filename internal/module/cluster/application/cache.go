@@ -3,8 +3,8 @@ package application
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -14,6 +14,7 @@ import (
 	clusterdomain "github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	kubeproxyapp "github.com/lanyulei/kubeflare/internal/module/kubeproxy/application"
 	"github.com/lanyulei/kubeflare/internal/platform/secrets"
+	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 )
 
 type CachedRegistry struct {
@@ -39,6 +40,7 @@ type redisTarget struct {
 	CACertPEM           string `json:"ca_cert_pem"`
 	TLSServerName       string `json:"tls_server_name"`
 	SkipTLSVerify       bool   `json:"skip_tls_verify"`
+	Enabled             *bool  `json:"enabled"`
 }
 
 func NewCachedRegistry(
@@ -67,21 +69,26 @@ func (r *CachedRegistry) ResolveCluster(ctx context.Context, clusterID string) (
 		clusterID = cluster.ID
 	}
 
-	if target, ok := r.fromMemory(clusterID); ok {
-		return target, nil
+	if r.redis == nil {
+		if target, ok := r.fromMemory(clusterID); ok {
+			return target, nil
+		}
 	}
 
 	if target, ok := r.fromRedis(ctx, clusterID); ok {
-		r.remember(clusterID, target)
 		return target, nil
 	}
 
-	cluster, err := r.repo.Get(ctx, clusterID)
+	cluster, err := r.repo.GetSecret(ctx, clusterID)
 	if err != nil {
 		return kubeproxyapp.ClusterTarget{}, err
 	}
 	if !cluster.Enabled {
-		return kubeproxyapp.ClusterTarget{}, errors.New("cluster is disabled")
+		return kubeproxyapp.ClusterTarget{}, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeClusterDisabled,
+			Message: "cluster is disabled",
+			Status:  http.StatusForbidden,
+		}
 	}
 
 	target, err := toClusterTarget(cluster)
@@ -89,7 +96,9 @@ func (r *CachedRegistry) ResolveCluster(ctx context.Context, clusterID string) (
 		return kubeproxyapp.ClusterTarget{}, err
 	}
 
-	r.remember(clusterID, target)
+	if r.redis == nil {
+		r.remember(clusterID, target)
+	}
 	r.saveRedis(ctx, clusterID, target)
 	return target, nil
 }
@@ -117,20 +126,34 @@ func (r *CachedRegistry) Invalidate(clusterIDs ...string) {
 		err := r.redis.Del(deleteCtx, redisKey(clusterID)).Err()
 		cancel()
 		if err != nil {
-			r.logger.Warn("delete cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", err))
+			r.warn("delete cluster cache", clusterID, err)
 		}
 	}
 }
 
 func (r *CachedRegistry) fromMemory(clusterID string) (kubeproxyapp.ClusterTarget, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	now := time.Now()
 
+	r.mu.RLock()
 	entry, ok := r.cache[clusterID]
-	if !ok || time.Now().After(entry.expiresAt) {
+	if ok && now.Before(entry.expiresAt) {
+		r.mu.RUnlock()
+		return entry.target, true
+	}
+	r.mu.RUnlock()
+
+	if ok {
+		r.mu.Lock()
+		if current, currentOK := r.cache[clusterID]; currentOK && now.After(current.expiresAt) {
+			delete(r.cache, clusterID)
+		}
+		r.mu.Unlock()
+	}
+
+	if !ok {
 		return kubeproxyapp.ClusterTarget{}, false
 	}
-	return entry.target, true
+	return kubeproxyapp.ClusterTarget{}, false
 }
 
 func (r *CachedRegistry) remember(clusterID string, target kubeproxyapp.ClusterTarget) {
@@ -165,6 +188,9 @@ func (r *CachedRegistry) fromRedis(ctx context.Context, clusterID string) (kubep
 	if err := json.Unmarshal(payload, &stored); err != nil {
 		return kubeproxyapp.ClusterTarget{}, false
 	}
+	if stored.Enabled == nil || !*stored.Enabled {
+		return kubeproxyapp.ClusterTarget{}, false
+	}
 
 	baseURL, err := url.Parse(stored.BaseURL)
 	if err != nil {
@@ -178,6 +204,7 @@ func (r *CachedRegistry) fromRedis(ctx context.Context, clusterID string) (kubep
 		CACertPEM:           stored.CACertPEM,
 		TLSServerName:       stored.TLSServerName,
 		SkipTLSVerify:       stored.SkipTLSVerify,
+		Enabled:             true,
 	}, true
 }
 
@@ -193,6 +220,7 @@ func (r *CachedRegistry) saveRedis(ctx context.Context, clusterID string, target
 		CACertPEM:           target.CACertPEM,
 		TLSServerName:       target.TLSServerName,
 		SkipTLSVerify:       target.SkipTLSVerify,
+		Enabled:             boolPointer(target.Enabled),
 	})
 	if err != nil {
 		return
@@ -201,15 +229,22 @@ func (r *CachedRegistry) saveRedis(ctx context.Context, clusterID string, target
 	if r.crypt != nil {
 		encrypted, encryptErr := r.crypt.Encrypt(string(payload))
 		if encryptErr != nil {
-			r.logger.Warn("encrypt cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", encryptErr))
+			r.warn("encrypt cluster cache", clusterID, encryptErr)
 			return
 		}
 		payload = []byte(encrypted)
 	}
 
 	if err := r.redis.Set(ctx, redisKey(clusterID), payload, r.ttl).Err(); err != nil {
-		r.logger.Warn("store cluster cache", slog.String("cluster_id", clusterID), slog.Any("error", err))
+		r.warn("store cluster cache", clusterID, err)
 	}
+}
+
+func (r *CachedRegistry) warn(message string, clusterID string, err error) {
+	if r.logger == nil {
+		return
+	}
+	r.logger.Warn(message, slog.String("cluster_id", clusterID), slog.Any("error", err))
 }
 
 func redisKey(clusterID string) string {
@@ -229,5 +264,10 @@ func toClusterTarget(cluster clusterdomain.Cluster) (kubeproxyapp.ClusterTarget,
 		CACertPEM:           cluster.CACertPEM,
 		TLSServerName:       cluster.TLSServerName,
 		SkipTLSVerify:       cluster.SkipTLSVerify,
+		Enabled:             cluster.Enabled,
 	}, nil
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }

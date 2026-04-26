@@ -21,4 +21,5 @@ const (
 	CodeInvalidProxyPath        = 40304
 	CodeInvalidClusterTransport = 40305
 	CodeUpstreamUnavailable     = 40306
+	CodeClusterDisabled         = 40307
 )

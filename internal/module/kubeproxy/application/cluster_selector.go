@@ -1,7 +1,6 @@
 package application
 
 import (
-	"fmt"
 	"net/http"
 	"strings"
 )
@@ -21,5 +20,5 @@ func ResolveClusterID(r *http.Request, defaultClusterID string) (string, error) 
 		return clusterID, nil
 	}
 
-	return "", fmt.Errorf("cluster identifier is required")
+	return "", nil
 }

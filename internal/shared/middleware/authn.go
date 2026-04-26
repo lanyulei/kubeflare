@@ -20,7 +20,8 @@ import (
 )
 
 type Principal struct {
-	Subject string `json:"subject"`
+	Subject string   `json:"subject"`
+	Roles   []string `json:"roles,omitempty"`
 }
 
 type Authenticator interface {
@@ -102,6 +103,7 @@ const (
 	RefreshTokenCookieName = "kubeflare_refresh_token"
 	CSRFTokenCookieName    = "kubeflare_csrf_token"
 	CSRFTokenHeaderName    = "X-Kubeflare-CSRF"
+	RoleAdmin              = "admin"
 )
 
 func NewSignedTokenManager(secret string, ttl time.Duration) *SignedTokenManager {
@@ -380,6 +382,39 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 	return principal, ok
 }
 
+func HasRole(principal Principal, role string) bool {
+	for _, existingRole := range principal.Roles {
+		if existingRole == role {
+			return true
+		}
+	}
+	return false
+}
+
+func RequireRolesHTTP(roles ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			principal, ok := PrincipalFromContext(r.Context())
+			if !ok {
+				requestID, _ := RequestIDFromContext(r.Context())
+				writeAuthError(w, requestID, ErrUnauthorized)
+				return
+			}
+			if !principalHasAnyRole(principal, roles) {
+				requestID, _ := RequestIDFromContext(r.Context())
+				response.HTTPError(w, requestID, &sharedErrors.AppError{
+					Code:    sharedErrors.CodeForbidden,
+					Message: "forbidden",
+					Status:  http.StatusForbidden,
+					Err:     errors.New("forbidden"),
+				})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func AuthenticateGin(authenticator Authenticator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, ok := tokenFromGinContext(c)
@@ -409,6 +444,43 @@ func AuthenticateGin(authenticator Authenticator) gin.HandlerFunc {
 		c.Set("principal", principal)
 		c.Next()
 	}
+}
+
+func RequireRolesGin(roles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := PrincipalFromContext(c.Request.Context())
+		if !ok {
+			response.Error(c, &sharedErrors.AppError{
+				Code:    sharedErrors.CodeUnauthorized,
+				Message: ErrUnauthorized.Error(),
+				Status:  http.StatusUnauthorized,
+				Err:     ErrUnauthorized,
+			})
+			return
+		}
+		if !principalHasAnyRole(principal, roles) {
+			response.Error(c, &sharedErrors.AppError{
+				Code:    sharedErrors.CodeForbidden,
+				Message: "forbidden",
+				Status:  http.StatusForbidden,
+				Err:     errors.New("forbidden"),
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func principalHasAnyRole(principal Principal, roles []string) bool {
+	if len(roles) == 0 {
+		return true
+	}
+	for _, role := range roles {
+		if HasRole(principal, role) {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerToken(header string) (string, bool) {

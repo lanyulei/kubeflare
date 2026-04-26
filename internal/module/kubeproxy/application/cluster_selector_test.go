@@ -42,11 +42,15 @@ func TestResolveClusterIDFallsBackToQueryAndDefault(t *testing.T) {
 	}
 }
 
-func TestResolveClusterIDReturnsErrorWhenMissing(t *testing.T) {
+func TestResolveClusterIDAllowsRegistryDefaultWhenMissing(t *testing.T) {
 	t.Parallel()
 
 	req := httptest.NewRequest("GET", "/kapi/v1/pods", nil)
-	if _, err := ResolveClusterID(req, ""); err == nil {
-		t.Fatal("expected error when cluster is not specified")
+	got, err := ResolveClusterID(req, "")
+	if err != nil {
+		t.Fatalf("ResolveClusterID returned error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("ResolveClusterID returned %q, want empty cluster id", got)
 	}
 }
