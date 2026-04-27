@@ -16,6 +16,15 @@ type Encryptor interface {
 
 type NoopEncryptor struct{}
 
+func IsNoopEncryptor(encryptor Encryptor) bool {
+	switch encryptor.(type) {
+	case NoopEncryptor, *NoopEncryptor:
+		return true
+	default:
+		return false
+	}
+}
+
 func (NoopEncryptor) Encrypt(value string) (string, error) {
 	return value, nil
 }

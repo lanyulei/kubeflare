@@ -1,4 +1,5 @@
 DROP TABLE IF EXISTS iam_external_identity;
+DROP TABLE IF EXISTS cluster;
 DROP TABLE IF EXISTS iam_oidc_state;
 DROP TABLE IF EXISTS iam_captcha_challenge;
 DROP TABLE IF EXISTS iam_login_failure;

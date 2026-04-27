@@ -8,6 +8,7 @@ type Config struct {
 	Auth          AuthConfig          `koanf:"auth"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
+	Secrets       SecretsConfig       `koanf:"secrets"`
 	Upload        UploadConfig        `koanf:"upload"`
 	Observability ObservabilityConfig `koanf:"observability"`
 }
@@ -84,6 +85,10 @@ type RedisConfig struct {
 	PoolSize           int           `koanf:"pool_size"`
 	CacheTTL           time.Duration `koanf:"cache_ttl"`
 	HealthCheckTimeout time.Duration `koanf:"health_check_timeout"`
+}
+
+type SecretsConfig struct {
+	EncryptionKey string `koanf:"encryption_key"`
 }
 
 type UploadConfig struct {

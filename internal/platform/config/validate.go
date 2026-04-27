@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 )
 
@@ -26,6 +27,10 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Redis.Enabled && cfg.Redis.Address == "" {
 		return errors.New("redis.address is required when redis is enabled")
+	}
+	key, err := hex.DecodeString(cfg.Secrets.EncryptionKey)
+	if err != nil || len(key) != 32 {
+		return errors.New("secrets.encryption_key is required and must be a 32-byte hex string")
 	}
 	if cfg.Auth.TokenTTL < 0 {
 		return errors.New("auth.token_ttl must not be negative")

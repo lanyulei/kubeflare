@@ -74,6 +74,9 @@ redis:
   cache_ttl: 2m
   health_check_timeout: 2s
 
+secrets:
+  encryption_key: ${KUBEFLARE_SECRETS__ENCRYPTION_KEY}
+
 upload:
   root_dir: data/uploads
 

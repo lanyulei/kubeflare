@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -14,6 +15,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	clusterapplication "github.com/lanyulei/kubeflare/internal/module/cluster/application"
+	clusterkubernetes "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/kubernetes"
+	clusterpostgres "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/postgres"
+	clusterhttp "github.com/lanyulei/kubeflare/internal/module/cluster/interface/http"
 	iamapplication "github.com/lanyulei/kubeflare/internal/module/iam/application"
 	iamdomain "github.com/lanyulei/kubeflare/internal/module/iam/domain"
 	iamauthstate "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/authstate"
@@ -62,7 +67,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 
-	var encryptor secrets.Encryptor = secrets.NoopEncryptor{}
+	encryptionKey := strings.TrimSpace(cfg.Secrets.EncryptionKey)
+	if encryptionKey == "" {
+		return nil, errors.New("secrets.encryption_key is required")
+	}
+	encryptor, err := secrets.NewAESGCMEncryptor(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
 
 	authSigningKey := strings.TrimSpace(cfg.Auth.SigningKey)
 
@@ -79,6 +91,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		authStateStore = iamredis.NewAuthStateStore(redisClient)
 	}
 	uploadRepo := uploadlocal.NewFileRepository(cfg.Upload.RootDir)
+	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, cfg.Database.QueryTimeout)
+	clusterInspector := clusterkubernetes.NewInspector(cfg.Database.QueryTimeout)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
 	authenticator := middleware.NewSignedTokenAuthenticator(tokenManager, userPrincipalResolver{repo: userRepo})
@@ -106,8 +120,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		}
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
+	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +199,7 @@ func newAPIHandler(
 	iamService *iamapplication.Service,
 	oidcService *iamapplication.OIDCService,
 	uploadService *uploadapplication.Service,
+	clusterService *clusterapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -210,6 +226,7 @@ func newAPIHandler(
 	iamhttp.RegisterPublicRoutes(api, iamHandler)
 	uploadHandler := uploadhttp.NewHandler(uploadService)
 	uploadhttp.RegisterPublicRoutes(api, uploadHandler)
+	clusterHandler := clusterhttp.NewHandler(clusterService)
 
 	protectedAPI := api.Group("")
 	protectedAPI.Use(middleware.AuthenticateGin(authenticator))
@@ -225,6 +242,7 @@ func newAPIHandler(
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
 	iamhttp.RegisterAdminRoutes(protectedAPI, iamHandler)
 	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
+	clusterhttp.RegisterRoutes(protectedAPI, clusterHandler)
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
