@@ -16,21 +16,21 @@ type ClusterRepository struct {
 	timeout time.Duration
 }
 
-type clusterRecord struct {
-	ID        int64          `gorm:"primaryKey;autoIncrement"`
-	Name      string         `gorm:"size:128;not null;index:idx_cluster_name_active,unique,where:delete_time IS NULL"`
-	Alias     string         `gorm:"size:128;not null;default:''"`
-	Provider  string         `gorm:"size:64;not null;default:''"`
-	YAML      string         `gorm:"column:yaml;type:text;not null"`
-	Remarks   string         `gorm:"size:512;not null;default:''"`
-	Status    bool           `gorm:"not null;default:true"`
-	CreatedAt time.Time      `gorm:"column:create_time;not null"`
-	UpdatedAt time.Time      `gorm:"column:update_time;not null"`
-	DeletedAt gorm.DeletedAt `gorm:"column:delete_time;index"`
+type clusterInfoRecord struct {
+	ID         int64          `gorm:"primaryKey;autoIncrement"`
+	Name       string         `gorm:"size:128;not null"`
+	Alias      string         `gorm:"size:128;not null;default:''"`
+	Provider   string         `gorm:"size:128;not null;default:''"`
+	Yaml       string         `gorm:"type:text;not null"`
+	Remarks    string         `gorm:"size:512;not null;default:''"`
+	Status     int            `gorm:"not null;default:1"`
+	CreateTime time.Time      `gorm:"column:create_time;not null"`
+	UpdateTime time.Time      `gorm:"column:update_time;not null"`
+	DeleteTime gorm.DeletedAt `gorm:"column:delete_time;index"`
 }
 
-func (clusterRecord) TableName() string {
-	return "cluster"
+func (clusterInfoRecord) TableName() string {
+	return "cluster_info"
 }
 
 func NewClusterRepository(db *gorm.DB, timeout time.Duration) *ClusterRepository {
@@ -45,7 +45,7 @@ func (r *ClusterRepository) List(ctx context.Context) ([]domain.Cluster, error) 
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	var records []clusterRecord
+	var records []clusterInfoRecord
 	if err := r.db.WithContext(queryCtx).Order("id DESC").Find(&records).Error; err != nil {
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func (r *ClusterRepository) Get(ctx context.Context, id int64) (domain.Cluster, 
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	var record clusterRecord
+	var record clusterInfoRecord
 	if err := r.db.WithContext(queryCtx).First(&record, "id = ?", id).Error; err != nil {
 		return domain.Cluster{}, err
 	}
@@ -95,30 +95,23 @@ func (r *ClusterRepository) Update(ctx context.Context, cluster domain.Cluster) 
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	var updated domain.Cluster
-	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
-		var record clusterRecord
-		if err := tx.First(&record, "id = ?", cluster.ID).Error; err != nil {
-			return err
-		}
-
-		record.Name = cluster.Name
-		record.Alias = cluster.Alias
-		record.Provider = cluster.Provider
-		record.YAML = cluster.YAML
-		record.Remarks = cluster.Remarks
-		record.Status = cluster.Status
-		record.UpdatedAt = cluster.UpdatedAt
-		if err := tx.Save(&record).Error; err != nil {
-			return err
-		}
-		updated = toDomainCluster(record)
-		return nil
-	})
-	if err != nil {
+	var record clusterInfoRecord
+	if err := r.db.WithContext(queryCtx).First(&record, "id = ?", cluster.ID).Error; err != nil {
 		return domain.Cluster{}, err
 	}
-	return updated, nil
+
+	record.Name = cluster.Name
+	record.Alias = cluster.Alias
+	record.Provider = cluster.Provider
+	record.Yaml = cluster.Yaml
+	record.Remarks = cluster.Remarks
+	record.Status = cluster.Status
+	record.UpdateTime = cluster.UpdatedAt
+
+	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
+		return domain.Cluster{}, err
+	}
+	return toDomainCluster(record), nil
 }
 
 func (r *ClusterRepository) Delete(ctx context.Context, id int64) error {
@@ -129,45 +122,41 @@ func (r *ClusterRepository) Delete(ctx context.Context, id int64) error {
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	result := r.db.WithContext(queryCtx).Delete(&clusterRecord{}, "id = ?", id)
+	result := r.db.WithContext(queryCtx).Delete(&clusterInfoRecord{}, "id = ?", id)
 	return deleteResultError(result.Error, result.RowsAffected)
 }
 
-func toDomainCluster(record clusterRecord) domain.Cluster {
+func toDomainCluster(record clusterInfoRecord) domain.Cluster {
 	cluster := domain.Cluster{
 		ID:        record.ID,
 		Name:      record.Name,
 		Alias:     record.Alias,
 		Provider:  record.Provider,
-		YAML:      record.YAML,
+		Yaml:      record.Yaml,
 		Remarks:   record.Remarks,
 		Status:    record.Status,
-		CreatedAt: record.CreatedAt,
-		UpdatedAt: record.UpdatedAt,
+		CreatedAt: record.CreateTime,
+		UpdatedAt: record.UpdateTime,
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
+	if record.DeleteTime.Valid {
+		deletedAt := record.DeleteTime.Time
 		cluster.DeletedAt = &deletedAt
 	}
 	return cluster
 }
 
-func fromDomainCluster(cluster domain.Cluster) clusterRecord {
-	record := clusterRecord{
-		ID:        cluster.ID,
-		Name:      cluster.Name,
-		Alias:     cluster.Alias,
-		Provider:  cluster.Provider,
-		YAML:      cluster.YAML,
-		Remarks:   cluster.Remarks,
-		Status:    cluster.Status,
-		CreatedAt: cluster.CreatedAt,
-		UpdatedAt: cluster.UpdatedAt,
+func fromDomainCluster(cluster domain.Cluster) clusterInfoRecord {
+	return clusterInfoRecord{
+		ID:         cluster.ID,
+		Name:       cluster.Name,
+		Alias:      cluster.Alias,
+		Provider:   cluster.Provider,
+		Yaml:       cluster.Yaml,
+		Remarks:    cluster.Remarks,
+		Status:     cluster.Status,
+		CreateTime: cluster.CreatedAt,
+		UpdateTime: cluster.UpdatedAt,
 	}
-	if cluster.DeletedAt != nil {
-		record.DeletedAt = gorm.DeletedAt{Time: *cluster.DeletedAt, Valid: true}
-	}
-	return record
 }
 
 func deleteResultError(err error, rowsAffected int64) error {

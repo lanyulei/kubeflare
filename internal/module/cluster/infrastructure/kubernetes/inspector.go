@@ -21,45 +21,48 @@ func NewInspector(timeout time.Duration) *Inspector {
 	return &Inspector{timeout: timeout}
 }
 
-func (i *Inspector) Inspect(ctx context.Context, kubeconfigYAML string) (domain.RuntimeInfo, error) {
-	kubeconfigYAML = strings.TrimSpace(kubeconfigYAML)
-	if kubeconfigYAML == "" {
-		return domain.RuntimeInfo{}, fmt.Errorf("cluster yaml is required")
+func (inspector *Inspector) Inspect(ctx context.Context, kubeconfig string) (domain.ClusterStats, error) {
+	kubeconfig = strings.TrimSpace(kubeconfig)
+	if kubeconfig == "" {
+		return domain.ClusterStats{}, fmt.Errorf("cluster yaml is empty")
 	}
 
-	config, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfigYAML))
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
 	if err != nil {
-		return domain.RuntimeInfo{}, fmt.Errorf("parse cluster yaml: %w", err)
+		return domain.ClusterStats{}, fmt.Errorf("invalid cluster yaml")
 	}
-	if i != nil && i.timeout > 0 {
-		config.Timeout = i.timeout
+	if inspector != nil && inspector.timeout > 0 {
+		restConfig.Timeout = inspector.timeout
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return domain.RuntimeInfo{}, fmt.Errorf("create kubernetes client: %w", err)
+		return domain.ClusterStats{}, fmt.Errorf("failed to create kubernetes client")
 	}
 
 	queryCtx := ctx
 	cancel := func() {}
-	if i != nil && i.timeout > 0 {
-		queryCtx, cancel = context.WithTimeout(ctx, i.timeout)
+	if inspector != nil && inspector.timeout > 0 {
+		queryCtx, cancel = context.WithTimeout(ctx, inspector.timeout)
 	}
 	defer cancel()
 
-	version, err := clientset.Discovery().ServerVersion()
-	if err != nil {
-		return domain.RuntimeInfo{}, fmt.Errorf("query cluster version: %w", err)
-	}
-
 	nodes, err := clientset.CoreV1().Nodes().List(queryCtx, metav1.ListOptions{})
 	if err != nil {
-		return domain.RuntimeInfo{}, fmt.Errorf("query cluster nodes: %w", err)
+		return domain.ClusterStats{}, fmt.Errorf("failed to query cluster nodes")
 	}
 
-	return domain.RuntimeInfo{
-		NodeCount:      len(nodes.Items),
-		RuntimeStatus:  "available",
-		ClusterVersion: version.GitVersion,
+	version, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		return domain.ClusterStats{
+			NodeCount:    len(nodes.Items),
+			RunningState: "unhealthy",
+		}, fmt.Errorf("failed to query cluster version")
+	}
+
+	return domain.ClusterStats{
+		NodeCount:    len(nodes.Items),
+		RunningState: "available",
+		Version:      version.String(),
 	}, nil
 }

@@ -226,7 +226,6 @@ func newAPIHandler(
 	iamhttp.RegisterPublicRoutes(api, iamHandler)
 	uploadHandler := uploadhttp.NewHandler(uploadService)
 	uploadhttp.RegisterPublicRoutes(api, uploadHandler)
-	clusterHandler := clusterhttp.NewHandler(clusterService)
 
 	protectedAPI := api.Group("")
 	protectedAPI.Use(middleware.AuthenticateGin(authenticator))
@@ -242,6 +241,7 @@ func newAPIHandler(
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
 	iamhttp.RegisterAdminRoutes(protectedAPI, iamHandler)
 	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
+	clusterHandler := clusterhttp.NewHandler(clusterService)
 	clusterhttp.RegisterRoutes(protectedAPI, clusterHandler)
 
 	var handler http.Handler = engine

@@ -2,26 +2,30 @@ package application
 
 import (
 	"context"
-	"errors"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"gorm.io/gorm"
 
 	"github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	"github.com/lanyulei/kubeflare/internal/platform/secrets"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 )
 
+const (
+	RUNNING_STATE_UNKNOWN   = "unknown"
+	RUNNING_STATE_AVAILABLE = "available"
+	RUNNING_STATE_UNHEALTHY = "unhealthy"
+	RUNNING_STATE_DISABLED  = "disabled"
+)
+
 const MAX_RUNTIME_INSPECTORS = 4
 
-const RUNTIME_INSPECT_TIMEOUT = 3 * time.Second
-
 type RuntimeInspector interface {
-	Inspect(ctx context.Context, kubeconfigYAML string) (domain.RuntimeInfo, error)
+	Inspect(ctx context.Context, kubeconfig string) (domain.ClusterStats, error)
 }
 
 type Service struct {
@@ -43,116 +47,88 @@ func NewService(repo domain.Repository, validator *validator.Validate, encryptor
 	}
 }
 
-func (s *Service) List(ctx context.Context) ([]ClusterListItem, error) {
+func (s *Service) List(ctx context.Context) ([]domain.ClusterWithStats, error) {
 	clusters, err := s.repo.List(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	items := s.listItemsWithRuntime(ctx, clusters)
-	return items, nil
+	return s.listWithStats(ctx, clusters), nil
 }
 
-func (s *Service) Get(ctx context.Context, id string) (ClusterDetail, error) {
+func (s *Service) Get(ctx context.Context, id string) (domain.ClusterWithStats, error) {
 	clusterID, err := parseClusterID(id)
 	if err != nil {
-		return ClusterDetail{}, err
+		return domain.ClusterWithStats{}, err
 	}
 
 	cluster, err := s.repo.Get(ctx, clusterID)
 	if err != nil {
-		return ClusterDetail{}, mapRepositoryError(err, "cluster not found")
+		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
-
-	decryptedCluster, runtimeInfo := s.clusterWithRuntime(ctx, cluster)
-	return toClusterDetail(decryptedCluster, runtimeInfo), nil
+	return s.withStats(ctx, cluster, true), nil
 }
 
-func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (ClusterDetail, error) {
-	req = sanitizeCreateRequest(req)
+func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (domain.ClusterWithStats, error) {
 	if err := s.validator.Struct(req); err != nil {
-		return ClusterDetail{}, err
-	}
-	if err := s.ensureEncryptor(); err != nil {
-		return ClusterDetail{}, err
+		return domain.ClusterWithStats{}, err
 	}
 
-	encryptedYAML, err := s.encryptor.Encrypt(req.YAML)
+	encryptedYaml, err := s.encryptYaml(req.Yaml)
 	if err != nil {
-		return ClusterDetail{}, err
+		return domain.ClusterWithStats{}, err
 	}
 
 	now := time.Now().UTC()
-	status := true
-	if req.Status != nil {
-		status = *req.Status
-	}
-	cluster := domain.Cluster{
-		Name:      req.Name,
-		Alias:     req.Alias,
-		Provider:  req.Provider,
-		YAML:      encryptedYAML,
-		Remarks:   req.Remarks,
-		Status:    status,
+	cluster, err := s.repo.Create(ctx, domain.Cluster{
+		Name:      strings.TrimSpace(req.Name),
+		Alias:     strings.TrimSpace(req.Alias),
+		Provider:  strings.TrimSpace(req.Provider),
+		Yaml:      encryptedYaml,
+		Remarks:   strings.TrimSpace(req.Remarks),
+		Status:    normalizeStatus(req.Status, domain.STATUS_ENABLED),
 		CreatedAt: now,
 		UpdatedAt: now,
-	}
-
-	created, err := s.repo.Create(ctx, cluster)
+	})
 	if err != nil {
-		return ClusterDetail{}, mapRepositoryError(err, "cluster already exists")
+		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
-	created.YAML = req.YAML
-	runtimeInfo := s.runtimeInfo(ctx, created)
-	return toClusterDetail(created, runtimeInfo), nil
+	return s.withStats(ctx, cluster, true), nil
 }
 
-func (s *Service) Update(ctx context.Context, id string, req UpdateClusterRequest) (ClusterDetail, error) {
-	clusterID, err := parseClusterID(id)
-	if err != nil {
-		return ClusterDetail{}, err
+func (s *Service) Update(ctx context.Context, id string, req UpdateClusterRequest) (domain.ClusterWithStats, error) {
+	if err := s.validator.Struct(req); err != nil {
+		return domain.ClusterWithStats{}, err
 	}
 
-	req = sanitizeUpdateRequest(req)
-	if err := s.validator.Struct(req); err != nil {
-		return ClusterDetail{}, err
-	}
-	if err := s.ensureEncryptor(); err != nil {
-		return ClusterDetail{}, err
+	clusterID, err := parseClusterID(id)
+	if err != nil {
+		return domain.ClusterWithStats{}, err
 	}
 
 	existing, err := s.repo.Get(ctx, clusterID)
 	if err != nil {
-		return ClusterDetail{}, mapRepositoryError(err, "cluster not found")
+		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
 
-	encryptedYAML, err := s.encryptor.Encrypt(req.YAML)
+	encryptedYaml, err := s.encryptYaml(req.Yaml)
 	if err != nil {
-		return ClusterDetail{}, err
+		return domain.ClusterWithStats{}, err
 	}
 
-	status := existing.Status
-	if req.Status != nil {
-		status = *req.Status
-	}
-	cluster := domain.Cluster{
-		ID:        clusterID,
-		Name:      req.Name,
-		Alias:     req.Alias,
-		Provider:  req.Provider,
-		YAML:      encryptedYAML,
-		Remarks:   req.Remarks,
-		Status:    status,
-		UpdatedAt: time.Now().UTC(),
-	}
+	existing.Name = strings.TrimSpace(req.Name)
+	existing.Alias = strings.TrimSpace(req.Alias)
+	existing.Provider = strings.TrimSpace(req.Provider)
+	existing.Yaml = encryptedYaml
+	existing.Remarks = strings.TrimSpace(req.Remarks)
+	existing.Status = normalizeStatus(req.Status, existing.Status)
+	existing.UpdatedAt = time.Now().UTC()
 
-	updated, err := s.repo.Update(ctx, cluster)
+	updated, err := s.repo.Update(ctx, existing)
 	if err != nil {
-		return ClusterDetail{}, mapRepositoryError(err, "cluster not found")
+		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
-	updated.YAML = req.YAML
-	runtimeInfo := s.runtimeInfo(ctx, updated)
-	return toClusterDetail(updated, runtimeInfo), nil
+	return s.withStats(ctx, updated, true), nil
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
@@ -166,8 +142,8 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) listItemsWithRuntime(ctx context.Context, clusters []domain.Cluster) []ClusterListItem {
-	items := make([]ClusterListItem, len(clusters))
+func (s *Service) listWithStats(ctx context.Context, clusters []domain.Cluster) []domain.ClusterWithStats {
+	items := make([]domain.ClusterWithStats, len(clusters))
 	workers := MAX_RUNTIME_INSPECTORS
 	if len(clusters) < workers {
 		workers = len(clusters)
@@ -182,16 +158,13 @@ func (s *Service) listItemsWithRuntime(ctx context.Context, clusters []domain.Cl
 	}
 
 	jobs := make(chan listJob)
-	var wg sync.WaitGroup
+	var waitGroup sync.WaitGroup
 	for range workers {
-		wg.Add(1)
+		waitGroup.Add(1)
 		go func() {
-			defer wg.Done()
+			defer waitGroup.Done()
 			for job := range jobs {
-				runtimeCtx, cancel := context.WithTimeout(ctx, RUNTIME_INSPECT_TIMEOUT)
-				decryptedCluster, runtimeInfo := s.clusterWithRuntime(runtimeCtx, job.cluster)
-				cancel()
-				items[job.index] = toClusterListItem(decryptedCluster, runtimeInfo)
+				items[job.index] = s.withStats(ctx, job.cluster, false)
 			}
 		}()
 	}
@@ -200,10 +173,16 @@ func (s *Service) listItemsWithRuntime(ctx context.Context, clusters []domain.Cl
 		select {
 		case <-ctx.Done():
 			close(jobs)
-			wg.Wait()
+			waitGroup.Wait()
 			for itemIndex, item := range items {
-				if strings.TrimSpace(item.RuntimeStatus) == "" {
-					items[itemIndex] = toClusterListItem(clusters[itemIndex], domain.RuntimeInfo{RuntimeStatus: "unknown"})
+				if strings.TrimSpace(item.RunningState) == "" {
+					items[itemIndex] = domain.ClusterWithStats{
+						Cluster: clusters[itemIndex],
+						ClusterStats: domain.ClusterStats{
+							RunningState: RUNNING_STATE_UNKNOWN,
+							Message:      "request canceled",
+						},
+					}
 				}
 			}
 			return items
@@ -211,142 +190,128 @@ func (s *Service) listItemsWithRuntime(ctx context.Context, clusters []domain.Cl
 		}
 	}
 	close(jobs)
-	wg.Wait()
+	waitGroup.Wait()
 	return items
 }
 
-func (s *Service) clusterWithRuntime(ctx context.Context, cluster domain.Cluster) (domain.Cluster, domain.RuntimeInfo) {
-	decryptedYAML, err := s.encryptor.Decrypt(cluster.YAML)
+func (s *Service) withStats(ctx context.Context, cluster domain.Cluster, includeYaml bool) domain.ClusterWithStats {
+	decryptedYaml, err := s.decryptYaml(cluster.Yaml)
 	if err != nil {
-		cluster.YAML = ""
-		return cluster, unavailableRuntimeInfo("cluster yaml unavailable")
-	}
-	cluster.YAML = decryptedYAML
-	return cluster, s.runtimeInfo(ctx, cluster)
-}
-
-func (s *Service) runtimeInfo(ctx context.Context, cluster domain.Cluster) domain.RuntimeInfo {
-	if !cluster.Status {
-		return domain.RuntimeInfo{RuntimeStatus: "disabled"}
-	}
-	if s.inspector == nil {
-		return domain.RuntimeInfo{RuntimeStatus: "unknown"}
-	}
-	runtimeInfo, err := s.inspector.Inspect(ctx, cluster.YAML)
-	if err != nil {
-		return unavailableRuntimeInfo("cluster runtime unavailable")
-	}
-	if strings.TrimSpace(runtimeInfo.RuntimeStatus) == "" {
-		runtimeInfo.RuntimeStatus = "available"
-	}
-	return runtimeInfo
-}
-
-func (s *Service) ensureEncryptor() error {
-	if s.encryptor == nil || secrets.IsNoopEncryptor(s.encryptor) {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeInternal,
-			Message: "cluster encryption is not configured",
-			Status:  http.StatusInternalServerError,
-			Err:     errors.New("cluster encryption is not configured"),
+		cluster.Yaml = ""
+		return domain.ClusterWithStats{
+			Cluster: cluster,
+			ClusterStats: domain.ClusterStats{
+				RunningState: RUNNING_STATE_UNHEALTHY,
+				Message:      "failed to decrypt cluster yaml",
+			},
 		}
 	}
-	return nil
-}
 
-func unavailableRuntimeInfo(message string) domain.RuntimeInfo {
-	return domain.RuntimeInfo{
-		RuntimeStatus: "unavailable",
-		RuntimeError:  message,
+	cluster.Yaml = ""
+	if includeYaml {
+		cluster.Yaml = decryptedYaml
 	}
+
+	stats := s.clusterStats(ctx, cluster.Status, decryptedYaml)
+	return domain.ClusterWithStats{Cluster: cluster, ClusterStats: stats}
 }
 
-func sanitizeCreateRequest(req CreateClusterRequest) CreateClusterRequest {
-	req.Name = strings.TrimSpace(req.Name)
-	req.Alias = strings.TrimSpace(req.Alias)
-	req.Provider = strings.TrimSpace(req.Provider)
-	req.YAML = strings.TrimSpace(req.YAML)
-	req.Remarks = strings.TrimSpace(req.Remarks)
-	return req
+func (s *Service) clusterStats(ctx context.Context, status int, kubeconfig string) domain.ClusterStats {
+	if status != domain.STATUS_ENABLED {
+		return domain.ClusterStats{RunningState: RUNNING_STATE_DISABLED}
+	}
+	if strings.TrimSpace(kubeconfig) == "" {
+		return domain.ClusterStats{
+			RunningState: RUNNING_STATE_UNKNOWN,
+			Message:      "cluster yaml is empty",
+		}
+	}
+	if s.inspector == nil {
+		return domain.ClusterStats{RunningState: RUNNING_STATE_UNKNOWN}
+	}
+
+	stats, err := s.inspector.Inspect(ctx, kubeconfig)
+	if err != nil {
+		stats.RunningState = RUNNING_STATE_UNHEALTHY
+		stats.Message = err.Error()
+		return domain.ClusterStats{
+			NodeCount:    stats.NodeCount,
+			RunningState: stats.RunningState,
+			Version:      stats.Version,
+			Message:      stats.Message,
+		}
+	}
+	if strings.TrimSpace(stats.RunningState) == "" {
+		stats.RunningState = RUNNING_STATE_AVAILABLE
+	}
+	return stats
 }
 
-func sanitizeUpdateRequest(req UpdateClusterRequest) UpdateClusterRequest {
-	req.Name = strings.TrimSpace(req.Name)
-	req.Alias = strings.TrimSpace(req.Alias)
-	req.Provider = strings.TrimSpace(req.Provider)
-	req.YAML = strings.TrimSpace(req.YAML)
-	req.Remarks = strings.TrimSpace(req.Remarks)
-	return req
+func (s *Service) encryptYaml(value string) (string, error) {
+	encryptedYaml, err := s.encryptor.Encrypt(strings.TrimSpace(value))
+	if err != nil {
+		return "", &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: "failed to encrypt cluster yaml",
+			Status:  500,
+			Err:     err,
+		}
+	}
+	return encryptedYaml, nil
 }
 
-func parseClusterID(id string) (int64, error) {
-	clusterID, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64)
+func (s *Service) decryptYaml(value string) (string, error) {
+	decryptedYaml, err := s.encryptor.Decrypt(value)
+	if err != nil {
+		return "", err
+	}
+	return decryptedYaml, nil
+}
+
+func mapRepositoryError(err error, notFoundMessage string) error {
+	if err == nil {
+		return nil
+	}
+
+	if err == gorm.ErrRecordNotFound || strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeNotFound,
+			Message: notFoundMessage,
+			Status:  404,
+			Err:     err,
+		}
+	}
+	if err == gorm.ErrDuplicatedKey {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeConflict,
+			Message: "cluster name already exists",
+			Status:  409,
+			Err:     err,
+		}
+	}
+
+	return err
+}
+
+func parseClusterID(value string) (int64, error) {
+	clusterID, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if err != nil || clusterID <= 0 {
 		return 0, &sharedErrors.AppError{
 			Code:    sharedErrors.CodeBadRequest,
 			Message: "invalid cluster id",
-			Status:  http.StatusBadRequest,
+			Status:  400,
 			Err:     err,
 		}
 	}
 	return clusterID, nil
 }
 
-func mapRepositoryError(err error, message string) error {
-	if err == nil {
-		return nil
+func normalizeStatus(value *int, fallback int) int {
+	if value == nil {
+		return fallback
 	}
-	lowerMessage := strings.ToLower(err.Error())
-	if strings.Contains(lowerMessage, "not found") || strings.Contains(lowerMessage, "record not found") {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeNotFound,
-			Message: message,
-			Status:  http.StatusNotFound,
-			Err:     err,
-		}
+	if *value == domain.STATUS_DISABLED {
+		return domain.STATUS_DISABLED
 	}
-	if strings.Contains(lowerMessage, "duplicate") || strings.Contains(lowerMessage, "unique") {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeConflict,
-			Message: message,
-			Status:  http.StatusConflict,
-			Err:     err,
-		}
-	}
-	return err
-}
-
-func toClusterListItem(cluster domain.Cluster, runtimeInfo domain.RuntimeInfo) ClusterListItem {
-	return ClusterListItem{
-		ID:             cluster.ID,
-		Name:           cluster.Name,
-		Alias:          cluster.Alias,
-		Provider:       cluster.Provider,
-		Remarks:        cluster.Remarks,
-		Status:         cluster.Status,
-		NodeCount:      runtimeInfo.NodeCount,
-		RuntimeStatus:  runtimeInfo.RuntimeStatus,
-		ClusterVersion: runtimeInfo.ClusterVersion,
-		RuntimeError:   runtimeInfo.RuntimeError,
-		CreateTime:     cluster.CreatedAt,
-		UpdateTime:     cluster.UpdatedAt,
-	}
-}
-
-func toClusterDetail(cluster domain.Cluster, runtimeInfo domain.RuntimeInfo) ClusterDetail {
-	return ClusterDetail{
-		ID:             cluster.ID,
-		Name:           cluster.Name,
-		Alias:          cluster.Alias,
-		Provider:       cluster.Provider,
-		YAML:           cluster.YAML,
-		Remarks:        cluster.Remarks,
-		Status:         cluster.Status,
-		NodeCount:      runtimeInfo.NodeCount,
-		RuntimeStatus:  runtimeInfo.RuntimeStatus,
-		ClusterVersion: runtimeInfo.ClusterVersion,
-		RuntimeError:   runtimeInfo.RuntimeError,
-		CreateTime:     cluster.CreatedAt,
-		UpdateTime:     cluster.UpdatedAt,
-	}
+	return domain.STATUS_ENABLED
 }

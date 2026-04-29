@@ -2,22 +2,32 @@ package domain
 
 import "time"
 
+const (
+	STATUS_DISABLED = 0
+	STATUS_ENABLED  = 1
+)
+
 type Cluster struct {
 	ID        int64      `json:"id"`
 	Name      string     `json:"name"`
 	Alias     string     `json:"alias,omitempty"`
-	Provider  string     `json:"provider"`
-	YAML      string     `json:"yaml,omitempty"`
+	Provider  string     `json:"provider,omitempty"`
+	Yaml      string     `json:"yaml,omitempty"`
 	Remarks   string     `json:"remarks,omitempty"`
-	Status    bool       `json:"status"`
+	Status    int        `json:"status"`
 	CreatedAt time.Time  `json:"create_time"`
 	UpdatedAt time.Time  `json:"update_time"`
 	DeletedAt *time.Time `json:"delete_time,omitempty"`
 }
 
-type RuntimeInfo struct {
-	NodeCount      int    `json:"node_count"`
-	RuntimeStatus  string `json:"runtime_status"`
-	ClusterVersion string `json:"cluster_version,omitempty"`
-	RuntimeError   string `json:"runtime_error,omitempty"`
+type ClusterStats struct {
+	NodeCount    int    `json:"node_count"`
+	RunningState string `json:"running_state"`
+	Version      string `json:"version,omitempty"`
+	Message      string `json:"message,omitempty"`
+}
+
+type ClusterWithStats struct {
+	Cluster
+	ClusterStats
 }

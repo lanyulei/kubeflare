@@ -3,7 +3,7 @@ service:
   environment: local
 
 http:
-  address: ":8080"
+  address: ":8000"
   allowed_origins:
     - "*"
 

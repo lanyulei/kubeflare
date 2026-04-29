@@ -47,7 +47,6 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-
 	response.OK(c, http.StatusCreated, cluster)
 }
 
@@ -63,7 +62,6 @@ func (h *Handler) Update(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-
 	response.OK(c, http.StatusOK, cluster)
 }
 
