@@ -7,6 +7,7 @@ export
 endif
 
 DATABASE_DSN ?= $(KUBEFLARE_DATABASE__DSN)
+CONFIG ?= ./configs/config.local.yaml
 
 .PHONY: tidy test build run migrate
 
@@ -21,7 +22,7 @@ build:
 	go build ./cmd/kubeflare
 
 run:
-	go run ./cmd/kubeflare serve --config ./configs/config.example.yaml
+	go run ./cmd/kubeflare serve --config $(CONFIG)
 
 migrate:
 	@if [ -z "$(DATABASE_DSN)" ]; then \

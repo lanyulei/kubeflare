@@ -1,0 +1,24 @@
+service:
+  name: kubeflare
+  environment: local
+
+http:
+  address: ":8080"
+  allowed_origins:
+    - "*"
+
+auth:
+  signing_key: local-development-signing-key-change-me
+  cookie_secure: false
+
+database:
+  enabled: false
+
+redis:
+  enabled: false
+
+secrets:
+  encryption_key: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+
+upload:
+  root_dir: data/uploads
