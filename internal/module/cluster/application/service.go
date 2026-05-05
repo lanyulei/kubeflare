@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	"github.com/lanyulei/kubeflare/internal/platform/secrets"
@@ -74,6 +76,13 @@ func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (domain.
 		return domain.ClusterWithStats{}, err
 	}
 
+	kubeconfig := strings.TrimSpace(req.Yaml)
+	testConnection := shouldTestConnection(req.TestConnection)
+	stats, err := s.validateClusterYaml(ctx, kubeconfig, testConnection)
+	if err != nil {
+		return domain.ClusterWithStats{}, err
+	}
+
 	encryptedYaml, err := s.encryptYaml(req.Yaml)
 	if err != nil {
 		return domain.ClusterWithStats{}, err
@@ -81,19 +90,20 @@ func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (domain.
 
 	now := time.Now().UTC()
 	cluster, err := s.repo.Create(ctx, domain.Cluster{
-		Name:      strings.TrimSpace(req.Name),
-		Alias:     strings.TrimSpace(req.Alias),
-		Provider:  strings.TrimSpace(req.Provider),
-		Yaml:      encryptedYaml,
-		Remarks:   strings.TrimSpace(req.Remarks),
-		Status:    normalizeStatus(req.Status, domain.STATUS_ENABLED),
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:           strings.TrimSpace(req.Name),
+		Alias:          strings.TrimSpace(req.Alias),
+		Provider:       strings.TrimSpace(req.Provider),
+		Yaml:           encryptedYaml,
+		Remarks:        strings.TrimSpace(req.Remarks),
+		Status:         normalizeStatus(req.Status, domain.STATUS_ENABLED),
+		TestConnection: testConnection,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	})
 	if err != nil {
 		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
-	return s.withStats(ctx, cluster, true), nil
+	return clusterWithSaveStats(cluster, kubeconfig, stats, true), nil
 }
 
 func (s *Service) Update(ctx context.Context, id string, req UpdateClusterRequest) (domain.ClusterWithStats, error) {
@@ -111,6 +121,13 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
 
+	kubeconfig := strings.TrimSpace(req.Yaml)
+	testConnection := shouldTestConnection(req.TestConnection)
+	stats, err := s.validateClusterYaml(ctx, kubeconfig, testConnection)
+	if err != nil {
+		return domain.ClusterWithStats{}, err
+	}
+
 	encryptedYaml, err := s.encryptYaml(req.Yaml)
 	if err != nil {
 		return domain.ClusterWithStats{}, err
@@ -122,13 +139,14 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 	existing.Yaml = encryptedYaml
 	existing.Remarks = strings.TrimSpace(req.Remarks)
 	existing.Status = normalizeStatus(req.Status, existing.Status)
+	existing.TestConnection = testConnection
 	existing.UpdatedAt = time.Now().UTC()
 
 	updated, err := s.repo.Update(ctx, existing)
 	if err != nil {
 		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
-	return s.withStats(ctx, updated, true), nil
+	return clusterWithSaveStats(updated, kubeconfig, stats, true), nil
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
@@ -247,6 +265,27 @@ func (s *Service) clusterStats(ctx context.Context, status int, kubeconfig strin
 	return stats
 }
 
+func (s *Service) validateClusterYaml(ctx context.Context, kubeconfig string, testConnection bool) (domain.ClusterStats, error) {
+	if err := validateSingleContextKubeconfig(kubeconfig); err != nil {
+		return domain.ClusterStats{}, err
+	}
+	if !testConnection {
+		return domain.ClusterStats{RunningState: RUNNING_STATE_UNKNOWN}, nil
+	}
+	if s.inspector == nil {
+		return domain.ClusterStats{}, badClusterYamlError("cluster connection inspector is unavailable", nil)
+	}
+
+	stats, err := s.inspector.Inspect(ctx, kubeconfig)
+	if err != nil {
+		return domain.ClusterStats{}, badClusterYamlError("failed to connect cluster", err)
+	}
+	if strings.TrimSpace(stats.RunningState) == "" {
+		stats.RunningState = RUNNING_STATE_AVAILABLE
+	}
+	return stats, nil
+}
+
 func (s *Service) encryptYaml(value string) (string, error) {
 	encryptedYaml, err := s.encryptor.Encrypt(strings.TrimSpace(value))
 	if err != nil {
@@ -314,4 +353,72 @@ func normalizeStatus(value *int, fallback int) int {
 		return domain.STATUS_DISABLED
 	}
 	return domain.STATUS_ENABLED
+}
+
+func validateSingleContextKubeconfig(kubeconfig string) error {
+	if strings.TrimSpace(kubeconfig) == "" {
+		return badClusterYamlError("cluster yaml is empty", nil)
+	}
+
+	config, err := clientcmd.Load([]byte(kubeconfig))
+	if err != nil {
+		return badClusterYamlError("invalid cluster yaml", err)
+	}
+	if len(config.Clusters) != 1 {
+		return badClusterYamlError("cluster yaml must contain exactly one cluster", nil)
+	}
+	if len(config.AuthInfos) != 1 {
+		return badClusterYamlError("cluster yaml must contain exactly one user", nil)
+	}
+	if len(config.Contexts) != 1 {
+		return badClusterYamlError("cluster yaml must contain exactly one context", nil)
+	}
+	if strings.TrimSpace(config.CurrentContext) == "" {
+		return badClusterYamlError("cluster yaml current-context is required", nil)
+	}
+
+	contextConfig, ok := config.Contexts[config.CurrentContext]
+	if !ok {
+		return badClusterYamlError("cluster yaml current-context must match the only context", nil)
+	}
+	if _, ok := config.Clusters[contextConfig.Cluster]; !ok {
+		return badClusterYamlError("cluster yaml context must reference the only cluster", nil)
+	}
+	if _, ok := config.AuthInfos[contextConfig.AuthInfo]; !ok {
+		return badClusterYamlError("cluster yaml context must reference the only user", nil)
+	}
+	if _, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig)); err != nil {
+		return badClusterYamlError("invalid cluster yaml", err)
+	}
+	return nil
+}
+
+func shouldTestConnection(value *bool) bool {
+	return value != nil && *value
+}
+
+func clusterWithSaveStats(cluster domain.Cluster, kubeconfig string, stats domain.ClusterStats, includeYaml bool) domain.ClusterWithStats {
+	if cluster.Status != domain.STATUS_ENABLED && (strings.TrimSpace(stats.RunningState) == "" || stats.RunningState == RUNNING_STATE_UNKNOWN) {
+		stats.RunningState = RUNNING_STATE_DISABLED
+	}
+	if strings.TrimSpace(stats.RunningState) == "" {
+		stats.RunningState = RUNNING_STATE_UNKNOWN
+	}
+	cluster.Yaml = ""
+	if includeYaml {
+		cluster.Yaml = kubeconfig
+	}
+	return domain.ClusterWithStats{Cluster: cluster, ClusterStats: stats}
+}
+
+func badClusterYamlError(message string, err error) error {
+	if err != nil {
+		message = fmt.Sprintf("%s: %v", message, err)
+	}
+	return &sharedErrors.AppError{
+		Code:    sharedErrors.CodeBadRequest,
+		Message: message,
+		Status:  400,
+		Err:     err,
+	}
 }

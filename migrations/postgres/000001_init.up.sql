@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS cluster_info (
     yaml TEXT NOT NULL,
     remarks VARCHAR(512) NOT NULL DEFAULT '',
     status SMALLINT NOT NULL DEFAULT 1,
+    test_connection BOOLEAN NOT NULL DEFAULT FALSE,
     create_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     update_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     delete_time TIMESTAMPTZ

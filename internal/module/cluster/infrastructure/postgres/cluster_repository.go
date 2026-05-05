@@ -17,16 +17,17 @@ type ClusterRepository struct {
 }
 
 type clusterInfoRecord struct {
-	ID         int64          `gorm:"primaryKey;autoIncrement"`
-	Name       string         `gorm:"size:128;not null"`
-	Alias      string         `gorm:"size:128;not null;default:''"`
-	Provider   string         `gorm:"size:128;not null;default:''"`
-	Yaml       string         `gorm:"type:text;not null"`
-	Remarks    string         `gorm:"size:512;not null;default:''"`
-	Status     int            `gorm:"not null;default:1"`
-	CreateTime time.Time      `gorm:"column:create_time;not null"`
-	UpdateTime time.Time      `gorm:"column:update_time;not null"`
-	DeleteTime gorm.DeletedAt `gorm:"column:delete_time;index"`
+	ID             int64          `gorm:"primaryKey;autoIncrement"`
+	Name           string         `gorm:"size:128;not null"`
+	Alias          string         `gorm:"size:128;not null;default:''"`
+	Provider       string         `gorm:"size:128;not null;default:''"`
+	Yaml           string         `gorm:"type:text;not null"`
+	Remarks        string         `gorm:"size:512;not null;default:''"`
+	Status         int            `gorm:"not null;default:1"`
+	TestConnection bool           `gorm:"not null;default:false"`
+	CreateTime     time.Time      `gorm:"column:create_time;not null"`
+	UpdateTime     time.Time      `gorm:"column:update_time;not null"`
+	DeleteTime     gorm.DeletedAt `gorm:"column:delete_time;index"`
 }
 
 func (clusterInfoRecord) TableName() string {
@@ -106,6 +107,7 @@ func (r *ClusterRepository) Update(ctx context.Context, cluster domain.Cluster) 
 	record.Yaml = cluster.Yaml
 	record.Remarks = cluster.Remarks
 	record.Status = cluster.Status
+	record.TestConnection = cluster.TestConnection
 	record.UpdateTime = cluster.UpdatedAt
 
 	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
@@ -128,15 +130,16 @@ func (r *ClusterRepository) Delete(ctx context.Context, id int64) error {
 
 func toDomainCluster(record clusterInfoRecord) domain.Cluster {
 	cluster := domain.Cluster{
-		ID:        record.ID,
-		Name:      record.Name,
-		Alias:     record.Alias,
-		Provider:  record.Provider,
-		Yaml:      record.Yaml,
-		Remarks:   record.Remarks,
-		Status:    record.Status,
-		CreatedAt: record.CreateTime,
-		UpdatedAt: record.UpdateTime,
+		ID:             record.ID,
+		Name:           record.Name,
+		Alias:          record.Alias,
+		Provider:       record.Provider,
+		Yaml:           record.Yaml,
+		Remarks:        record.Remarks,
+		Status:         record.Status,
+		TestConnection: record.TestConnection,
+		CreatedAt:      record.CreateTime,
+		UpdatedAt:      record.UpdateTime,
 	}
 	if record.DeleteTime.Valid {
 		deletedAt := record.DeleteTime.Time
@@ -147,15 +150,16 @@ func toDomainCluster(record clusterInfoRecord) domain.Cluster {
 
 func fromDomainCluster(cluster domain.Cluster) clusterInfoRecord {
 	return clusterInfoRecord{
-		ID:         cluster.ID,
-		Name:       cluster.Name,
-		Alias:      cluster.Alias,
-		Provider:   cluster.Provider,
-		Yaml:       cluster.Yaml,
-		Remarks:    cluster.Remarks,
-		Status:     cluster.Status,
-		CreateTime: cluster.CreatedAt,
-		UpdateTime: cluster.UpdatedAt,
+		ID:             cluster.ID,
+		Name:           cluster.Name,
+		Alias:          cluster.Alias,
+		Provider:       cluster.Provider,
+		Yaml:           cluster.Yaml,
+		Remarks:        cluster.Remarks,
+		Status:         cluster.Status,
+		TestConnection: cluster.TestConnection,
+		CreateTime:     cluster.CreatedAt,
+		UpdateTime:     cluster.UpdatedAt,
 	}
 }
 

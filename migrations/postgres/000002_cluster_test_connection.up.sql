@@ -1,0 +1,2 @@
+ALTER TABLE cluster_info
+    ADD COLUMN IF NOT EXISTS test_connection BOOLEAN NOT NULL DEFAULT FALSE;
