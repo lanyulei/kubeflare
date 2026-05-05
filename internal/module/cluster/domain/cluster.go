@@ -7,6 +7,18 @@ const (
 	STATUS_ENABLED  = 1
 )
 
+const (
+	PROVIDER_KUBERNETES  = "kubernetes"
+	PROVIDER_ALIYUN      = "aliyun"
+	PROVIDER_TENCENT     = "tencent"
+	PROVIDER_HUAWEI      = "huawei"
+	PROVIDER_AWS         = "aws"
+	PROVIDER_AZURE       = "azure"
+	PROVIDER_GOOGLE      = "google"
+	PROVIDER_OTHER       = "other"
+	PROVIDER_SELF_HOSTED = "self_hosted"
+)
+
 type Cluster struct {
 	ID             int64      `json:"id"`
 	Name           string     `json:"name"`

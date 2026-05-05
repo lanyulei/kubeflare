@@ -92,7 +92,7 @@ func (s *Service) Create(ctx context.Context, req CreateClusterRequest) (domain.
 	cluster, err := s.repo.Create(ctx, domain.Cluster{
 		Name:           strings.TrimSpace(req.Name),
 		Alias:          strings.TrimSpace(req.Alias),
-		Provider:       strings.TrimSpace(req.Provider),
+		Provider:       normalizeProvider(req.Provider),
 		Yaml:           encryptedYaml,
 		Remarks:        strings.TrimSpace(req.Remarks),
 		Status:         normalizeStatus(req.Status, domain.STATUS_ENABLED),
@@ -135,7 +135,7 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 
 	existing.Name = strings.TrimSpace(req.Name)
 	existing.Alias = strings.TrimSpace(req.Alias)
-	existing.Provider = strings.TrimSpace(req.Provider)
+	existing.Provider = normalizeProvider(req.Provider)
 	existing.Yaml = encryptedYaml
 	existing.Remarks = strings.TrimSpace(req.Remarks)
 	existing.Status = normalizeStatus(req.Status, existing.Status)
@@ -353,6 +353,10 @@ func normalizeStatus(value *int, fallback int) int {
 		return domain.STATUS_DISABLED
 	}
 	return domain.STATUS_ENABLED
+}
+
+func normalizeProvider(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func validateSingleContextKubeconfig(kubeconfig string) error {
