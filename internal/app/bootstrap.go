@@ -121,6 +121,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
+	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout)
 
 	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService)
 	if err != nil {
@@ -163,6 +164,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		MetricsHandler: metricsRegistry.Handler(),
 		PprofHandler:   pprofHandler,
 		APIHandler:     apiHandler,
+		KAPIHandler:    kapiHandler,
 	})
 
 	rootHandler = metrics.InstrumentHTTP(metricsRegistry, rootHandler)
@@ -190,6 +192,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			func(context.Context) error { return db.Close(gormDB) },
 		},
 	}, nil
+}
+
+func newKAPIHandler(clusterService *clusterapplication.Service, authenticator middleware.Authenticator, timeout time.Duration) http.Handler {
+	var handler http.Handler = clusterkubernetes.NewProxyHandler(clusterService, timeout)
+	handler = middleware.RequireRolesHTTP("admin")(handler)
+	handler = middleware.RequireCSRFHTTP(handler)
+	handler = middleware.AuthenticateHTTP(authenticator, handler)
+	return handler
 }
 
 func newAPIHandler(

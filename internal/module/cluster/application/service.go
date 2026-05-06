@@ -160,6 +160,40 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (s *Service) KubeconfigForProxy(ctx context.Context, id string) (string, error) {
+	clusterID, err := parseClusterID(id)
+	if err != nil {
+		return "", err
+	}
+
+	cluster, err := s.repo.Get(ctx, clusterID)
+	if err != nil {
+		return "", mapRepositoryError(err, "cluster not found")
+	}
+	if cluster.Status != domain.STATUS_ENABLED {
+		return "", &sharedErrors.AppError{
+			Code:    sharedErrors.CodeForbidden,
+			Message: "cluster is disabled",
+			Status:  403,
+			Err:     fmt.Errorf("cluster %d is disabled", clusterID),
+		}
+	}
+
+	kubeconfig, err := s.decryptYaml(cluster.Yaml)
+	if err != nil {
+		return "", &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: "failed to decrypt cluster yaml",
+			Status:  500,
+			Err:     err,
+		}
+	}
+	if strings.TrimSpace(kubeconfig) == "" {
+		return "", badClusterYamlError("cluster yaml is empty", nil)
+	}
+	return kubeconfig, nil
+}
+
 func (s *Service) listWithStats(ctx context.Context, clusters []domain.Cluster) []domain.ClusterWithStats {
 	items := make([]domain.ClusterWithStats, len(clusters))
 	workers := MAX_RUNTIME_INSPECTORS
