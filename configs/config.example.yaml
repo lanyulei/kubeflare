@@ -12,8 +12,10 @@ http:
   drain_timeout: 5s
   api_request_timeout: 10s
   max_header_bytes: 1048576
+  trusted_proxies: []
   allowed_origins:
     - https://kubeflare.example.com
+  allow_credentials: false
   allow_headers:
     - Authorization
     - Content-Type
@@ -26,6 +28,7 @@ http:
     - PATCH
     - DELETE
     - OPTIONS
+  enable_pprof: false
   readiness_timeout: 2s
 
 auth:
@@ -49,6 +52,14 @@ auth:
       - profile
       - email
 
+kapi:
+  blocked_namespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+  max_concurrent_sessions_per_user: 5
+  audit_stdin: true
+
 database:
   enabled: true
   dsn: postgres://postgres:${KUBEFLARE_DB_PASSWORD}@127.0.0.1:5432/kubeflare?sslmode=disable
@@ -62,6 +73,7 @@ database:
 redis:
   enabled: true
   address: 127.0.0.1:6379
+  username: ""
   password: ${KUBEFLARE_REDIS_PASSWORD}
   db: 0
   dial_timeout: 2s

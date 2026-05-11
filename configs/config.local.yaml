@@ -22,3 +22,6 @@ secrets:
 
 upload:
   root_dir: data/uploads
+
+kapi:
+  blocked_namespaces: []
