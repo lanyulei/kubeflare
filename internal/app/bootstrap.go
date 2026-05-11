@@ -125,7 +125,6 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
 		MaxConcurrentSessionsPerUser: cfg.KAPI.MaxConcurrentSessionsPerUser,
-		AuditStdin:                   cfg.KAPI.AuditStdin,
 	})
 
 	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService)

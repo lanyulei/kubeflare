@@ -58,7 +58,6 @@ kapi:
     - kube-public
     - kube-node-lease
   max_concurrent_sessions_per_user: 5
-  audit_stdin: true
 
 database:
   enabled: true

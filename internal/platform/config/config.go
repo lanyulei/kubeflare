@@ -44,7 +44,6 @@ type HTTPConfig struct {
 // gets sensible behaviour:
 //   - exec into kube-system / kube-public / kube-node-lease is denied
 //   - each user is capped at 5 concurrent upgrade sessions
-//   - stdin keystrokes are recorded to the audit log
 type KAPIConfig struct {
 	// BlockedNamespaces is the set of Kubernetes namespaces in which
 	// pods/exec, pods/attach, and pods/portforward upgrade requests are
@@ -55,10 +54,6 @@ type KAPIConfig struct {
 	// SPDY upgrade sessions a single authenticated subject may hold open.
 	// 0 disables the cap (not recommended).
 	MaxConcurrentSessionsPerUser int `koanf:"max_concurrent_sessions_per_user"`
-	// AuditStdin toggles recording of every keystroke a user sends to a
-	// container terminal. The data is written to the structured logger at
-	// INFO level under the message "kapi exec stdin".
-	AuditStdin bool `koanf:"audit_stdin"`
 }
 
 type AuthConfig struct {
@@ -162,7 +157,6 @@ func Default() Config {
 				"kube-node-lease",
 			},
 			MaxConcurrentSessionsPerUser: 5,
-			AuditStdin:                   true,
 		},
 		Auth: AuthConfig{
 			TokenTTL:              24 * time.Hour,

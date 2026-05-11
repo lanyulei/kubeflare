@@ -51,8 +51,6 @@ type SecurityOptions struct {
 	// MaxConcurrentSessionsPerUser caps simultaneous upgrade sessions for
 	// the same Principal subject. 0 disables the limit.
 	MaxConcurrentSessionsPerUser int
-	// AuditStdin enables keystroke-level audit logging for exec sessions.
-	AuditStdin bool
 }
 
 type ProxyHandler struct {
@@ -62,7 +60,6 @@ type ProxyHandler struct {
 	allowAnyOrigin    bool
 	blockedNamespaces map[string]struct{}
 	limiter           *sessionLimiter
-	auditStdin        bool
 }
 
 type upstreamStatus struct {
@@ -88,7 +85,6 @@ func NewProxyHandlerWithSecurity(provider KubeconfigProvider, timeout time.Durat
 		allowedOrigins:    make(map[string]struct{}),
 		blockedNamespaces: make(map[string]struct{}),
 		limiter:           newSessionLimiter(opts.MaxConcurrentSessionsPerUser),
-		auditStdin:        opts.AuditStdin,
 	}
 	for _, raw := range opts.AllowedOrigins {
 		origin := strings.TrimSpace(raw)
@@ -191,14 +187,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Block exec/attach/portforward against privileged namespaces by
 		// default; operators must explicitly remove a namespace from the
 		// blocklist to allow access.
-		ns, podName, container, isExec := parseExecTarget(upstreamPath, r.URL.Query())
+		ns, _, _, isExec := parseExecTarget(upstreamPath, r.URL.Query())
 		if isExec && h.isNamespaceBlocked(ns) {
 			slog.Default().Warn("kapi upgrade namespace blocked",
 				"request_id", requestID,
 				"cluster_id", clusterID,
 				"namespace", ns,
-				"pod", podName,
-				"container", container,
 			)
 			response.HTTPError(w, requestID, &sharedErrors.AppError{
 				Code:    sharedErrors.CodeForbidden,
@@ -208,7 +202,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		h.serveUpgrade(w, r, restConfig, upstreamPath, requestID, clusterID, ns, podName, container)
+		h.serveUpgrade(w, r, restConfig, upstreamPath, requestID, clusterID)
 		return
 	}
 
@@ -330,9 +324,6 @@ func (h *ProxyHandler) serveUpgrade(
 	upstreamPath string,
 	requestID string,
 	clusterID string,
-	namespace string,
-	podName string,
-	containerName string,
 ) {
 	logger := slog.Default()
 
@@ -488,35 +479,6 @@ func (h *ProxyHandler) serveUpgrade(
 		}
 	}
 
-	// Per-session stdin audit. Bytes are fed to the parser via a bounded
-	// channel; if the auditor cannot keep up the data is dropped so the
-	// proxy never blocks on the audit goroutine.
-	var (
-		auditCh      chan []byte
-		auditDone    chan struct{}
-		auditor      *wsStdinAuditor
-		auditEnabled = h.auditStdin
-	)
-	if auditEnabled {
-		auditor = newWSStdinAuditor(logger, sessionMeta{
-			RequestID: requestID,
-			ClusterID: clusterID,
-			Subject:   principal.Subject,
-			Namespace: namespace,
-			Pod:       podName,
-			Container: containerName,
-		})
-		auditCh = make(chan []byte, 256)
-		auditDone = make(chan struct{})
-		go func() {
-			defer close(auditDone)
-			for chunk := range auditCh {
-				auditor.Feed(chunk)
-			}
-			auditor.Flush()
-		}()
-	}
-
 	if err := writeUpgrade101ToWriter(clientBuf, upstreamResp); err != nil {
 		logger.Error("kapi upgrade write 101 to client",
 			"request_id", requestID, "cluster_id", clusterID, "error", err)
@@ -547,9 +509,6 @@ func (h *ProxyHandler) serveUpgrade(
 		defer wg.Done()
 		clientReader := combineReaders(clientBuf.Reader, clientConn)
 		var dst io.Writer = upstreamConn
-		if auditEnabled {
-			dst = &auditTapWriter{w: dst, ch: auditCh}
-		}
 		_, _ = io.Copy(dst, clientReader)
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
@@ -570,11 +529,6 @@ func (h *ProxyHandler) serveUpgrade(
 	_ = clientConn.Close()
 	_ = upstreamConn.Close()
 	wg.Wait()
-
-	if auditEnabled {
-		close(auditCh)
-		<-auditDone
-	}
 }
 
 type closeWriter interface {
