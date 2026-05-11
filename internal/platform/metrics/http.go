@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"bufio"
+	"errors"
+	"net"
 	"net/http"
 	"time"
 )
@@ -22,6 +25,30 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// Hijack lets HTTP Upgrade flows (e.g. WebSocket proxying for kube-apiserver
+// exec/attach/port-forward) reach the underlying connection through this
+// wrapper. After hijack the stdlib writes the 101 status line directly to the
+// raw conn, so we record it here for accurate metrics labelling.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	conn, brw, err := hijacker.Hijack()
+	if err == nil {
+		r.status = http.StatusSwitchingProtocols
+	}
+	return conn, brw, err
+}
+
+// Flush forwards streaming flushes (server-sent events, follow logs, etc.) to
+// the underlying writer.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func routeLabel(path string) string {

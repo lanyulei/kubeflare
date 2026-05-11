@@ -1,16 +1,22 @@
 package kubernetes
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/client-go/rest"
@@ -20,6 +26,8 @@ import (
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 	"github.com/lanyulei/kubeflare/internal/shared/response"
 )
+
+var osReadFile = os.ReadFile
 
 const CLUSTER_ID_HEADER = "X-Cluster-ID"
 
@@ -68,6 +76,11 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	clusterID := strings.TrimSpace(r.Header.Get(CLUSTER_ID_HEADER))
 	if clusterID == "" {
+		// Browsers cannot set custom headers on native WebSocket handshakes,
+		// so allow the cluster id to come from a query parameter as a fallback.
+		clusterID = strings.TrimSpace(r.URL.Query().Get("clusterId"))
+	}
+	if clusterID == "" {
 		response.HTTPError(w, requestID, &sharedErrors.AppError{
 			Code:    sharedErrors.CodeBadRequest,
 			Message: "X-Cluster-ID header is required",
@@ -95,6 +108,18 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	passThrough := shouldPassThroughRequest(r)
 	nodeKeyword := nodeListKeyword(r, upstreamPath)
+
+	// WebSocket / SPDY upgrades are handled by a dedicated byte-level proxy.
+	// Going through net/http/httputil.ReverseProxy here is fragile because
+	// it depends on every middleware in the chain implementing http.Hijacker
+	// and on subtle rules around Response.Write semantics for 101 responses.
+	// Doing it ourselves keeps the upgrade response exactly as the
+	// kube-apiserver emitted it.
+	if isUpgradeRequest(r) {
+		h.serveUpgrade(w, r, restConfig, upstreamPath, requestID, clusterID)
+		return
+	}
+
 	if h.timeout > 0 && !passThrough {
 		restConfig.Timeout = h.timeout
 	}
@@ -117,11 +142,15 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.URL.Path = joinURLPath(target.Path, upstreamPath)
 			req.URL.RawPath = ""
 			req.Host = target.Host
+			query := req.URL.Query()
+			// Strip Kubeflare-only query parameters so they never reach the
+			// upstream Kubernetes API server or its access logs.
+			query.Del("clusterId")
+			query.Del("access_token")
 			if nodeKeyword != "" {
-				query := req.URL.Query()
 				query.Del("keyword")
-				req.URL.RawQuery = query.Encode()
 			}
+			req.URL.RawQuery = query.Encode()
 			removeKubeflareHeaders(req.Header)
 			if !passThrough {
 				req.Header.Del("Accept-Encoding")
@@ -135,6 +164,14 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return wrapKubernetesResponse(resp, requestID, nodeKeyword)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Default().Error("kapi proxy upstream error",
+				"request_id", requestID,
+				"cluster_id", clusterID,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"pass_through", passThrough,
+				"error", err,
+			)
 			response.HTTPError(w, requestID, &sharedErrors.AppError{
 				Code:    sharedErrors.CodeInternal,
 				Message: "failed to proxy kubernetes request",
@@ -144,6 +181,376 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func isUpgradeRequest(r *http.Request) bool {
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		return false
+	}
+	return strings.TrimSpace(r.Header.Get("Upgrade")) != ""
+}
+
+// serveUpgrade transparently bridges an HTTP/1.1 protocol upgrade (WebSocket,
+// SPDY/3.1, etc.) between the client and the upstream kube-apiserver. It does
+// not rely on net/http/httputil.ReverseProxy, so the upstream's status line
+// and headers are forwarded to the client byte-for-byte.
+func (h *ProxyHandler) serveUpgrade(
+	w http.ResponseWriter,
+	r *http.Request,
+	restConfig *rest.Config,
+	upstreamPath string,
+	requestID string,
+	clusterID string,
+) {
+	logger := slog.Default()
+
+	target, err := url.Parse(restConfig.Host)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		writeUpgradeError(w, requestID, http.StatusBadGateway,
+			"invalid kubernetes host", fmt.Errorf("invalid kubernetes host"))
+		logger.Error("kapi upgrade invalid host",
+			"request_id", requestID, "cluster_id", clusterID, "host", restConfig.Host)
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeUpgradeError(w, requestID, http.StatusInternalServerError,
+			"hijacking not supported",
+			fmt.Errorf("response writer is %T", w))
+		logger.Error("kapi upgrade response writer not hijackable",
+			"request_id", requestID, "cluster_id", clusterID, "writer_type", fmt.Sprintf("%T", w))
+		return
+	}
+
+	upstreamURL := *target
+	upstreamURL.Path = joinURLPath(target.Path, upstreamPath)
+	query := r.URL.Query()
+	query.Del("clusterId")
+	query.Del("access_token")
+	upstreamURL.RawQuery = query.Encode()
+	upstreamURL.Fragment = ""
+
+	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL.String(), nil)
+	if err != nil {
+		writeUpgradeError(w, requestID, http.StatusInternalServerError,
+			"failed to build upstream request", err)
+		logger.Error("kapi upgrade build request",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+	copyUpgradeRequestHeaders(outReq.Header, r.Header)
+	outReq.Host = upstreamURL.Host
+	if err := applyKubeconfigAuth(outReq, restConfig); err != nil {
+		writeUpgradeError(w, requestID, http.StatusInternalServerError,
+			"failed to apply kubeconfig auth", err)
+		logger.Error("kapi upgrade apply auth",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+
+	upstreamConn, err := dialUpstream(r.Context(), restConfig, &upstreamURL)
+	if err != nil {
+		writeUpgradeError(w, requestID, http.StatusBadGateway,
+			"failed to dial kubernetes", err)
+		logger.Error("kapi upgrade dial",
+			"request_id", requestID, "cluster_id", clusterID, "host", upstreamURL.Host, "error", err)
+		return
+	}
+	defer upstreamConn.Close()
+
+	if deadline, ok := r.Context().Deadline(); ok {
+		_ = upstreamConn.SetDeadline(deadline)
+	}
+
+	if err := outReq.Write(upstreamConn); err != nil {
+		writeUpgradeError(w, requestID, http.StatusBadGateway,
+			"failed to send request to kubernetes", err)
+		logger.Error("kapi upgrade write request",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+
+	upstreamReader := bufio.NewReader(upstreamConn)
+	upstreamResp, err := http.ReadResponse(upstreamReader, outReq)
+	if err != nil {
+		writeUpgradeError(w, requestID, http.StatusBadGateway,
+			"failed to read kubernetes response", err)
+		logger.Error("kapi upgrade read response",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+
+	if upstreamResp.StatusCode != http.StatusSwitchingProtocols {
+		// Upstream rejected the upgrade. Forward the response to the client
+		// using the normal ResponseWriter so the JSON status surface is shown.
+		body, _ := io.ReadAll(upstreamResp.Body)
+		_ = upstreamResp.Body.Close()
+		logger.Warn("kapi upgrade upstream non-101",
+			"request_id", requestID, "cluster_id", clusterID,
+			"status", upstreamResp.StatusCode,
+			"upstream_headers", flattenHeaders(upstreamResp.Header),
+			"body", truncate(string(body), 512))
+		for k, vs := range upstreamResp.Header {
+			if isHopByHopHeader(k) {
+				continue
+			}
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(upstreamResp.StatusCode)
+		_, _ = w.Write(body)
+		return
+	}
+
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		_ = upstreamResp.Body.Close()
+		logger.Error("kapi upgrade hijack client",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+	defer clientConn.Close()
+
+	if err := writeUpgrade101ToWriter(clientBuf, upstreamResp); err != nil {
+		logger.Error("kapi upgrade write 101 to client",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+	if err := clientBuf.Flush(); err != nil {
+		logger.Error("kapi upgrade flush 101 to client",
+			"request_id", requestID, "cluster_id", clusterID, "error", err)
+		return
+	}
+
+	// Bidirectional copy; the first direction to finish closes done.
+	var (
+		wg             sync.WaitGroup
+		firstCloseOnce sync.Once
+	)
+	wg.Add(2)
+	done := make(chan struct{})
+
+	noteClose := func() {
+		firstCloseOnce.Do(func() {
+			close(done)
+		})
+	}
+
+	go func() {
+		defer wg.Done()
+		clientReader := combineReaders(clientBuf.Reader, clientConn)
+		_, _ = io.Copy(upstreamConn, clientReader)
+		if cw, ok := upstreamConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+		noteClose()
+	}()
+	go func() {
+		defer wg.Done()
+		upstreamReaderCombined := combineReaders(upstreamReader, upstreamConn)
+		_, _ = io.Copy(clientConn, upstreamReaderCombined)
+		if cw, ok := clientConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+		noteClose()
+	}()
+
+	<-done
+	_ = clientConn.Close()
+	_ = upstreamConn.Close()
+	wg.Wait()
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// combineReaders concatenates a bufio.Reader (whose buffered bytes must be
+// drained first) with the raw conn for any bytes that arrive afterward.
+func combineReaders(buffered *bufio.Reader, conn io.Reader) io.Reader {
+	if buffered == nil || buffered.Buffered() == 0 {
+		return conn
+	}
+	return io.MultiReader(io.LimitReader(buffered, int64(buffered.Buffered())), conn)
+}
+
+var rfc6455HeaderCasing = map[string]string{
+	"sec-websocket-accept":     "Sec-WebSocket-Accept",
+	"sec-websocket-protocol":   "Sec-WebSocket-Protocol",
+	"sec-websocket-extensions": "Sec-WebSocket-Extensions",
+	"sec-websocket-version":    "Sec-WebSocket-Version",
+	"upgrade":                  "Upgrade",
+	"connection":               "Connection",
+}
+
+func writeUpgrade101ToWriter(w io.Writer, resp *http.Response) error {
+	statusText := resp.Status
+	if statusText == "" {
+		statusText = "101 Switching Protocols"
+	}
+	if _, err := fmt.Fprintf(w, "HTTP/1.1 %s\r\n", statusText); err != nil {
+		return err
+	}
+	for k, vs := range resp.Header {
+		if isHopByHopHeader(k) && !strings.EqualFold(k, "Connection") && !strings.EqualFold(k, "Upgrade") {
+			continue
+		}
+		name := k
+		if canonical, ok := rfc6455HeaderCasing[strings.ToLower(k)]; ok {
+			name = canonical
+		}
+		for _, v := range vs {
+			if _, err := fmt.Fprintf(w, "%s: %s\r\n", name, v); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := io.WriteString(w, "\r\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isHopByHopHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Keep-Alive", "Proxy-Connection", "Proxy-Authenticate",
+		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding":
+		return true
+	}
+	return false
+}
+
+func copyUpgradeRequestHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		canon := http.CanonicalHeaderKey(k)
+		switch canon {
+		case "Host", "Cookie", "Authorization",
+			http.CanonicalHeaderKey(CLUSTER_ID_HEADER),
+			http.CanonicalHeaderKey(middleware.CSRFTokenHeaderName):
+			continue
+		}
+		if isHopByHopHeader(canon) {
+			continue
+		}
+		dst[canon] = append([]string(nil), vs...)
+	}
+	// Upgrade & Connection are hop-by-hop but required to advertise the
+	// upgrade to the upstream; copy them through explicitly.
+	if v := src.Get("Connection"); v != "" {
+		dst.Set("Connection", v)
+	}
+	if v := src.Get("Upgrade"); v != "" {
+		dst.Set("Upgrade", v)
+	}
+}
+
+func applyKubeconfigAuth(req *http.Request, config *rest.Config) error {
+	switch {
+	case strings.TrimSpace(config.BearerToken) != "":
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(config.BearerToken))
+	case strings.TrimSpace(config.BearerTokenFile) != "":
+		data, err := readBearerTokenFile(config.BearerTokenFile)
+		if err != nil {
+			return fmt.Errorf("read bearer token file: %w", err)
+		}
+		if data != "" {
+			req.Header.Set("Authorization", "Bearer "+data)
+		}
+	case config.Username != "":
+		req.SetBasicAuth(config.Username, config.Password)
+	}
+	if ua := strings.TrimSpace(config.UserAgent); ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if len(config.Impersonate.UserName) > 0 {
+		req.Header.Set("Impersonate-User", config.Impersonate.UserName)
+	}
+	for _, g := range config.Impersonate.Groups {
+		req.Header.Add("Impersonate-Group", g)
+	}
+	for k, vs := range config.Impersonate.Extra {
+		for _, v := range vs {
+			req.Header.Add("Impersonate-Extra-"+k, v)
+		}
+	}
+	return nil
+}
+
+func dialUpstream(ctx context.Context, config *rest.Config, target *url.URL) (net.Conn, error) {
+	host := target.Host
+	if !strings.Contains(host, ":") {
+		switch target.Scheme {
+		case "https":
+			host += ":443"
+		case "http":
+			host += ":80"
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	switch target.Scheme {
+	case "https":
+		tlsConfig, err := rest.TLSConfigFor(config)
+		if err != nil {
+			return nil, err
+		}
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		// Force HTTP/1.1 ALPN so the kube-apiserver does not negotiate h2,
+		// which has no Connection: Upgrade semantics.
+		tlsConfig.NextProtos = []string{"http/1.1"}
+		if tlsConfig.ServerName == "" {
+			hostOnly, _, _ := net.SplitHostPort(host)
+			if hostOnly != "" {
+				tlsConfig.ServerName = hostOnly
+			}
+		}
+		return tls.DialWithDialer(dialer, "tcp", host, tlsConfig)
+	case "http":
+		return dialer.DialContext(ctx, "tcp", host)
+	default:
+		return nil, fmt.Errorf("unsupported scheme %q", target.Scheme)
+	}
+}
+
+func writeUpgradeError(w http.ResponseWriter, requestID string, status int, message string, err error) {
+	response.HTTPError(w, requestID, &sharedErrors.AppError{
+		Code:    errorCodeForStatus(status),
+		Message: message,
+		Status:  status,
+		Err:     err,
+	})
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
+}
+
+func readBearerTokenFile(path string) (string, error) {
+	data, err := osReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func flattenHeaders(h http.Header) string {
+	var b strings.Builder
+	for k, v := range h {
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(strings.Join(v, ","))
+	}
+	return b.String()
 }
 
 func proxyTarget(config *rest.Config) (*url.URL, http.RoundTripper, error) {
