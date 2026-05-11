@@ -425,6 +425,22 @@ func validateSingleContextKubeconfig(kubeconfig string) error {
 	if _, ok := config.AuthInfos[contextConfig.AuthInfo]; !ok {
 		return badClusterYamlError("cluster yaml context must reference the only user", nil)
 	}
+	// Reject kubeconfigs that disable TLS verification. Accepting them
+	// would mean every exec / log / port-forward request is vulnerable to
+	// a man-in-the-middle on the path between Kubeflare and the apiserver,
+	// silently bypassing cert pinning that operators expect from a cluster
+	// proxy. Operators should embed certificate-authority-data instead.
+	for name, c := range config.Clusters {
+		if c == nil {
+			continue
+		}
+		if c.InsecureSkipTLSVerify {
+			return badClusterYamlError(
+				fmt.Sprintf("cluster %q has insecure-skip-tls-verify enabled; provide certificate-authority-data instead", name),
+				nil,
+			)
+		}
+	}
 	if _, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig)); err != nil {
 		return badClusterYamlError("invalid cluster yaml", err)
 	}

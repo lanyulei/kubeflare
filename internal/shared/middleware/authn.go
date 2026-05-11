@@ -22,6 +22,11 @@ import (
 type Principal struct {
 	Subject string   `json:"subject"`
 	Roles   []string `json:"roles,omitempty"`
+	// ExpiresAt is the access token's expiry timestamp. Long-lived streaming
+	// handlers (WebSocket / SSE) use this to proactively terminate sessions
+	// whose backing token has expired, so a logged-out user cannot keep an
+	// open shell indefinitely. Zero value means "unknown / do not enforce".
+	ExpiresAt time.Time `json:"-"`
 }
 
 type Authenticator interface {
@@ -291,6 +296,7 @@ func (a *SignedTokenAuthenticator) Authenticate(ctx context.Context, token strin
 	if err != nil {
 		return Principal{}, ErrUnauthorized
 	}
+	principal.ExpiresAt = time.Unix(payload.ExpiresAt, 0).UTC()
 	return principal, nil
 }
 

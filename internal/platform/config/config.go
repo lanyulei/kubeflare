@@ -6,6 +6,7 @@ type Config struct {
 	Service       ServiceConfig       `koanf:"service"`
 	HTTP          HTTPConfig          `koanf:"http"`
 	Auth          AuthConfig          `koanf:"auth"`
+	KAPI          KAPIConfig          `koanf:"kapi"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
 	Secrets       SecretsConfig       `koanf:"secrets"`
@@ -35,6 +36,29 @@ type HTTPConfig struct {
 	AllowMethods      []string      `koanf:"allow_methods"`
 	EnablePprof       bool          `koanf:"enable_pprof"`
 	ReadinessTimeout  time.Duration `koanf:"readiness_timeout"`
+}
+
+// KAPIConfig hardens the Kubernetes API proxy / WebSocket exec path.
+//
+// All fields have safe defaults so a deployment that omits the block still
+// gets sensible behaviour:
+//   - exec into kube-system / kube-public / kube-node-lease is denied
+//   - each user is capped at 5 concurrent upgrade sessions
+//   - stdin keystrokes are recorded to the audit log
+type KAPIConfig struct {
+	// BlockedNamespaces is the set of Kubernetes namespaces in which
+	// pods/exec, pods/attach, and pods/portforward upgrade requests are
+	// refused. Defaults to the cluster's privileged control-plane
+	// namespaces.
+	BlockedNamespaces []string `koanf:"blocked_namespaces"`
+	// MaxConcurrentSessionsPerUser limits how many simultaneous WebSocket /
+	// SPDY upgrade sessions a single authenticated subject may hold open.
+	// 0 disables the cap (not recommended).
+	MaxConcurrentSessionsPerUser int `koanf:"max_concurrent_sessions_per_user"`
+	// AuditStdin toggles recording of every keystroke a user sends to a
+	// container terminal. The data is written to the structured logger at
+	// INFO level under the message "kapi exec stdin".
+	AuditStdin bool `koanf:"audit_stdin"`
 }
 
 type AuthConfig struct {
@@ -130,6 +154,15 @@ func Default() Config {
 			},
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 			ReadinessTimeout: 2 * time.Second,
+		},
+		KAPI: KAPIConfig{
+			BlockedNamespaces: []string{
+				"kube-system",
+				"kube-public",
+				"kube-node-lease",
+			},
+			MaxConcurrentSessionsPerUser: 5,
+			AuditStdin:                   true,
 		},
 		Auth: AuthConfig{
 			TokenTTL:              24 * time.Hour,

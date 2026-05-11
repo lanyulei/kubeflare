@@ -121,7 +121,12 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
-	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout)
+	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
+		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
+		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
+		MaxConcurrentSessionsPerUser: cfg.KAPI.MaxConcurrentSessionsPerUser,
+		AuditStdin:                   cfg.KAPI.AuditStdin,
+	})
 
 	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService)
 	if err != nil {
@@ -194,8 +199,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}, nil
 }
 
-func newKAPIHandler(clusterService *clusterapplication.Service, authenticator middleware.Authenticator, timeout time.Duration) http.Handler {
-	var handler http.Handler = clusterkubernetes.NewProxyHandler(clusterService, timeout)
+func newKAPIHandler(clusterService *clusterapplication.Service, authenticator middleware.Authenticator, timeout time.Duration, security clusterkubernetes.SecurityOptions) http.Handler {
+	var handler http.Handler = clusterkubernetes.NewProxyHandlerWithSecurity(clusterService, timeout, security)
 	handler = middleware.RequireRolesHTTP("admin")(handler)
 	handler = middleware.RequireCSRFHTTP(handler)
 	handler = middleware.AuthenticateHTTP(authenticator, handler)

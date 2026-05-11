@@ -35,9 +35,34 @@ type KubeconfigProvider interface {
 	KubeconfigForProxy(ctx context.Context, id string) (string, error)
 }
 
+// SecurityOptions configures hardening knobs for the Kubernetes API proxy.
+// All fields have safe defaults when zero-valued.
+type SecurityOptions struct {
+	// AllowedOrigins is the strict whitelist applied to the Origin header
+	// of WebSocket / SPDY upgrade requests. Required to defeat Cross-Site
+	// WebSocket Hijacking (CSWSH). An empty / nil slice disables the check
+	// (e.g. for headless callers); a single "*" entry permits any origin
+	// and SHOULD NOT be used together with cookie-based auth.
+	AllowedOrigins []string
+	// BlockedNamespaces forbids upgrade requests (exec/attach/portforward)
+	// against pods in any of these namespaces. Use it to keep the
+	// privileged control-plane out of reach.
+	BlockedNamespaces []string
+	// MaxConcurrentSessionsPerUser caps simultaneous upgrade sessions for
+	// the same Principal subject. 0 disables the limit.
+	MaxConcurrentSessionsPerUser int
+	// AuditStdin enables keystroke-level audit logging for exec sessions.
+	AuditStdin bool
+}
+
 type ProxyHandler struct {
-	provider KubeconfigProvider
-	timeout  time.Duration
+	provider          KubeconfigProvider
+	timeout           time.Duration
+	allowedOrigins    map[string]struct{}
+	allowAnyOrigin    bool
+	blockedNamespaces map[string]struct{}
+	limiter           *sessionLimiter
+	auditStdin        bool
 }
 
 type upstreamStatus struct {
@@ -53,7 +78,36 @@ type proxyEnvelope struct {
 }
 
 func NewProxyHandler(provider KubeconfigProvider, timeout time.Duration) *ProxyHandler {
-	return &ProxyHandler{provider: provider, timeout: timeout}
+	return NewProxyHandlerWithSecurity(provider, timeout, SecurityOptions{})
+}
+
+func NewProxyHandlerWithSecurity(provider KubeconfigProvider, timeout time.Duration, opts SecurityOptions) *ProxyHandler {
+	h := &ProxyHandler{
+		provider:          provider,
+		timeout:           timeout,
+		allowedOrigins:    make(map[string]struct{}),
+		blockedNamespaces: make(map[string]struct{}),
+		limiter:           newSessionLimiter(opts.MaxConcurrentSessionsPerUser),
+		auditStdin:        opts.AuditStdin,
+	}
+	for _, raw := range opts.AllowedOrigins {
+		origin := strings.TrimSpace(raw)
+		if origin == "" {
+			continue
+		}
+		if origin == "*" {
+			h.allowAnyOrigin = true
+			continue
+		}
+		h.allowedOrigins[strings.ToLower(strings.TrimRight(origin, "/"))] = struct{}{}
+	}
+	for _, ns := range opts.BlockedNamespaces {
+		ns = strings.ToLower(strings.TrimSpace(ns))
+		if ns != "" {
+			h.blockedNamespaces[ns] = struct{}{}
+		}
+	}
+	return h
 }
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +170,45 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Doing it ourselves keeps the upgrade response exactly as the
 	// kube-apiserver emitted it.
 	if isUpgradeRequest(r) {
-		h.serveUpgrade(w, r, restConfig, upstreamPath, requestID, clusterID)
+		// CSWSH defence: upgrade requests carry SameSite=Lax cookies on
+		// cross-site GETs, so a malicious origin could otherwise piggyback
+		// on a logged-in admin's session. Origin MUST be on the whitelist.
+		if !h.isOriginAllowed(r) {
+			slog.Default().Warn("kapi upgrade origin denied",
+				"request_id", requestID,
+				"cluster_id", clusterID,
+				"origin", r.Header.Get("Origin"),
+				"path", r.URL.Path,
+			)
+			response.HTTPError(w, requestID, &sharedErrors.AppError{
+				Code:    sharedErrors.CodeForbidden,
+				Message: "origin not allowed",
+				Status:  http.StatusForbidden,
+				Err:     fmt.Errorf("origin %q not in allowlist", r.Header.Get("Origin")),
+			})
+			return
+		}
+		// Block exec/attach/portforward against privileged namespaces by
+		// default; operators must explicitly remove a namespace from the
+		// blocklist to allow access.
+		ns, podName, container, isExec := parseExecTarget(upstreamPath, r.URL.Query())
+		if isExec && h.isNamespaceBlocked(ns) {
+			slog.Default().Warn("kapi upgrade namespace blocked",
+				"request_id", requestID,
+				"cluster_id", clusterID,
+				"namespace", ns,
+				"pod", podName,
+				"container", container,
+			)
+			response.HTTPError(w, requestID, &sharedErrors.AppError{
+				Code:    sharedErrors.CodeForbidden,
+				Message: fmt.Sprintf("namespace %q is protected against exec/attach/portforward", ns),
+				Status:  http.StatusForbidden,
+				Err:     fmt.Errorf("namespace %q is on blocklist", ns),
+			})
+			return
+		}
+		h.serveUpgrade(w, r, restConfig, upstreamPath, requestID, clusterID, ns, podName, container)
 		return
 	}
 
@@ -190,6 +282,43 @@ func isUpgradeRequest(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("Upgrade")) != ""
 }
 
+// isOriginAllowed implements the WebSocket-side counterpart to CORS: it
+// rejects upgrade requests whose Origin is not on the operator-configured
+// allowlist, which is the only effective defence against Cross-Site
+// WebSocket Hijacking. Same-host server-to-server callers omit Origin and
+// are allowed through; that is the standard browser-vs-non-browser split.
+func (h *ProxyHandler) isOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser clients (curl, kubectl, our own service-to-service
+		// callers) do not send Origin. They still had to clear the auth
+		// + role + CSRF chain to reach us, so allow them.
+		return true
+	}
+	if h == nil {
+		return false
+	}
+	if h.allowAnyOrigin {
+		return true
+	}
+	// No allowlist configured at all → deny anything with an Origin to
+	// fail closed. Operators must opt-in via http.allowed_origins.
+	if len(h.allowedOrigins) == 0 {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimRight(origin, "/"))
+	_, ok := h.allowedOrigins[normalized]
+	return ok
+}
+
+func (h *ProxyHandler) isNamespaceBlocked(namespace string) bool {
+	if h == nil || namespace == "" {
+		return false
+	}
+	_, blocked := h.blockedNamespaces[strings.ToLower(namespace)]
+	return blocked
+}
+
 // serveUpgrade transparently bridges an HTTP/1.1 protocol upgrade (WebSocket,
 // SPDY/3.1, etc.) between the client and the upstream kube-apiserver. It does
 // not rely on net/http/httputil.ReverseProxy, so the upstream's status line
@@ -201,8 +330,27 @@ func (h *ProxyHandler) serveUpgrade(
 	upstreamPath string,
 	requestID string,
 	clusterID string,
+	namespace string,
+	podName string,
+	containerName string,
 ) {
 	logger := slog.Default()
+
+	// Cap concurrent upgrade sessions per user so a misbehaving (or
+	// compromised) account cannot exhaust kube-apiserver connection
+	// quotas or our file descriptors.
+	principal, _ := middleware.PrincipalFromContext(r.Context())
+	release, ok := h.limiter.Acquire(principal.Subject)
+	if !ok {
+		writeUpgradeError(w, requestID, http.StatusTooManyRequests,
+			"too many concurrent terminal sessions",
+			fmt.Errorf("subject %q exceeded concurrent session limit", principal.Subject))
+		logger.Warn("kapi upgrade rate limited",
+			"request_id", requestID, "cluster_id", clusterID,
+			"subject", principal.Subject)
+		return
+	}
+	defer release()
 
 	target, err := url.Parse(restConfig.Host)
 	if err != nil || target.Scheme == "" || target.Host == "" {
@@ -304,6 +452,21 @@ func (h *ProxyHandler) serveUpgrade(
 		return
 	}
 
+	logger.Info("kapi upgrade upstream 101",
+		"request_id", requestID, "cluster_id", clusterID,
+		"path", upstreamURL.Path,
+		"upstream_subprotocol", upstreamResp.Header.Get("Sec-Websocket-Protocol"),
+		"upstream_accept", upstreamResp.Header.Get("Sec-Websocket-Accept"),
+		"upstream_extensions", upstreamResp.Header.Get("Sec-Websocket-Extensions"),
+		"upstream_headers", flattenHeaders(upstreamResp.Header),
+		"client_sent_key", r.Header.Get("Sec-Websocket-Key"),
+		"client_sent_subprotocol", r.Header.Get("Sec-Websocket-Protocol"),
+		"client_sent_version", r.Header.Get("Sec-Websocket-Version"),
+		"client_sent_extensions", r.Header.Get("Sec-Websocket-Extensions"),
+		"client_origin", r.Header.Get("Origin"),
+		"upstream_buffered", upstreamReader.Buffered(),
+	)
+
 	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
 		_ = upstreamResp.Body.Close()
@@ -313,7 +476,78 @@ func (h *ProxyHandler) serveUpgrade(
 	}
 	defer clientConn.Close()
 
-	if err := writeUpgrade101ToWriter(clientBuf, upstreamResp); err != nil {
+	logger.Info("kapi upgrade hijacked",
+		"request_id", requestID, "cluster_id", clusterID,
+		"subject", principal.Subject,
+		"namespace", namespace,
+		"pod", podName,
+		"container", containerName,
+		"client_local", clientConn.LocalAddr().String(),
+		"client_remote", clientConn.RemoteAddr().String(),
+		"client_buffered", clientBuf.Reader.Buffered(),
+		"client_conn_type", fmt.Sprintf("%T", clientConn),
+	)
+
+	// Schedule a hard kill once the access token expires so an already-
+	// established WebSocket cannot outlive the credential that opened it.
+	// A small grace period (5s) absorbs clock skew between Kubeflare and
+	// the token issuer.
+	if !principal.ExpiresAt.IsZero() {
+		ttl := time.Until(principal.ExpiresAt) + 5*time.Second
+		if ttl > 0 {
+			timer := time.AfterFunc(ttl, func() {
+				logger.Warn("kapi upgrade token expired, closing",
+					"request_id", requestID, "cluster_id", clusterID,
+					"subject", principal.Subject,
+					"expires_at", principal.ExpiresAt,
+				)
+				_ = clientConn.Close()
+				_ = upstreamConn.Close()
+			})
+			defer timer.Stop()
+		} else {
+			logger.Warn("kapi upgrade token already expired at handshake",
+				"request_id", requestID, "cluster_id", clusterID,
+				"subject", principal.Subject)
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+			return
+		}
+	}
+
+	// Per-session stdin audit. Bytes are fed to the parser via a bounded
+	// channel; if the auditor cannot keep up the data is dropped so the
+	// proxy never blocks on the audit goroutine.
+	var (
+		auditCh      chan []byte
+		auditDone    chan struct{}
+		auditor      *wsStdinAuditor
+		auditEnabled = h.auditStdin
+	)
+	if auditEnabled {
+		auditor = newWSStdinAuditor(logger, sessionMeta{
+			RequestID: requestID,
+			ClusterID: clusterID,
+			Subject:   principal.Subject,
+			Namespace: namespace,
+			Pod:       podName,
+			Container: containerName,
+		})
+		auditCh = make(chan []byte, 256)
+		auditDone = make(chan struct{})
+		go func() {
+			defer close(auditDone)
+			for chunk := range auditCh {
+				auditor.Feed(chunk)
+			}
+			auditor.Flush()
+		}()
+	}
+
+	// Capture the exact bytes we send back to the client as the 101 response.
+	var headerCapture bytes.Buffer
+	mirroredWriter := io.MultiWriter(clientBuf, &headerCapture)
+	if err := writeUpgrade101ToWriter(mirroredWriter, upstreamResp); err != nil {
 		logger.Error("kapi upgrade write 101 to client",
 			"request_id", requestID, "cluster_id", clusterID, "error", err)
 		return
@@ -323,17 +557,29 @@ func (h *ProxyHandler) serveUpgrade(
 			"request_id", requestID, "cluster_id", clusterID, "error", err)
 		return
 	}
+	logger.Info("kapi upgrade wrote 101 to client",
+		"request_id", requestID, "cluster_id", clusterID,
+		"bytes", headerCapture.Len(),
+		"response_dump", strings.ReplaceAll(headerCapture.String(), "\r\n", "\\r\\n"),
+	)
 
-	// Bidirectional copy; the first direction to finish closes done.
+	// Bidirectional copy with detailed instrumentation so we can see which
+	// side closes first and how many bytes were exchanged.
 	var (
-		wg             sync.WaitGroup
-		firstCloseOnce sync.Once
+		wg              sync.WaitGroup
+		clientToUpBytes int64
+		upToClientBytes int64
+		firstCloseOnce  sync.Once
+		firstCloseSide  string
+		firstCloseErr   error
 	)
 	wg.Add(2)
 	done := make(chan struct{})
 
-	noteClose := func() {
+	noteClose := func(side string, err error) {
 		firstCloseOnce.Do(func() {
+			firstCloseSide = side
+			firstCloseErr = err
 			close(done)
 		})
 	}
@@ -341,26 +587,98 @@ func (h *ProxyHandler) serveUpgrade(
 	go func() {
 		defer wg.Done()
 		clientReader := combineReaders(clientBuf.Reader, clientConn)
-		_, _ = io.Copy(upstreamConn, clientReader)
+		var dst io.Writer = &loggedWriter{
+			w:          upstreamConn,
+			direction:  "client->upstream",
+			requestID:  requestID,
+			clusterID:  clusterID,
+			logger:     logger,
+			firstFrame: true,
+		}
+		if auditEnabled {
+			dst = &auditTapWriter{w: dst, ch: auditCh}
+		}
+		n, err := io.Copy(dst, clientReader)
+		clientToUpBytes = n
+		logger.Info("kapi upgrade copy client->upstream finished",
+			"request_id", requestID, "cluster_id", clusterID,
+			"bytes", n, "error", err,
+		)
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		noteClose()
+		noteClose("client->upstream", err)
 	}()
 	go func() {
 		defer wg.Done()
 		upstreamReaderCombined := combineReaders(upstreamReader, upstreamConn)
-		_, _ = io.Copy(clientConn, upstreamReaderCombined)
+		n, err := io.Copy(&loggedWriter{
+			w:          clientConn,
+			direction:  "upstream->client",
+			requestID:  requestID,
+			clusterID:  clusterID,
+			logger:     logger,
+			firstFrame: true,
+		}, upstreamReaderCombined)
+		upToClientBytes = n
+		logger.Info("kapi upgrade copy upstream->client finished",
+			"request_id", requestID, "cluster_id", clusterID,
+			"bytes", n, "error", err,
+		)
 		if cw, ok := clientConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		noteClose()
+		noteClose("upstream->client", err)
 	}()
 
 	<-done
 	_ = clientConn.Close()
 	_ = upstreamConn.Close()
 	wg.Wait()
+
+	if auditEnabled {
+		close(auditCh)
+		<-auditDone
+	}
+
+	logger.Info("kapi upgrade closed",
+		"request_id", requestID, "cluster_id", clusterID,
+		"subject", principal.Subject,
+		"first_close_side", firstCloseSide,
+		"first_close_error", fmt.Sprint(firstCloseErr),
+		"client_to_upstream_bytes", clientToUpBytes,
+		"upstream_to_client_bytes", upToClientBytes,
+	)
+}
+
+// loggedWriter wraps an io.Writer and logs the very first chunk of data
+// that flows through it, with a hex dump capped to 64 bytes. Useful for
+// figuring out which side started talking after the WebSocket upgrade.
+type loggedWriter struct {
+	w          io.Writer
+	direction  string
+	requestID  string
+	clusterID  string
+	logger     *slog.Logger
+	firstFrame bool
+}
+
+func (lw *loggedWriter) Write(p []byte) (int, error) {
+	if lw.firstFrame {
+		lw.firstFrame = false
+		preview := p
+		if len(preview) > 64 {
+			preview = preview[:64]
+		}
+		lw.logger.Info("kapi upgrade first bytes",
+			"request_id", lw.requestID,
+			"cluster_id", lw.clusterID,
+			"direction", lw.direction,
+			"chunk_size", len(p),
+			"preview_hex", fmt.Sprintf("%x", preview),
+		)
+	}
+	return lw.w.Write(p)
 }
 
 type closeWriter interface {
