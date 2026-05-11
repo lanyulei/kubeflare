@@ -452,21 +452,6 @@ func (h *ProxyHandler) serveUpgrade(
 		return
 	}
 
-	logger.Info("kapi upgrade upstream 101",
-		"request_id", requestID, "cluster_id", clusterID,
-		"path", upstreamURL.Path,
-		"upstream_subprotocol", upstreamResp.Header.Get("Sec-Websocket-Protocol"),
-		"upstream_accept", upstreamResp.Header.Get("Sec-Websocket-Accept"),
-		"upstream_extensions", upstreamResp.Header.Get("Sec-Websocket-Extensions"),
-		"upstream_headers", flattenHeaders(upstreamResp.Header),
-		"client_sent_key", r.Header.Get("Sec-Websocket-Key"),
-		"client_sent_subprotocol", r.Header.Get("Sec-Websocket-Protocol"),
-		"client_sent_version", r.Header.Get("Sec-Websocket-Version"),
-		"client_sent_extensions", r.Header.Get("Sec-Websocket-Extensions"),
-		"client_origin", r.Header.Get("Origin"),
-		"upstream_buffered", upstreamReader.Buffered(),
-	)
-
 	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
 		_ = upstreamResp.Body.Close()
@@ -475,18 +460,6 @@ func (h *ProxyHandler) serveUpgrade(
 		return
 	}
 	defer clientConn.Close()
-
-	logger.Info("kapi upgrade hijacked",
-		"request_id", requestID, "cluster_id", clusterID,
-		"subject", principal.Subject,
-		"namespace", namespace,
-		"pod", podName,
-		"container", containerName,
-		"client_local", clientConn.LocalAddr().String(),
-		"client_remote", clientConn.RemoteAddr().String(),
-		"client_buffered", clientBuf.Reader.Buffered(),
-		"client_conn_type", fmt.Sprintf("%T", clientConn),
-	)
 
 	// Schedule a hard kill once the access token expires so an already-
 	// established WebSocket cannot outlive the credential that opened it.
@@ -544,10 +517,7 @@ func (h *ProxyHandler) serveUpgrade(
 		}()
 	}
 
-	// Capture the exact bytes we send back to the client as the 101 response.
-	var headerCapture bytes.Buffer
-	mirroredWriter := io.MultiWriter(clientBuf, &headerCapture)
-	if err := writeUpgrade101ToWriter(mirroredWriter, upstreamResp); err != nil {
+	if err := writeUpgrade101ToWriter(clientBuf, upstreamResp); err != nil {
 		logger.Error("kapi upgrade write 101 to client",
 			"request_id", requestID, "cluster_id", clusterID, "error", err)
 		return
@@ -557,29 +527,18 @@ func (h *ProxyHandler) serveUpgrade(
 			"request_id", requestID, "cluster_id", clusterID, "error", err)
 		return
 	}
-	logger.Info("kapi upgrade wrote 101 to client",
-		"request_id", requestID, "cluster_id", clusterID,
-		"bytes", headerCapture.Len(),
-		"response_dump", strings.ReplaceAll(headerCapture.String(), "\r\n", "\\r\\n"),
-	)
 
-	// Bidirectional copy with detailed instrumentation so we can see which
-	// side closes first and how many bytes were exchanged.
+	// Bidirectional copy between client and upstream. We only need to know
+	// when one side closes so we can tear the other side down promptly.
 	var (
-		wg              sync.WaitGroup
-		clientToUpBytes int64
-		upToClientBytes int64
-		firstCloseOnce  sync.Once
-		firstCloseSide  string
-		firstCloseErr   error
+		wg             sync.WaitGroup
+		firstCloseOnce sync.Once
 	)
 	wg.Add(2)
 	done := make(chan struct{})
 
-	noteClose := func(side string, err error) {
+	noteClose := func() {
 		firstCloseOnce.Do(func() {
-			firstCloseSide = side
-			firstCloseErr = err
 			close(done)
 		})
 	}
@@ -587,48 +546,24 @@ func (h *ProxyHandler) serveUpgrade(
 	go func() {
 		defer wg.Done()
 		clientReader := combineReaders(clientBuf.Reader, clientConn)
-		var dst io.Writer = &loggedWriter{
-			w:          upstreamConn,
-			direction:  "client->upstream",
-			requestID:  requestID,
-			clusterID:  clusterID,
-			logger:     logger,
-			firstFrame: true,
-		}
+		var dst io.Writer = upstreamConn
 		if auditEnabled {
 			dst = &auditTapWriter{w: dst, ch: auditCh}
 		}
-		n, err := io.Copy(dst, clientReader)
-		clientToUpBytes = n
-		logger.Info("kapi upgrade copy client->upstream finished",
-			"request_id", requestID, "cluster_id", clusterID,
-			"bytes", n, "error", err,
-		)
+		_, _ = io.Copy(dst, clientReader)
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		noteClose("client->upstream", err)
+		noteClose()
 	}()
 	go func() {
 		defer wg.Done()
 		upstreamReaderCombined := combineReaders(upstreamReader, upstreamConn)
-		n, err := io.Copy(&loggedWriter{
-			w:          clientConn,
-			direction:  "upstream->client",
-			requestID:  requestID,
-			clusterID:  clusterID,
-			logger:     logger,
-			firstFrame: true,
-		}, upstreamReaderCombined)
-		upToClientBytes = n
-		logger.Info("kapi upgrade copy upstream->client finished",
-			"request_id", requestID, "cluster_id", clusterID,
-			"bytes", n, "error", err,
-		)
+		_, _ = io.Copy(clientConn, upstreamReaderCombined)
 		if cw, ok := clientConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		noteClose("upstream->client", err)
+		noteClose()
 	}()
 
 	<-done
@@ -640,45 +575,6 @@ func (h *ProxyHandler) serveUpgrade(
 		close(auditCh)
 		<-auditDone
 	}
-
-	logger.Info("kapi upgrade closed",
-		"request_id", requestID, "cluster_id", clusterID,
-		"subject", principal.Subject,
-		"first_close_side", firstCloseSide,
-		"first_close_error", fmt.Sprint(firstCloseErr),
-		"client_to_upstream_bytes", clientToUpBytes,
-		"upstream_to_client_bytes", upToClientBytes,
-	)
-}
-
-// loggedWriter wraps an io.Writer and logs the very first chunk of data
-// that flows through it, with a hex dump capped to 64 bytes. Useful for
-// figuring out which side started talking after the WebSocket upgrade.
-type loggedWriter struct {
-	w          io.Writer
-	direction  string
-	requestID  string
-	clusterID  string
-	logger     *slog.Logger
-	firstFrame bool
-}
-
-func (lw *loggedWriter) Write(p []byte) (int, error) {
-	if lw.firstFrame {
-		lw.firstFrame = false
-		preview := p
-		if len(preview) > 64 {
-			preview = preview[:64]
-		}
-		lw.logger.Info("kapi upgrade first bytes",
-			"request_id", lw.requestID,
-			"cluster_id", lw.clusterID,
-			"direction", lw.direction,
-			"chunk_size", len(p),
-			"preview_hex", fmt.Sprintf("%x", preview),
-		)
-	}
-	return lw.w.Write(p)
 }
 
 type closeWriter interface {
