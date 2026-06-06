@@ -15,6 +15,9 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	aipostgres "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/postgres"
+	aihttp "github.com/lanyulei/kubeflare/internal/module/ai/interface/http"
 	clusterapplication "github.com/lanyulei/kubeflare/internal/module/cluster/application"
 	clusterkubernetes "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/kubernetes"
 	clusterpostgres "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/postgres"
@@ -93,6 +96,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	uploadRepo := uploadlocal.NewFileRepository(cfg.Upload.RootDir)
 	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, cfg.Database.QueryTimeout)
 	clusterInspector := clusterkubernetes.NewInspector(cfg.Database.QueryTimeout)
+	aiRepo := aipostgres.NewChatRepository(gormDB, cfg.Database.QueryTimeout)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
 	authenticator := middleware.NewSignedTokenAuthenticator(tokenManager, userPrincipalResolver{repo: userRepo})
@@ -121,13 +125,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
+	aiService := aiapplication.NewService(aiRepo, validator, nil)
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
 		MaxConcurrentSessionsPerUser: cfg.KAPI.MaxConcurrentSessionsPerUser,
 	})
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService)
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +219,7 @@ func newAPIHandler(
 	oidcService *iamapplication.OIDCService,
 	uploadService *uploadapplication.Service,
 	clusterService *clusterapplication.Service,
+	aiService *aiapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -257,6 +263,8 @@ func newAPIHandler(
 	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
 	clusterHandler := clusterhttp.NewHandler(clusterService)
 	clusterhttp.RegisterRoutes(protectedAPI, clusterHandler)
+	aiHandler := aihttp.NewHandler(aiService)
+	aihttp.RegisterRoutes(protectedAPI, aiHandler)
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
