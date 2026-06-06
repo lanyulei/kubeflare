@@ -19,6 +19,7 @@ import (
 const (
 	DEFAULT_SESSION_TITLE = "新会话"
 	MAX_TITLE_LENGTH      = 18
+	MAX_SUMMARY_LENGTH    = 512
 )
 
 type Service struct {
@@ -242,6 +243,7 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 		CompletedAt: &now,
 	}
 	session.Title = titleForMessage(session, content)
+	session.Summary = summaryForMessage(assistantMessage)
 	session.UpdatedAt = now
 
 	updatedSession, messages, err := repo.AppendMessages(ctx, normalizedUserID, normalizedSessionID, []domain.ChatMessage{userMessage, assistantMessage}, session)
@@ -384,6 +386,19 @@ func titleForMessage(session domain.ChatSession, content string) string {
 		return normalizedContent
 	}
 	return string([]rune(normalizedContent)[:MAX_TITLE_LENGTH]) + "..."
+}
+
+func summaryForMessage(message domain.ChatMessage) string {
+	normalizedContent := strings.Join(strings.Fields(message.Content), " ")
+	if normalizedContent == "" {
+		return ""
+	}
+
+	runes := []rune(normalizedContent)
+	if len(runes) <= MAX_SUMMARY_LENGTH {
+		return normalizedContent
+	}
+	return string(runes[:MAX_SUMMARY_LENGTH-3]) + "..."
 }
 
 func toMessageContext(messages []domain.ChatMessage) []MessageContext {
