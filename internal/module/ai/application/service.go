@@ -317,12 +317,6 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 
 	content := req.Content
 	history := toMessageContext(existingMessages)
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	stream, err := s.assistantGenerator().Stream(streamCtx, history, content)
-	if err != nil {
-		cancelStream()
-		return nil, mapAssistantError(err)
-	}
 
 	now := time.Now().UTC()
 	userMessage := domain.ChatMessage{
@@ -348,7 +342,6 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 
 	updatedSession, messages, err := repo.AppendMessages(ctx, normalizedUserID, normalizedSessionID, []domain.ChatMessage{userMessage, assistantMessage}, session)
 	if err != nil {
-		cancelStream()
 		return nil, mapRepositoryError(err, "chat session not found")
 	}
 	if len(messages) >= 2 {
@@ -356,23 +349,26 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 		assistantMessage = messages[1]
 	}
 
+	streamCtx, cancelStream := context.WithCancel(ctx)
 	events := make(chan StreamMessageEvent, 16)
 	go func() {
 		defer cancelStream()
-		s.runMessageStream(ctx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, stream)
+		s.runMessageStream(ctx, streamCtx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content)
 	}()
 	return events, nil
 }
 
 func (s *Service) runMessageStream(
 	ctx context.Context,
+	streamCtx context.Context,
 	events chan<- StreamMessageEvent,
 	userID string,
 	repo domain.Repository,
 	session domain.ChatSession,
 	userMessage domain.ChatMessage,
 	assistantMessage domain.ChatMessage,
-	stream <-chan AssistantStreamEvent,
+	history []MessageContext,
+	content string,
 ) {
 	defer close(events)
 
@@ -391,6 +387,12 @@ func (s *Service) runMessageStream(
 		UserMessage:      &userMessage,
 		AssistantMessage: &assistantMessage,
 	}) {
+		return
+	}
+
+	stream, err := s.assistantGenerator().Stream(streamCtx, history, content)
+	if err != nil {
+		s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(err))
 		return
 	}
 

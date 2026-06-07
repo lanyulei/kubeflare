@@ -173,8 +173,13 @@ func (h *Handler) StreamMessage(c *gin.Context) {
 	}
 
 	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
+	c.Header("Cache-Control", "no-cache, no-transform")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Writer.WriteHeaderNow()
+	if c.Writer != nil {
+		c.Writer.Flush()
+	}
 	for event := range events {
 		if event.Event == "" {
 			continue
