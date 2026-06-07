@@ -21,6 +21,16 @@ func NewHandler(service *application.Service) *Handler {
 	return &Handler{service: service}
 }
 
+func (h *Handler) GetStatus(c *gin.Context) {
+	if _, err := currentUserID(c); err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	status := h.service.ConnectionStatus(c.Request.Context())
+	response.OK(c, http.StatusOK, status)
+}
+
 func (h *Handler) ListSession(c *gin.Context) {
 	userID, err := currentUserID(c)
 	if err != nil {

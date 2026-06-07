@@ -12,6 +12,10 @@ type AssistantGenerator struct {
 	registry *platformllm.Registry
 }
 
+type clientInfoProvider interface {
+	Info() platformllm.ClientInfo
+}
+
 func NewAssistantGenerator(registry *platformllm.Registry) *AssistantGenerator {
 	return &AssistantGenerator{registry: registry}
 }
@@ -78,6 +82,27 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 		_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Done: true, Reply: reply})
 	}()
 	return events, nil
+}
+
+func (generator *AssistantGenerator) ConnectionStatus(_ context.Context) application.AssistantConnectionStatus {
+	client, err := generator.client()
+	if err != nil {
+		return application.AssistantConnectionStatus{
+			Status:  application.AI_CONNECTION_STATUS_FAILED,
+			Message: err.Error(),
+		}
+	}
+
+	status := application.AssistantConnectionStatus{
+		Status:  application.AI_CONNECTION_STATUS_CONNECTED,
+		Message: "AI provider is configured",
+	}
+	if infoProvider, ok := client.(clientInfoProvider); ok {
+		info := infoProvider.Info()
+		status.Provider = info.Provider
+		status.Model = info.Model
+	}
+	return status
 }
 
 func (generator *AssistantGenerator) client() (platformllm.Client, error) {

@@ -46,6 +46,11 @@ type ChatRequest struct {
 	Messages []Message
 }
 
+type ClientInfo struct {
+	Provider string
+	Model    string
+}
+
 type Message struct {
 	Role    string
 	Content string
@@ -288,6 +293,13 @@ func (c *openAICompatibleClient) Stream(ctx context.Context, request ChatRequest
 	events := make(chan StreamEvent, 8)
 	go c.readStream(ctx, httpResponse.Body, events)
 	return events, nil
+}
+
+func (c *openAICompatibleClient) Info() ClientInfo {
+	return ClientInfo{
+		Provider: c.provider,
+		Model:    c.config.Model,
+	}
 }
 
 func (c *openAICompatibleClient) newRequestBody(request ChatRequest, stream bool) ([]byte, error) {

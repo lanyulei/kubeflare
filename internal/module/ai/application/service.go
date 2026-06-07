@@ -50,7 +50,7 @@ func NewService(repo domain.Repository, validator *validation.Validate, generato
 		validator = validation.New()
 	}
 	if generator == nil {
-		generator = NewStaticAssistantGenerator()
+		generator = NewUnavailableAssistantGenerator()
 	}
 	return &Service{
 		repo:      repo,
@@ -220,6 +220,9 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 	if err != nil {
 		return domain.ChatSessionDetail{}, err
 	}
+	if err := s.ensureAssistantConnected(ctx); err != nil {
+		return domain.ChatSessionDetail{}, err
+	}
 
 	session, err := repo.GetSession(ctx, normalizedUserID, normalizedSessionID)
 	if err != nil {
@@ -299,6 +302,9 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 	if err != nil {
 		return nil, err
 	}
+	if err := s.ensureAssistantConnected(ctx); err != nil {
+		return nil, err
+	}
 
 	session, err := repo.GetSession(ctx, normalizedUserID, normalizedSessionID)
 	if err != nil {
@@ -311,6 +317,13 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 
 	content := req.Content
 	history := toMessageContext(existingMessages)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stream, err := s.assistantGenerator().Stream(streamCtx, history, content)
+	if err != nil {
+		cancelStream()
+		return nil, mapAssistantError(err)
+	}
+
 	now := time.Now().UTC()
 	userMessage := domain.ChatMessage{
 		ID:          newID("message-user"),
@@ -335,6 +348,7 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 
 	updatedSession, messages, err := repo.AppendMessages(ctx, normalizedUserID, normalizedSessionID, []domain.ChatMessage{userMessage, assistantMessage}, session)
 	if err != nil {
+		cancelStream()
 		return nil, mapRepositoryError(err, "chat session not found")
 	}
 	if len(messages) >= 2 {
@@ -343,7 +357,10 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 	}
 
 	events := make(chan StreamMessageEvent, 16)
-	go s.runMessageStream(ctx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content)
+	go func() {
+		defer cancelStream()
+		s.runMessageStream(ctx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, stream)
+	}()
 	return events, nil
 }
 
@@ -355,8 +372,7 @@ func (s *Service) runMessageStream(
 	session domain.ChatSession,
 	userMessage domain.ChatMessage,
 	assistantMessage domain.ChatMessage,
-	history []MessageContext,
-	content string,
+	stream <-chan AssistantStreamEvent,
 ) {
 	defer close(events)
 
@@ -375,12 +391,6 @@ func (s *Service) runMessageStream(
 		UserMessage:      &userMessage,
 		AssistantMessage: &assistantMessage,
 	}) {
-		return
-	}
-
-	stream, err := s.assistantGenerator().Stream(ctx, history, content)
-	if err != nil {
-		s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(err))
 		return
 	}
 
@@ -534,6 +544,27 @@ func (s *Service) CancelMessage(ctx context.Context, userID string, messageID st
 	return updated, nil
 }
 
+func (s *Service) ConnectionStatus(ctx context.Context) AssistantConnectionStatus {
+	return s.assistantGenerator().ConnectionStatus(ctx)
+}
+
+func (s *Service) ensureAssistantConnected(ctx context.Context) error {
+	status := s.assistantGenerator().ConnectionStatus(ctx)
+	if status.Status == AI_CONNECTION_STATUS_CONNECTED {
+		return nil
+	}
+
+	message := strings.TrimSpace(status.Message)
+	if message == "" {
+		message = "AI provider is not connected"
+	}
+	return &sharedErrors.AppError{
+		Code:    sharedErrors.CodeInternal,
+		Message: message,
+		Status:  http.StatusServiceUnavailable,
+	}
+}
+
 func (s *Service) repository() (domain.Repository, error) {
 	if s == nil || s.repo == nil {
 		return nil, &sharedErrors.AppError{
@@ -554,7 +585,7 @@ func (s *Service) validateRequest(req any) error {
 
 func (s *Service) assistantGenerator() AssistantGenerator {
 	if s == nil || s.generator == nil {
-		return NewStaticAssistantGenerator()
+		return NewUnavailableAssistantGenerator()
 	}
 	return s.generator
 }
@@ -591,6 +622,14 @@ func mapAssistantError(err error) error {
 			Code:    sharedErrors.CodeTimeout,
 			Message: "AI provider request timed out",
 			Status:  http.StatusGatewayTimeout,
+			Err:     err,
+		}
+	}
+	if errors.Is(err, ErrAssistantUnavailable) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: ErrAssistantUnavailable.Error(),
+			Status:  http.StatusServiceUnavailable,
 			Err:     err,
 		}
 	}
@@ -666,9 +705,6 @@ func normalizeTitle(title string, fallback string) string {
 
 func normalizeModel(model string) string {
 	trimmedModel := strings.TrimSpace(model)
-	if trimmedModel == "" {
-		return DEFAULT_ASSISTANT_MODEL
-	}
 	return trimmedModel
 }
 

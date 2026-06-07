@@ -4,6 +4,7 @@ import "github.com/gin-gonic/gin"
 
 func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	ai := group.Group("/ai")
+	ai.GET("/status", handler.GetStatus)
 	ai.GET("/session", handler.ListSession)
 	ai.POST("/session", handler.CreateSession)
 	ai.GET("/session/:sessionID", handler.GetSession)

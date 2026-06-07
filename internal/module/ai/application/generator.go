@@ -2,13 +2,16 @@ package application
 
 import (
 	"context"
-	"regexp"
-	"strings"
+	"errors"
 )
 
-var artificialIntelligencePattern = regexp.MustCompile(`(?i)artificial intelligence|人工智能|\bai\b`)
+const (
+	AI_CONNECTION_STATUS_CONNECTED    = "connected"
+	AI_CONNECTION_STATUS_DISCONNECTED = "disconnected"
+	AI_CONNECTION_STATUS_FAILED       = "failed"
+)
 
-const DEFAULT_ASSISTANT_MODEL = "kubeflare-static-assistant"
+var ErrAssistantUnavailable = errors.New("AI provider is not configured")
 
 type AssistantReply struct {
 	Content          string
@@ -22,6 +25,7 @@ type AssistantReply struct {
 type AssistantGenerator interface {
 	Generate(ctx context.Context, history []MessageContext, content string) (AssistantReply, error)
 	Stream(ctx context.Context, history []MessageContext, content string) (<-chan AssistantStreamEvent, error)
+	ConnectionStatus(ctx context.Context) AssistantConnectionStatus
 }
 
 type AssistantStreamEvent struct {
@@ -36,59 +40,30 @@ type MessageContext struct {
 	Content string
 }
 
-type StaticAssistantGenerator struct{}
-
-func NewStaticAssistantGenerator() StaticAssistantGenerator {
-	return StaticAssistantGenerator{}
+type AssistantConnectionStatus struct {
+	Status   string `json:"status"`
+	Message  string `json:"message,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
-func (StaticAssistantGenerator) Generate(_ context.Context, _ []MessageContext, content string) (AssistantReply, error) {
-	trimmedContent := strings.TrimSpace(content)
-	if artificialIntelligencePattern.MatchString(trimmedContent) {
-		return AssistantReply{
-			Content: strings.Join([]string{
-				"### Key advantages of Artificial Intelligence",
-				"- **Automation:** AI can automate repetitive and mundane tasks, saving time and effort for humans.",
-				"- **Decision-making:** AI systems can analyze vast amounts of data, identify patterns, and support informed decisions.",
-				"- **Improved accuracy:** AI algorithms can reduce human error in image recognition, natural language processing, and data analysis.",
-				"- **Continuous operation:** AI systems can work without breaks, which is helpful for customer support, manufacturing, and monitoring scenarios.",
-			}, "\n"),
-			Model: DEFAULT_ASSISTANT_MODEL,
-		}, nil
+type UnavailableAssistantGenerator struct{}
+
+func NewUnavailableAssistantGenerator() UnavailableAssistantGenerator {
+	return UnavailableAssistantGenerator{}
+}
+
+func (UnavailableAssistantGenerator) Generate(_ context.Context, _ []MessageContext, _ string) (AssistantReply, error) {
+	return AssistantReply{}, ErrAssistantUnavailable
+}
+
+func (UnavailableAssistantGenerator) Stream(_ context.Context, _ []MessageContext, _ string) (<-chan AssistantStreamEvent, error) {
+	return nil, ErrAssistantUnavailable
+}
+
+func (UnavailableAssistantGenerator) ConnectionStatus(_ context.Context) AssistantConnectionStatus {
+	return AssistantConnectionStatus{
+		Status:  AI_CONNECTION_STATUS_DISCONNECTED,
+		Message: ErrAssistantUnavailable.Error(),
 	}
-
-	return AssistantReply{
-		Content: strings.Join([]string{
-			"**我已经收到你的问题。** “" + trimmedContent + "”",
-			"可以先从以下角度拆解：",
-			strings.Join([]string{
-				"- **目标：** 明确你希望最终得到什么结果。",
-				"- **上下文：** 补充当前环境、已有数据和限制条件。",
-				"- **验证：** 定义怎样确认输出是正确的。",
-			}, "\n"),
-			"```text\n输入 -> 分析 -> 实现 -> 验证\n```",
-		}, "\n\n"),
-		Model: DEFAULT_ASSISTANT_MODEL,
-	}, nil
-}
-
-func (generator StaticAssistantGenerator) Stream(ctx context.Context, history []MessageContext, content string) (<-chan AssistantStreamEvent, error) {
-	events := make(chan AssistantStreamEvent, 2)
-	go func() {
-		defer close(events)
-
-		reply, err := generator.Generate(ctx, history, content)
-		if err != nil {
-			events <- AssistantStreamEvent{Err: err}
-			return
-		}
-
-		select {
-		case <-ctx.Done():
-			events <- AssistantStreamEvent{Err: ctx.Err()}
-		case events <- AssistantStreamEvent{Delta: reply.Content}:
-			events <- AssistantStreamEvent{Done: true, Reply: reply}
-		}
-	}()
-	return events, nil
 }
