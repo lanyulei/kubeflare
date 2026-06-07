@@ -25,3 +25,18 @@ upload:
 
 kapi:
   blocked_namespaces: []
+
+ai:
+  enabled: true
+  default_provider: deepseek
+  providers:
+    deepseek:
+      type: openai_compatible
+      base_url: https://api.deepseek.com
+      chat_path: /chat/completions
+      api_key: ${KUBEFLARE_AI__PROVIDERS__DEEPSEEK__API_KEY}
+      model: deepseek-v4-flash
+      timeout: 30s
+      stream: true
+      temperature: 0.7
+      max_tokens: 4096
