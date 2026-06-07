@@ -361,6 +361,8 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	completed := false
+	completedModel := c.config.Model
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
@@ -375,7 +377,7 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 			continue
 		}
 		if payload == "[DONE]" {
-			_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: c.config.Model})
+			_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: completedModel})
 			return
 		}
 
@@ -391,22 +393,35 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 			}
 		}
 		for _, choice := range response.Choices {
+			model := streamModel(response.Model, c.config.Model)
 			if choice.Delta.Content != "" {
-				if !sendStreamEvent(ctx, events, StreamEvent{Delta: choice.Delta.Content, Provider: c.provider, Model: streamModel(response.Model, c.config.Model)}) {
+				if !sendStreamEvent(ctx, events, StreamEvent{Delta: choice.Delta.Content, Provider: c.provider, Model: model}) {
 					return
 				}
 			}
 			if choice.FinishReason != nil {
-				_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: streamModel(response.Model, c.config.Model)})
-				return
+				completed = true
+				completedModel = model
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			_ = sendStreamEvent(ctx, events, StreamEvent{Err: ctx.Err()})
+			return
+		}
 		_ = sendStreamEvent(ctx, events, StreamEvent{Err: providerError(c.provider, 0, "read llm provider stream failed", err)})
 		return
 	}
-	_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: c.config.Model})
+	if ctx.Err() != nil {
+		_ = sendStreamEvent(ctx, events, StreamEvent{Err: ctx.Err()})
+		return
+	}
+	if completed {
+		_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: completedModel})
+		return
+	}
+	_ = sendStreamEvent(ctx, events, StreamEvent{Err: providerError(c.provider, 0, "llm provider stream ended before completion", nil)})
 }
 
 func sendStreamEvent(ctx context.Context, events chan<- StreamEvent, event StreamEvent) bool {

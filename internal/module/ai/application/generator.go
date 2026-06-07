@@ -12,6 +12,7 @@ const (
 )
 
 var ErrAssistantUnavailable = errors.New("AI provider is not configured")
+var ErrAssistantStreamInterrupted = errors.New("AI provider stream interrupted before completion")
 
 type AssistantReply struct {
 	Content          string

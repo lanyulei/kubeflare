@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/application"
@@ -41,11 +42,14 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 
 	stream, err := client.Stream(ctx, toChatRequest(history, content))
 	if err != nil {
-		reply, generateErr := generator.Generate(ctx, history, content)
-		if generateErr != nil {
-			return nil, generateErr
+		if isStreamingDisabledError(err) {
+			reply, generateErr := generator.Generate(ctx, history, content)
+			if generateErr != nil {
+				return nil, generateErr
+			}
+			return singleReplyStream(ctx, reply), nil
 		}
-		return singleReplyStream(ctx, reply), nil
+		return nil, err
 	}
 
 	events := make(chan application.AssistantStreamEvent, 8)
@@ -79,7 +83,7 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 				return
 			}
 		}
-		_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Done: true, Reply: reply})
+		_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Err: application.ErrAssistantStreamInterrupted})
 	}()
 	return events, nil
 }
@@ -107,6 +111,13 @@ func (generator *AssistantGenerator) ConnectionStatus(_ context.Context) applica
 
 func (generator *AssistantGenerator) client() (platformllm.Client, error) {
 	return generator.registry.DefaultClient()
+}
+
+func isStreamingDisabledError(err error) bool {
+	var providerErr *platformllm.ProviderError
+	return errors.As(err, &providerErr) &&
+		providerErr.StatusCode == 0 &&
+		strings.Contains(strings.ToLower(providerErr.Message), "streaming is disabled")
 }
 
 func singleReplyStream(ctx context.Context, reply application.AssistantReply) <-chan application.AssistantStreamEvent {

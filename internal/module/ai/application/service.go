@@ -396,6 +396,7 @@ func (s *Service) runMessageStream(
 
 	var responseContent strings.Builder
 	var finalReply AssistantReply
+	streamCompleted := false
 	for event := range stream {
 		if event.Err != nil {
 			s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(event.Err))
@@ -414,8 +415,17 @@ func (s *Service) runMessageStream(
 		}
 		if event.Done {
 			finalReply = event.Reply
+			streamCompleted = true
 			break
 		}
+	}
+	if !streamCompleted {
+		err := ErrAssistantStreamInterrupted
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(err))
+		return
 	}
 
 	if finalReply.Content == "" {
@@ -633,6 +643,14 @@ func mapAssistantError(err error) error {
 			Err:     err,
 		}
 	}
+	if errors.Is(err, ErrAssistantStreamInterrupted) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: ErrAssistantStreamInterrupted.Error(),
+			Status:  http.StatusBadGateway,
+			Err:     err,
+		}
+	}
 
 	var providerErr *platformllm.ProviderError
 	if errors.As(err, &providerErr) {
@@ -737,13 +755,60 @@ func summaryForMessage(message domain.ChatMessage) string {
 
 func toMessageContext(messages []domain.ChatMessage) []MessageContext {
 	contextMessages := make([]MessageContext, 0, len(messages))
-	for _, message := range messages {
+	for index := 0; index < len(messages); index++ {
+		message := messages[index]
+		if message.DeletedAt != nil || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+
+		if message.Role == domain.MESSAGE_ROLE_SYSTEM && message.Status == domain.MESSAGE_STATUS_COMPLETED {
+			contextMessages = append(contextMessages, MessageContext{
+				Role:    message.Role,
+				Content: message.Content,
+			})
+			continue
+		}
+
+		if message.Role != domain.MESSAGE_ROLE_USER || message.Status != domain.MESSAGE_STATUS_COMPLETED {
+			continue
+		}
+
+		assistantIndex := nextCompletedAssistantIndex(messages, index+1)
+		if assistantIndex < 0 {
+			continue
+		}
+
+		assistantMessage := messages[assistantIndex]
 		contextMessages = append(contextMessages, MessageContext{
 			Role:    message.Role,
 			Content: message.Content,
 		})
+		contextMessages = append(contextMessages, MessageContext{
+			Role:    assistantMessage.Role,
+			Content: assistantMessage.Content,
+		})
+		index = assistantIndex
 	}
 	return contextMessages
+}
+
+func nextCompletedAssistantIndex(messages []domain.ChatMessage, start int) int {
+	for index := start; index < len(messages); index++ {
+		message := messages[index]
+		if message.DeletedAt != nil || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if message.Role == domain.MESSAGE_ROLE_USER {
+			return -1
+		}
+		if message.Role == domain.MESSAGE_ROLE_ASSISTANT {
+			if message.Status == domain.MESSAGE_STATUS_COMPLETED {
+				return index
+			}
+			return -1
+		}
+	}
+	return -1
 }
 
 func newID(prefix string) string {
