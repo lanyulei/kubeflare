@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	aillm "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/llm"
 	aipostgres "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/postgres"
 	aihttp "github.com/lanyulei/kubeflare/internal/module/ai/interface/http"
 	clusterapplication "github.com/lanyulei/kubeflare/internal/module/cluster/application"
@@ -36,6 +37,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/platform/config"
 	"github.com/lanyulei/kubeflare/internal/platform/db"
 	"github.com/lanyulei/kubeflare/internal/platform/httpx"
+	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
 	logpkg "github.com/lanyulei/kubeflare/internal/platform/log"
 	"github.com/lanyulei/kubeflare/internal/platform/metrics"
 	"github.com/lanyulei/kubeflare/internal/platform/secrets"
@@ -123,9 +125,13 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			return nil, err
 		}
 	}
+	aiGenerator, err := newAIGenerator(cfg.AI)
+	if err != nil {
+		return nil, err
+	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
-	aiService := aiapplication.NewService(aiRepo, validator, nil)
+	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator)
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
@@ -211,6 +217,33 @@ func newKAPIHandler(clusterService *clusterapplication.Service, authenticator mi
 	return handler
 }
 
+func newAIGenerator(cfg config.AIConfig) (aiapplication.AssistantGenerator, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+
+	providers := make(map[string]platformllm.ProviderConfig, len(cfg.Providers))
+	for providerName, providerConfig := range cfg.Providers {
+		providers[providerName] = platformllm.ProviderConfig{
+			Type:        providerConfig.Type,
+			BaseURL:     providerConfig.BaseURL,
+			ChatPath:    providerConfig.ChatPath,
+			APIKey:      providerConfig.APIKey,
+			Model:       providerConfig.Model,
+			Timeout:     providerConfig.Timeout,
+			Stream:      providerConfig.Stream,
+			Temperature: providerConfig.Temperature,
+			MaxTokens:   providerConfig.MaxTokens,
+		}
+	}
+
+	registry, err := platformllm.NewRegistry(cfg.DefaultProvider, providers)
+	if err != nil {
+		return nil, err
+	}
+	return aillm.NewAssistantGenerator(registry), nil
+}
+
 func newAPIHandler(
 	cfg config.Config,
 	logger *slog.Logger,
@@ -268,9 +301,19 @@ func newAPIHandler(
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
-		handler = middleware.TimeoutHTTP(cfg.HTTP.APIRequestTimeout, handler)
+		handler = middleware.TimeoutHTTPWithSkipper(cfg.HTTP.APIRequestTimeout, isAIStreamRequest, handler)
 	}
 	return handler, nil
+}
+
+func isAIStreamRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	path := r.URL.Path
+	return r.Method == http.MethodPost &&
+		strings.HasPrefix(path, "/api/v1/ai/session/") &&
+		strings.HasSuffix(path, "/message/stream")
 }
 
 func runAuthStateCleanup(ctx context.Context, logger *slog.Logger, authStateRepo *iampostgres.AuthStateRepository, captchaStore *iamcaptcha.Store) {

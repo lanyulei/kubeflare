@@ -11,12 +11,24 @@ var artificialIntelligencePattern = regexp.MustCompile(`(?i)artificial intellige
 const DEFAULT_ASSISTANT_MODEL = "kubeflare-static-assistant"
 
 type AssistantReply struct {
-	Content string
-	Model   string
+	Content          string
+	Provider         string
+	Model            string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 type AssistantGenerator interface {
 	Generate(ctx context.Context, history []MessageContext, content string) (AssistantReply, error)
+	Stream(ctx context.Context, history []MessageContext, content string) (<-chan AssistantStreamEvent, error)
+}
+
+type AssistantStreamEvent struct {
+	Delta string
+	Done  bool
+	Err   error
+	Reply AssistantReply
 }
 
 type MessageContext struct {
@@ -58,4 +70,25 @@ func (StaticAssistantGenerator) Generate(_ context.Context, _ []MessageContext, 
 		}, "\n\n"),
 		Model: DEFAULT_ASSISTANT_MODEL,
 	}, nil
+}
+
+func (generator StaticAssistantGenerator) Stream(ctx context.Context, history []MessageContext, content string) (<-chan AssistantStreamEvent, error) {
+	events := make(chan AssistantStreamEvent, 2)
+	go func() {
+		defer close(events)
+
+		reply, err := generator.Generate(ctx, history, content)
+		if err != nil {
+			events <- AssistantStreamEvent{Err: err}
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			events <- AssistantStreamEvent{Err: ctx.Err()}
+		case events <- AssistantStreamEvent{Delta: reply.Content}:
+			events <- AssistantStreamEvent{Done: true, Reply: reply}
+		}
+	}()
+	return events, nil
 }

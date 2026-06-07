@@ -1,0 +1,2 @@
+ALTER TABLE ai_chat_message
+  ADD COLUMN IF NOT EXISTS provider VARCHAR(64) NOT NULL DEFAULT '';

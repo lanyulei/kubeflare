@@ -7,6 +7,7 @@ type Config struct {
 	HTTP          HTTPConfig          `koanf:"http"`
 	Auth          AuthConfig          `koanf:"auth"`
 	KAPI          KAPIConfig          `koanf:"kapi"`
+	AI            AIConfig            `koanf:"ai"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
 	Secrets       SecretsConfig       `koanf:"secrets"`
@@ -54,6 +55,24 @@ type KAPIConfig struct {
 	// SPDY upgrade sessions a single authenticated subject may hold open.
 	// 0 disables the cap (not recommended).
 	MaxConcurrentSessionsPerUser int `koanf:"max_concurrent_sessions_per_user"`
+}
+
+type AIConfig struct {
+	Enabled         bool                        `koanf:"enabled"`
+	DefaultProvider string                      `koanf:"default_provider"`
+	Providers       map[string]AIProviderConfig `koanf:"providers"`
+}
+
+type AIProviderConfig struct {
+	Type        string        `koanf:"type"`
+	BaseURL     string        `koanf:"base_url"`
+	ChatPath    string        `koanf:"chat_path"`
+	APIKey      string        `koanf:"api_key"`
+	Model       string        `koanf:"model"`
+	Timeout     time.Duration `koanf:"timeout"`
+	Stream      bool          `koanf:"stream"`
+	Temperature float64       `koanf:"temperature"`
+	MaxTokens   int           `koanf:"max_tokens"`
 }
 
 type AuthConfig struct {
@@ -157,6 +176,10 @@ func Default() Config {
 				"kube-node-lease",
 			},
 			MaxConcurrentSessionsPerUser: 5,
+		},
+		AI: AIConfig{
+			Enabled:   false,
+			Providers: map[string]AIProviderConfig{},
 		},
 		Auth: AuthConfig{
 			TokenTTL:              24 * time.Hour,

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/hex"
 	"errors"
+	"strings"
 )
 
 func Validate(cfg Config) error {
@@ -58,8 +59,61 @@ func Validate(cfg Config) error {
 			return errors.New("auth.oidc issuer_url, client_id, client_secret, and redirect_url are required when oidc is enabled")
 		}
 	}
+	if err := validateAIConfig(cfg.AI); err != nil {
+		return err
+	}
 	if cfg.Upload.RootDir == "" {
 		return errors.New("upload.root_dir is required")
 	}
+	return nil
+}
+
+func validateAIConfig(cfg AIConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(cfg.DefaultProvider) == "" {
+		return errors.New("ai.default_provider is required when ai is enabled")
+	}
+	if len(cfg.Providers) == 0 {
+		return errors.New("ai.providers is required when ai is enabled")
+	}
+
+	defaultProvider := strings.TrimSpace(cfg.DefaultProvider)
+	if _, ok := cfg.Providers[defaultProvider]; !ok {
+		return errors.New("ai.default_provider must reference an entry in ai.providers")
+	}
+
+	for name, provider := range cfg.Providers {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("ai.providers cannot contain an empty provider name")
+		}
+		providerType := strings.TrimSpace(provider.Type)
+		if providerType == "" {
+			return errors.New("ai.providers." + name + ".type is required")
+		}
+		if providerType != "openai_compatible" {
+			return errors.New("ai.providers." + name + ".type must be openai_compatible")
+		}
+		if strings.TrimSpace(provider.BaseURL) == "" {
+			return errors.New("ai.providers." + name + ".base_url is required")
+		}
+		if strings.TrimSpace(provider.APIKey) == "" {
+			return errors.New("ai.providers." + name + ".api_key is required")
+		}
+		if strings.TrimSpace(provider.Model) == "" {
+			return errors.New("ai.providers." + name + ".model is required")
+		}
+		if provider.Timeout < 0 {
+			return errors.New("ai.providers." + name + ".timeout must not be negative")
+		}
+		if provider.Temperature < 0 || provider.Temperature > 2 {
+			return errors.New("ai.providers." + name + ".temperature must be between 0 and 2")
+		}
+		if provider.MaxTokens < 0 {
+			return errors.New("ai.providers." + name + ".max_tokens must not be negative")
+		}
+	}
+
 	return nil
 }

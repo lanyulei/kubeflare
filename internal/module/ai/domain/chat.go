@@ -36,6 +36,7 @@ type ChatMessage struct {
 	ContentType      string     `json:"content_type"`
 	Status           string     `json:"status"`
 	Sequence         int        `json:"sequence"`
+	Provider         string     `json:"provider,omitempty"`
 	Model            string     `json:"model,omitempty"`
 	PromptTokens     int        `json:"prompt_tokens,omitempty"`
 	CompletionTokens int        `json:"completion_tokens,omitempty"`

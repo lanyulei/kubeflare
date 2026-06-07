@@ -156,7 +156,7 @@ func (h *Handler) StreamMessage(c *gin.Context) {
 		return
 	}
 
-	detail, err := h.service.StreamMessage(c.Request.Context(), userID, c.Param("sessionID"), req)
+	events, err := h.service.StreamMessage(c.Request.Context(), userID, c.Param("sessionID"), req)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -165,10 +165,14 @@ func (h *Handler) StreamMessage(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
-	c.SSEvent("message", detail)
-	c.SSEvent("done", gin.H{"session_id": detail.ID})
-	if c.Writer != nil {
-		c.Writer.Flush()
+	for event := range events {
+		if event.Event == "" {
+			continue
+		}
+		c.SSEvent(event.Event, event)
+		if c.Writer != nil {
+			c.Writer.Flush()
+		}
 	}
 }
 

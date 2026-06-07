@@ -36,6 +36,7 @@ type chatMessageRecord struct {
 	ContentType      string    `gorm:"size:32;not null;default:'markdown'"`
 	Status           string    `gorm:"size:32;not null;default:'completed'"`
 	Sequence         int       `gorm:"not null"`
+	Provider         string    `gorm:"size:64;not null;default:''"`
 	Model            string    `gorm:"size:128;not null;default:''"`
 	PromptTokens     int       `gorm:"not null;default:0"`
 	CompletionTokens int       `gorm:"not null;default:0"`
@@ -270,6 +271,12 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 	}
 
 	record.Status = message.Status
+	record.Content = message.Content
+	record.Provider = message.Provider
+	record.Model = message.Model
+	record.PromptTokens = message.PromptTokens
+	record.CompletionTokens = message.CompletionTokens
+	record.TotalTokens = message.TotalTokens
 	record.ErrorMessage = message.ErrorMessage
 	record.CompletedAt = message.CompletedAt
 	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
@@ -323,6 +330,7 @@ func toDomainMessage(record chatMessageRecord) domain.ChatMessage {
 		ContentType:      record.ContentType,
 		Status:           record.Status,
 		Sequence:         record.Sequence,
+		Provider:         record.Provider,
 		Model:            record.Model,
 		PromptTokens:     record.PromptTokens,
 		CompletionTokens: record.CompletionTokens,
@@ -347,6 +355,7 @@ func fromDomainMessage(message domain.ChatMessage) chatMessageRecord {
 		ContentType:      message.ContentType,
 		Status:           message.Status,
 		Sequence:         message.Sequence,
+		Provider:         message.Provider,
 		Model:            message.Model,
 		PromptTokens:     message.PromptTokens,
 		CompletionTokens: message.CompletionTokens,

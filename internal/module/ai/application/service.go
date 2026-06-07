@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/domain"
+	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 )
 
@@ -20,12 +21,28 @@ const (
 	DEFAULT_SESSION_TITLE = "新会话"
 	MAX_TITLE_LENGTH      = 18
 	MAX_SUMMARY_LENGTH    = 512
+
+	STREAM_EVENT_MESSAGE_CREATED   = "message.created"
+	STREAM_EVENT_MESSAGE_DELTA     = "message.delta"
+	STREAM_EVENT_MESSAGE_COMPLETED = "message.completed"
+	STREAM_EVENT_MESSAGE_FAILED    = "message.failed"
 )
 
 type Service struct {
 	repo      domain.Repository
 	validator *validation.Validate
 	generator AssistantGenerator
+}
+
+type StreamMessageEvent struct {
+	Event            string              `json:"-"`
+	Session          *domain.ChatSession `json:"session,omitempty"`
+	UserMessage      *domain.ChatMessage `json:"user_message,omitempty"`
+	AssistantMessage *domain.ChatMessage `json:"assistant_message,omitempty"`
+	Message          *domain.ChatMessage `json:"message,omitempty"`
+	MessageID        string              `json:"message_id,omitempty"`
+	Delta            string              `json:"delta,omitempty"`
+	ErrorMessage     string              `json:"error_message,omitempty"`
 }
 
 func NewService(repo domain.Repository, validator *validation.Validate, generator AssistantGenerator) *Service {
@@ -217,7 +234,7 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 	history := toMessageContext(existingMessages)
 	reply, err := s.assistantGenerator().Generate(ctx, history, content)
 	if err != nil {
-		return domain.ChatSessionDetail{}, err
+		return domain.ChatSessionDetail{}, mapAssistantError(err)
 	}
 
 	now := time.Now().UTC()
@@ -232,15 +249,19 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 		CompletedAt: &now,
 	}
 	assistantMessage := domain.ChatMessage{
-		ID:          newID("message-assistant"),
-		SessionID:   normalizedSessionID,
-		Role:        domain.MESSAGE_ROLE_ASSISTANT,
-		Content:     reply.Content,
-		ContentType: domain.MESSAGE_CONTENT_TYPE_MARKDOWN,
-		Status:      domain.MESSAGE_STATUS_COMPLETED,
-		Model:       normalizeModel(reply.Model),
-		CreatedAt:   now,
-		CompletedAt: &now,
+		ID:               newID("message-assistant"),
+		SessionID:        normalizedSessionID,
+		Role:             domain.MESSAGE_ROLE_ASSISTANT,
+		Content:          reply.Content,
+		ContentType:      domain.MESSAGE_CONTENT_TYPE_MARKDOWN,
+		Status:           domain.MESSAGE_STATUS_COMPLETED,
+		Provider:         strings.TrimSpace(reply.Provider),
+		Model:            normalizeModel(reply.Model),
+		PromptTokens:     reply.PromptTokens,
+		CompletionTokens: reply.CompletionTokens,
+		TotalTokens:      reply.TotalTokens,
+		CreatedAt:        now,
+		CompletedAt:      &now,
 	}
 	session.Title = titleForMessage(session, content)
 	session.Summary = summaryForMessage(assistantMessage)
@@ -261,8 +282,223 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 	}, nil
 }
 
-func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID string, req CreateMessageRequest) (domain.ChatSessionDetail, error) {
-	return s.CreateMessage(ctx, userID, sessionID, req)
+func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID string, req CreateMessageRequest) (<-chan StreamMessageEvent, error) {
+	repo, err := s.repository()
+	if err != nil {
+		return nil, err
+	}
+	req.Content = strings.TrimSpace(req.Content)
+	if err := s.validateRequest(req); err != nil {
+		return nil, err
+	}
+	normalizedUserID, err := normalizeUserID(userID)
+	if err != nil {
+		return nil, err
+	}
+	normalizedSessionID, err := normalizeID(sessionID, "session id is required")
+	if err != nil {
+		return nil, err
+	}
+
+	session, err := repo.GetSession(ctx, normalizedUserID, normalizedSessionID)
+	if err != nil {
+		return nil, mapRepositoryError(err, "chat session not found")
+	}
+	existingMessages, err := repo.ListMessages(ctx, normalizedUserID, normalizedSessionID)
+	if err != nil {
+		return nil, mapRepositoryError(err, "chat session not found")
+	}
+
+	content := req.Content
+	history := toMessageContext(existingMessages)
+	now := time.Now().UTC()
+	userMessage := domain.ChatMessage{
+		ID:          newID("message-user"),
+		SessionID:   normalizedSessionID,
+		Role:        domain.MESSAGE_ROLE_USER,
+		Content:     content,
+		ContentType: domain.MESSAGE_CONTENT_TYPE_MARKDOWN,
+		Status:      domain.MESSAGE_STATUS_COMPLETED,
+		CreatedAt:   now,
+		CompletedAt: &now,
+	}
+	assistantMessage := domain.ChatMessage{
+		ID:          newID("message-assistant"),
+		SessionID:   normalizedSessionID,
+		Role:        domain.MESSAGE_ROLE_ASSISTANT,
+		ContentType: domain.MESSAGE_CONTENT_TYPE_MARKDOWN,
+		Status:      domain.MESSAGE_STATUS_PENDING,
+		CreatedAt:   now,
+	}
+	session.Title = titleForMessage(session, content)
+	session.UpdatedAt = now
+
+	updatedSession, messages, err := repo.AppendMessages(ctx, normalizedUserID, normalizedSessionID, []domain.ChatMessage{userMessage, assistantMessage}, session)
+	if err != nil {
+		return nil, mapRepositoryError(err, "chat session not found")
+	}
+	if len(messages) >= 2 {
+		userMessage = messages[0]
+		assistantMessage = messages[1]
+	}
+
+	events := make(chan StreamMessageEvent, 16)
+	go s.runMessageStream(ctx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content)
+	return events, nil
+}
+
+func (s *Service) runMessageStream(
+	ctx context.Context,
+	events chan<- StreamMessageEvent,
+	userID string,
+	repo domain.Repository,
+	session domain.ChatSession,
+	userMessage domain.ChatMessage,
+	assistantMessage domain.ChatMessage,
+	history []MessageContext,
+	content string,
+) {
+	defer close(events)
+
+	persistCtx := context.WithoutCancel(ctx)
+	assistantMessage.Status = domain.MESSAGE_STATUS_STREAMING
+	if updatedMessage, err := repo.UpdateMessage(persistCtx, userID, assistantMessage); err == nil {
+		assistantMessage = updatedMessage
+	} else {
+		s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapRepositoryError(err, "chat message not found"))
+		return
+	}
+
+	if !sendStreamEvent(ctx, events, StreamMessageEvent{
+		Event:            STREAM_EVENT_MESSAGE_CREATED,
+		Session:          &session,
+		UserMessage:      &userMessage,
+		AssistantMessage: &assistantMessage,
+	}) {
+		return
+	}
+
+	stream, err := s.assistantGenerator().Stream(ctx, history, content)
+	if err != nil {
+		s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(err))
+		return
+	}
+
+	var responseContent strings.Builder
+	var finalReply AssistantReply
+	for event := range stream {
+		if event.Err != nil {
+			s.failStreamMessage(persistCtx, ctx, events, userID, repo, assistantMessage, mapAssistantError(event.Err))
+			return
+		}
+		if event.Delta != "" {
+			responseContent.WriteString(event.Delta)
+			if !sendStreamEvent(ctx, events, StreamMessageEvent{
+				Event:     STREAM_EVENT_MESSAGE_DELTA,
+				MessageID: assistantMessage.ID,
+				Delta:     event.Delta,
+			}) {
+				_, _ = markStreamMessageFailed(persistCtx, userID, repo, assistantMessage, "generation canceled")
+				return
+			}
+		}
+		if event.Done {
+			finalReply = event.Reply
+			break
+		}
+	}
+
+	if finalReply.Content == "" {
+		finalReply.Content = responseContent.String()
+	}
+	s.completeStreamMessage(persistCtx, ctx, events, userID, repo, session, assistantMessage, finalReply)
+}
+
+func (s *Service) completeStreamMessage(
+	ctx context.Context,
+	eventCtx context.Context,
+	events chan<- StreamMessageEvent,
+	userID string,
+	repo domain.Repository,
+	session domain.ChatSession,
+	assistantMessage domain.ChatMessage,
+	reply AssistantReply,
+) {
+	now := time.Now().UTC()
+	assistantMessage.Content = reply.Content
+	assistantMessage.Status = domain.MESSAGE_STATUS_COMPLETED
+	assistantMessage.Provider = strings.TrimSpace(reply.Provider)
+	assistantMessage.Model = normalizeModel(reply.Model)
+	assistantMessage.PromptTokens = reply.PromptTokens
+	assistantMessage.CompletionTokens = reply.CompletionTokens
+	assistantMessage.TotalTokens = reply.TotalTokens
+	assistantMessage.CompletedAt = &now
+	assistantMessage.ErrorMessage = ""
+
+	updatedMessage, err := repo.UpdateMessage(ctx, userID, assistantMessage)
+	if err != nil {
+		s.failStreamMessage(ctx, eventCtx, events, userID, repo, assistantMessage, mapRepositoryError(err, "chat message not found"))
+		return
+	}
+
+	session.Summary = summaryForMessage(updatedMessage)
+	session.UpdatedAt = now
+	updatedSession, err := repo.UpdateSession(ctx, session)
+	if err != nil {
+		s.failStreamMessage(ctx, eventCtx, events, userID, repo, updatedMessage, mapRepositoryError(err, "chat session not found"))
+		return
+	}
+
+	_ = sendStreamEvent(eventCtx, events, StreamMessageEvent{
+		Event:   STREAM_EVENT_MESSAGE_COMPLETED,
+		Session: &updatedSession,
+		Message: &updatedMessage,
+	})
+}
+
+func (s *Service) failStreamMessage(
+	ctx context.Context,
+	eventCtx context.Context,
+	events chan<- StreamMessageEvent,
+	userID string,
+	repo domain.Repository,
+	assistantMessage domain.ChatMessage,
+	err error,
+) {
+	errorMessage := userFacingAssistantError(err)
+	updatedMessage, updateErr := markStreamMessageFailed(ctx, userID, repo, assistantMessage, errorMessage)
+	if updateErr == nil {
+		assistantMessage = updatedMessage
+	} else {
+		now := time.Now().UTC()
+		assistantMessage.Status = domain.MESSAGE_STATUS_FAILED
+		assistantMessage.ErrorMessage = errorMessage
+		assistantMessage.CompletedAt = &now
+	}
+
+	_ = sendStreamEvent(eventCtx, events, StreamMessageEvent{
+		Event:        STREAM_EVENT_MESSAGE_FAILED,
+		Message:      &assistantMessage,
+		MessageID:    assistantMessage.ID,
+		ErrorMessage: assistantMessage.ErrorMessage,
+	})
+}
+
+func markStreamMessageFailed(ctx context.Context, userID string, repo domain.Repository, assistantMessage domain.ChatMessage, errorMessage string) (domain.ChatMessage, error) {
+	now := time.Now().UTC()
+	assistantMessage.Status = domain.MESSAGE_STATUS_FAILED
+	assistantMessage.ErrorMessage = errorMessage
+	assistantMessage.CompletedAt = &now
+	return repo.UpdateMessage(ctx, userID, assistantMessage)
+}
+
+func sendStreamEvent(ctx context.Context, events chan<- StreamMessageEvent, event StreamMessageEvent) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case events <- event:
+		return true
+	}
 }
 
 func (s *Service) CancelMessage(ctx context.Context, userID string, messageID string) (domain.ChatMessage, error) {
@@ -336,6 +572,64 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 		}
 	}
 	return err
+}
+
+func mapAssistantError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeBadRequest,
+			Message: "generation canceled",
+			Status:  http.StatusBadRequest,
+			Err:     err,
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeTimeout,
+			Message: "AI provider request timed out",
+			Status:  http.StatusGatewayTimeout,
+			Err:     err,
+		}
+	}
+
+	var providerErr *platformllm.ProviderError
+	if errors.As(err, &providerErr) {
+		status := http.StatusBadGateway
+		message := "AI provider request failed"
+		switch providerErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			message = "AI provider authentication failed"
+		case http.StatusTooManyRequests:
+			status = http.StatusTooManyRequests
+			message = "AI provider rate limited"
+		case http.StatusGatewayTimeout:
+			status = http.StatusGatewayTimeout
+			message = "AI provider request timed out"
+		default:
+			if providerErr.StatusCode >= http.StatusInternalServerError {
+				message = "AI provider is unavailable"
+			}
+		}
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: message,
+			Status:  status,
+			Err:     err,
+		}
+	}
+
+	return err
+}
+
+func userFacingAssistantError(err error) string {
+	appErr := sharedErrors.From(err)
+	if strings.TrimSpace(appErr.Message) == "" {
+		return "AI generation failed"
+	}
+	return appErr.Message
 }
 
 func normalizeUserID(userID string) (string, error) {
