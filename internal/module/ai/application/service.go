@@ -251,9 +251,13 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 		return domain.ChatSessionDetail{}, mapRepositoryError(err, "chat session not found")
 	}
 
+	sessionMessages := make([]domain.ChatMessage, 0, len(existingMessages)+len(messages))
+	sessionMessages = append(sessionMessages, existingMessages...)
+	sessionMessages = append(sessionMessages, messages...)
+
 	return domain.ChatSessionDetail{
 		ChatSession: updatedSession,
-		Messages:    messages,
+		Messages:    sessionMessages,
 	}, nil
 }
 
