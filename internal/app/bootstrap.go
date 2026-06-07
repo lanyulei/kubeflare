@@ -15,6 +15,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	agentapplication "github.com/lanyulei/kubeflare/internal/module/agent/application"
+	agentkubernetes "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubernetes"
+	agentpostgres "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/postgres"
+	agenthttp "github.com/lanyulei/kubeflare/internal/module/agent/interface/http"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	aillm "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/llm"
 	aipostgres "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/postgres"
@@ -99,6 +103,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, cfg.Database.QueryTimeout)
 	clusterInspector := clusterkubernetes.NewInspector(cfg.Database.QueryTimeout)
 	aiRepo := aipostgres.NewChatRepository(gormDB, cfg.Database.QueryTimeout)
+	agentRepo := agentpostgres.NewAgentRepository(gormDB, cfg.Database.QueryTimeout)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
 	authenticator := middleware.NewSignedTokenAuthenticator(tokenManager, userPrincipalResolver{repo: userRepo})
@@ -132,13 +137,15 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
 	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator)
+	agentToolExecutor := agentkubernetes.NewToolExecutor(clusterService)
+	agentService := agentapplication.NewService(agentRepo, validator, agentToolExecutor, aiGenerator)
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
 		MaxConcurrentSessionsPerUser: cfg.KAPI.MaxConcurrentSessionsPerUser,
 	})
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService, agentService)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +260,7 @@ func newAPIHandler(
 	uploadService *uploadapplication.Service,
 	clusterService *clusterapplication.Service,
 	aiService *aiapplication.Service,
+	agentService *agentapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -298,21 +306,28 @@ func newAPIHandler(
 	clusterhttp.RegisterRoutes(protectedAPI, clusterHandler)
 	aiHandler := aihttp.NewHandler(aiService)
 	aihttp.RegisterRoutes(protectedAPI, aiHandler)
+	agentHandler := agenthttp.NewHandler(agentService)
+	agenthttp.RegisterRoutes(protectedAPI, agentHandler)
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
-		handler = middleware.TimeoutHTTPWithSkipper(cfg.HTTP.APIRequestTimeout, isAIStreamRequest, handler)
+		handler = middleware.TimeoutHTTPWithSkipper(cfg.HTTP.APIRequestTimeout, isLongLivedAPIRequest, handler)
 	}
 	return handler, nil
 }
 
-func isAIStreamRequest(r *http.Request) bool {
+func isLongLivedAPIRequest(r *http.Request) bool {
 	if r == nil || r.URL == nil {
 		return false
 	}
 	path := r.URL.Path
-	return r.Method == http.MethodPost &&
-		strings.HasPrefix(path, "/api/v1/ai/session/") &&
+	if r.Method != http.MethodPost {
+		return false
+	}
+	if strings.HasPrefix(path, "/api/v1/agent/") && strings.HasSuffix(path, "/run/stream") {
+		return true
+	}
+	return strings.HasPrefix(path, "/api/v1/ai/session/") &&
 		strings.HasSuffix(path, "/message/stream")
 }
 
