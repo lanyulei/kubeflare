@@ -2,11 +2,11 @@ package application
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	validation "github.com/go-playground/validator/v10"
@@ -14,7 +14,9 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
+	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
+	"github.com/lanyulei/kubeflare/internal/shared/idgen"
 )
 
 const (
@@ -22,16 +24,37 @@ const (
 	MAX_TITLE_LENGTH      = 18
 	MAX_SUMMARY_LENGTH    = 512
 
+	// DEFAULT_STALE_AFTER 是判定生成中消息为"僵尸"的默认时长阈值。
+	DEFAULT_STALE_AFTER = 10 * time.Minute
+
+	// MAX_CONTEXT_MESSAGES / MAX_CONTEXT_CHARS 限制随每次请求发送给 LLM 的
+	// 历史上下文规模(不含本次新消息),防止长会话触发 provider 的 context
+	// 超限错误而导致会话无法继续。
+	MAX_CONTEXT_MESSAGES = 20
+	MAX_CONTEXT_CHARS    = 24000
+
 	STREAM_EVENT_MESSAGE_CREATED   = "message.created"
 	STREAM_EVENT_MESSAGE_DELTA     = "message.delta"
 	STREAM_EVENT_MESSAGE_COMPLETED = "message.completed"
 	STREAM_EVENT_MESSAGE_FAILED    = "message.failed"
+
+	// MAX_TITLE_SOURCE_CHARS 限制送给 LLM 生成标题的用户首条消息长度。
+	MAX_TITLE_SOURCE_CHARS = 500
 )
+
+// titleSystemPrompt 指示 LLM 为会话生成简短标题。
+const titleSystemPrompt = "你是会话标题生成助手。根据用户的第一条消息,生成一个不超过 12 个字、概括主题的简短中文标题。只输出标题本身,不要任何标点、引号、前后缀或解释。"
 
 type Service struct {
 	repo      domain.Repository
 	validator *validation.Validate
 	generator AssistantGenerator
+	// systemPrompt 是注入到每次对话最前的系统提示词,为空则不注入。
+	systemPrompt string
+	logger       *slog.Logger
+	// activeStreams 记录正在进行流式生成的 assistantMessageID -> 取消函数,
+	// 供 CancelMessage 主动中断后台生成,避免取消后仍空跑消耗 token。
+	activeStreams sync.Map
 }
 
 type StreamMessageEvent struct {
@@ -45,17 +68,22 @@ type StreamMessageEvent struct {
 	ErrorMessage     string              `json:"error_message,omitempty"`
 }
 
-func NewService(repo domain.Repository, validator *validation.Validate, generator AssistantGenerator) *Service {
+func NewService(repo domain.Repository, validator *validation.Validate, generator AssistantGenerator, systemPrompt string, logger *slog.Logger) *Service {
 	if validator == nil {
 		validator = validation.New()
 	}
 	if generator == nil {
 		generator = NewUnavailableAssistantGenerator()
 	}
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Service{
-		repo:      repo,
-		validator: validator,
-		generator: generator,
+		repo:         repo,
+		validator:    validator,
+		generator:    generator,
+		systemPrompt: strings.TrimSpace(systemPrompt),
+		logger:       logger,
 	}
 }
 
@@ -234,7 +262,7 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 	}
 
 	content := req.Content
-	history := toMessageContext(existingMessages)
+	history := s.buildHistory(existingMessages)
 	reply, err := s.assistantGenerator().Generate(ctx, history, content)
 	if err != nil {
 		return domain.ChatSessionDetail{}, mapAssistantError(err)
@@ -273,6 +301,11 @@ func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID st
 	updatedSession, messages, err := repo.AppendMessages(ctx, normalizedUserID, normalizedSessionID, []domain.ChatMessage{userMessage, assistantMessage}, session)
 	if err != nil {
 		return domain.ChatSessionDetail{}, mapRepositoryError(err, "chat session not found")
+	}
+
+	// 首轮对话(此前无历史)后台异步用 LLM 生成更贴切的标题。
+	if len(existingMessages) == 0 {
+		s.maybeGenerateTitle(ctx, normalizedUserID, updatedSession, content)
 	}
 
 	sessionMessages := make([]domain.ChatMessage, 0, len(existingMessages)+len(messages))
@@ -316,7 +349,8 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 	}
 
 	content := req.Content
-	history := toMessageContext(existingMessages)
+	history := s.buildHistory(existingMessages)
+	firstTurn := len(existingMessages) == 0
 
 	now := time.Now().UTC()
 	userMessage := domain.ChatMessage{
@@ -350,10 +384,12 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 	}
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
+	s.activeStreams.Store(assistantMessage.ID, cancelStream)
 	events := make(chan StreamMessageEvent, 16)
 	go func() {
+		defer s.activeStreams.Delete(assistantMessage.ID)
 		defer cancelStream()
-		s.runMessageStream(ctx, streamCtx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content)
+		s.runMessageStream(ctx, streamCtx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content, firstTurn)
 	}()
 	return events, nil
 }
@@ -369,6 +405,7 @@ func (s *Service) runMessageStream(
 	assistantMessage domain.ChatMessage,
 	history []MessageContext,
 	content string,
+	firstTurn bool,
 ) {
 	defer close(events)
 
@@ -433,7 +470,7 @@ func (s *Service) runMessageStream(
 	if finalReply.Content == "" {
 		finalReply.Content = responseContent.String()
 	}
-	s.completeStreamMessage(persistCtx, ctx, events, userID, repo, session, assistantMessage, finalReply)
+	s.completeStreamMessage(persistCtx, ctx, events, userID, repo, session, assistantMessage, finalReply, content, firstTurn)
 }
 
 func (s *Service) completeStreamMessage(
@@ -445,6 +482,8 @@ func (s *Service) completeStreamMessage(
 	session domain.ChatSession,
 	assistantMessage domain.ChatMessage,
 	reply AssistantReply,
+	userContent string,
+	firstTurn bool,
 ) {
 	now := time.Now().UTC()
 	assistantMessage.Content = reply.Content
@@ -476,6 +515,11 @@ func (s *Service) completeStreamMessage(
 		Session: &updatedSession,
 		Message: &updatedMessage,
 	})
+
+	// 首轮对话完成后,后台异步用 LLM 生成更贴切的会话标题。
+	if firstTurn {
+		s.maybeGenerateTitle(ctx, userID, updatedSession, userContent)
+	}
 }
 
 func (s *Service) failStreamMessage(
@@ -515,12 +559,7 @@ func markStreamMessageFailed(ctx context.Context, userID string, repo domain.Rep
 }
 
 func sendStreamEvent(ctx context.Context, events chan<- StreamMessageEvent, event StreamMessageEvent) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case events <- event:
-		return true
-	}
+	return chanutil.Send(ctx, events, event)
 }
 
 func (s *Service) CancelMessage(ctx context.Context, userID string, messageID string) (domain.ChatMessage, error) {
@@ -541,6 +580,15 @@ func (s *Service) CancelMessage(ctx context.Context, userID string, messageID st
 	if err != nil {
 		return domain.ChatMessage{}, mapRepositoryError(err, "chat message not found")
 	}
+
+	// 若该消息正在本进程内流式生成,主动中断后台 goroutine,停止继续消耗
+	// token;由 runMessageStream 自身把消息落为终态。
+	if value, ok := s.activeStreams.Load(normalizedMessageID); ok {
+		if cancel, isCancel := value.(context.CancelFunc); isCancel {
+			cancel()
+		}
+	}
+
 	if message.Status == domain.MESSAGE_STATUS_COMPLETED || message.Status == domain.MESSAGE_STATUS_FAILED {
 		return message, nil
 	}
@@ -558,6 +606,20 @@ func (s *Service) CancelMessage(ctx context.Context, userID string, messageID st
 
 func (s *Service) ConnectionStatus(ctx context.Context) AssistantConnectionStatus {
 	return s.assistantGenerator().ConnectionStatus(ctx)
+}
+
+// RecoverStaleMessages 把超过 staleAfter 仍未完成(pending/streaming)的助手消息
+// 标记为 failed,用于进程重启后清理"卡住"的生成中消息。返回受影响数量。
+func (s *Service) RecoverStaleMessages(ctx context.Context, staleAfter time.Duration) (int64, error) {
+	repo, err := s.repository()
+	if err != nil {
+		return 0, err
+	}
+	if staleAfter <= 0 {
+		staleAfter = DEFAULT_STALE_AFTER
+	}
+	before := time.Now().UTC().Add(-staleAfter)
+	return repo.FailStaleMessages(ctx, before, "AI 生成因服务中断未完成")
 }
 
 func (s *Service) ensureAssistantConnected(ctx context.Context) error {
@@ -755,6 +817,107 @@ func summaryForMessage(message domain.ChatMessage) string {
 	return string(runes[:MAX_SUMMARY_LENGTH-3]) + "..."
 }
 
+// buildHistory 在历史对话上下文最前注入系统提示词(若已配置且历史中尚无
+// system 消息),作为每次对话的统一角色与边界设定。
+func (s *Service) buildHistory(messages []domain.ChatMessage) []MessageContext {
+	history := toMessageContext(messages)
+	prompt := strings.TrimSpace(s.systemPrompt)
+	if prompt == "" {
+		return history
+	}
+	for _, message := range history {
+		if message.Role == domain.MESSAGE_ROLE_SYSTEM {
+			return history
+		}
+	}
+	result := make([]MessageContext, 0, len(history)+1)
+	result = append(result, MessageContext{Role: domain.MESSAGE_ROLE_SYSTEM, Content: prompt})
+	result = append(result, history...)
+	return result
+}
+
+// maybeGenerateTitle 在后台异步用 LLM 为会话生成标题。仅当当前标题仍是默认/
+// 截断派生(即用户未自定义)时才覆盖。失败仅记日志,回退既有截断标题。
+// 使用 context.WithoutCancel 脱离请求生命周期,避免 SSE 断连后被取消。
+func (s *Service) maybeGenerateTitle(ctx context.Context, userID string, session domain.ChatSession, userContent string) {
+	source := strings.TrimSpace(userContent)
+	if source == "" {
+		return
+	}
+	if !isAutoTitle(session.Title, source) {
+		return
+	}
+	bgCtx := context.WithoutCancel(ctx)
+	go func() {
+		titleCtx, cancel := context.WithTimeout(bgCtx, 30*time.Second)
+		defer cancel()
+		s.generateTitle(titleCtx, userID, session, source)
+	}()
+}
+
+func (s *Service) generateTitle(ctx context.Context, userID string, session domain.ChatSession, userContent string) {
+	repo, err := s.repository()
+	if err != nil {
+		return
+	}
+	prompt := []MessageContext{{Role: domain.MESSAGE_ROLE_SYSTEM, Content: titleSystemPrompt}}
+	reply, err := s.assistantGenerator().Generate(ctx, prompt, truncateRunes(userContent, MAX_TITLE_SOURCE_CHARS))
+	if err != nil {
+		s.logger.Warn("generate chat title failed", "session", session.ID, "error", err)
+		return
+	}
+	title := sanitizeTitle(reply.Content)
+	if title == "" || title == strings.TrimSpace(session.Title) {
+		return
+	}
+
+	latest, err := repo.GetSession(ctx, userID, session.ID)
+	if err != nil {
+		return
+	}
+	// 期间用户可能已手动改名;仅当仍是自动标题时才覆盖。
+	if !isAutoTitle(latest.Title, userContent) {
+		return
+	}
+	latest.Title = title
+	latest.UpdatedAt = time.Now().UTC()
+	if _, err := repo.UpdateSession(ctx, latest); err != nil {
+		s.logger.Warn("update chat title failed", "session", session.ID, "error", err)
+	}
+}
+
+// isAutoTitle 判断标题是否仍是系统自动生成的(默认值或由首条消息截断而来),
+// 用于避免覆盖用户手动设置的标题。
+func isAutoTitle(title string, userContent string) bool {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" || trimmed == DEFAULT_SESSION_TITLE {
+		return true
+	}
+	return trimmed == titleForMessage(domain.ChatSession{}, userContent)
+}
+
+// sanitizeTitle 清洗 LLM 返回的标题:去换行/首尾空白/包裹引号,并截断到上限。
+func sanitizeTitle(raw string) string {
+	title := strings.TrimSpace(raw)
+	title = strings.ReplaceAll(title, "\n", " ")
+	title = strings.ReplaceAll(title, "\r", " ")
+	title = strings.Join(strings.Fields(title), " ")
+	title = strings.Trim(title, "\"'“”‘’`")
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	return truncateRunes(title, MAX_TITLE_LENGTH)
+}
+
+func truncateRunes(text string, max int) string {
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max])
+}
+
 func toMessageContext(messages []domain.ChatMessage) []MessageContext {
 	contextMessages := make([]MessageContext, 0, len(messages))
 	for index := 0; index < len(messages); index++ {
@@ -791,7 +954,54 @@ func toMessageContext(messages []domain.ChatMessage) []MessageContext {
 		})
 		index = assistantIndex
 	}
-	return contextMessages
+	return applyContextWindow(contextMessages)
+}
+
+// applyContextWindow 对历史上下文施加滑动窗口,防止长会话把全部历史塞进
+// LLM 请求而触发 context 超限(进而导致会话被"锁死")。策略:
+//   - system 消息始终保留(通常是系统提示);
+//   - 其余按从新到旧保留,直到达到最大消息条数或累计字符上限;
+//   - 始终保持成对的顺序与原有先后次序。
+func applyContextWindow(messages []MessageContext) []MessageContext {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	systemMessages := make([]MessageContext, 0)
+	dialogMessages := make([]MessageContext, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == domain.MESSAGE_ROLE_SYSTEM {
+			systemMessages = append(systemMessages, message)
+			continue
+		}
+		dialogMessages = append(dialogMessages, message)
+	}
+
+	kept := make([]MessageContext, 0, len(dialogMessages))
+	totalChars := 0
+	for _, message := range systemMessages {
+		totalChars += len([]rune(message.Content))
+	}
+	// 从最近的对话往前累计,超出任一上限即停止。
+	for index := len(dialogMessages) - 1; index >= 0; index-- {
+		message := dialogMessages[index]
+		chars := len([]rune(message.Content))
+		if len(kept) >= MAX_CONTEXT_MESSAGES || totalChars+chars > MAX_CONTEXT_CHARS {
+			break
+		}
+		kept = append(kept, message)
+		totalChars += chars
+	}
+
+	// kept 是逆序收集的,反转回时间正序。
+	for left, right := 0, len(kept)-1; left < right; left, right = left+1, right-1 {
+		kept[left], kept[right] = kept[right], kept[left]
+	}
+
+	result := make([]MessageContext, 0, len(systemMessages)+len(kept))
+	result = append(result, systemMessages...)
+	result = append(result, kept...)
+	return result
 }
 
 func nextCompletedAssistantIndex(messages []domain.ChatMessage, start int) int {
@@ -814,7 +1024,5 @@ func nextCompletedAssistantIndex(messages []domain.ChatMessage, start int) int {
 }
 
 func newID(prefix string) string {
-	var buf [12]byte
-	_, _ = rand.Read(buf[:])
-	return prefix + "-" + hex.EncodeToString(buf[:])
+	return idgen.NewID(prefix)
 }

@@ -8,7 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/application"
-	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 	"github.com/lanyulei/kubeflare/internal/shared/response"
 )
@@ -172,23 +171,9 @@ func (h *Handler) StreamMessage(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache, no-transform")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	c.Writer.WriteHeaderNow()
-	if c.Writer != nil {
-		c.Writer.Flush()
-	}
-	for event := range events {
-		if event.Event == "" {
-			continue
-		}
-		c.SSEvent(event.Event, event)
-		if c.Writer != nil {
-			c.Writer.Flush()
-		}
-	}
+	response.StreamSSE(c, events, func(event application.StreamMessageEvent) string {
+		return event.Event
+	})
 }
 
 func (h *Handler) CancelMessage(c *gin.Context) {
@@ -207,15 +192,5 @@ func (h *Handler) CancelMessage(c *gin.Context) {
 }
 
 func currentUserID(c *gin.Context) (string, error) {
-	principal, ok := middleware.PrincipalFromContext(c.Request.Context())
-	if ok && principal.Subject != "" {
-		return principal.Subject, nil
-	}
-
-	return "", &sharedErrors.AppError{
-		Code:    sharedErrors.CodeUnauthorized,
-		Message: middleware.ErrUnauthorized.Error(),
-		Status:  http.StatusUnauthorized,
-		Err:     middleware.ErrUnauthorized,
-	}
+	return middleware.RequireSubject(c)
 }

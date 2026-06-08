@@ -62,17 +62,51 @@ kapi:
 ai:
   enabled: false
   default_provider: deepseek
+  # 对话助手(非 Agent)的系统提示词,留空则不注入。
+  system_prompt: "你是 KubeFlare 的 Kubernetes 运维助手,用简洁、专业的中文回答运维与云原生问题。"
   providers:
     deepseek:
       type: openai_compatible
       base_url: https://api.deepseek.com
       chat_path: /chat/completions
+      # api_key 支持两种形式:
+      #   1) 明文(含通过 ${ENV} 注入的明文),向后兼容;
+      #   2) 密文:用与 secrets.encryption_key 同一把密钥加密、带 "enc:v1:" 前缀的串,
+      #      避免密钥明文落配置文件。两者启动时自动识别。
       api_key: ${KUBEFLARE_AI__PROVIDERS__DEEPSEEK__API_KEY}
       model: deepseek-chat
       timeout: 30s
+      stream_timeout: 5m
       stream: true
       temperature: 0.7
       max_tokens: 4096
+      max_retries: 2               # 对网络错误/429/5xx 的最大重试次数,0 表示不重试
+      retry_backoff: 500ms         # 首次重试退避基数,后续指数增长
+      # include_stream_usage: true # 流式是否请求 token 用量统计(默认开,个别 provider 可关)
+
+# Agent loop(LLM 驱动的多步只读诊断)运行参数。
+agent:
+  max_steps: 6                 # 单次运行最大 think-act 轮数
+  max_token_budget: 60000      # 单次运行累计 token 预算上限,0 表示不限
+  max_tool_errors_per_step: 3  # 连续无有效工具调用的最大步数,超过则强制收尾
+  step_timeout: 60s            # 单步 LLM 调用超时
+  tool_choice: auto            # 工具选择策略:auto / none / required
+  llm_routing: true            # 用 LLM 做 Agent 路由分类(失败回退关键词规则),默认开
+  stream_think: true           # think 阶段逐 token 流式输出 thinking 事件,默认开
+  max_concurrent_runs_per_user: 3  # 单用户并发执行的 Agent run 上限,0 表示不限(不推荐)
+  max_concurrent_runs: 50          # 全实例并发执行的 Agent run 总上限,0 表示不限(不推荐)
+  # 集群内 Prometheus 服务定位(经 K8s API Server 代理访问,无需额外凭证)。
+  prometheus:
+    namespace: monitoring                              # Prometheus 所在命名空间
+    service: prometheus-kube-prometheus-prometheus     # Prometheus Service 名
+    port: "9090"                                       # Service 端口
+    scheme: http                                       # http / https
+    query_timeout: 15s                                 # 单次查询超时
+  # 可选:覆盖各 Agent 的系统提示词(内联优先,其次文件路径)
+  # prompts:
+  #   diagnostic: "自定义诊断提示词"
+  # prompt_files:
+  #   diagnostic: /etc/kubeflare/prompts/diagnostic.md
 
 database:
   enabled: true

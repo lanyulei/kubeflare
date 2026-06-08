@@ -19,6 +19,9 @@ type AgentDefinition struct {
 	Available    bool     `json:"available"`
 	Capabilities []string `json:"capabilities"`
 	DefaultTools []string `json:"default_tools"`
+	// SystemPrompt 是该 Agent 在 LLM loop 中使用的系统提示词。json:"-" 确保
+	// 不通过 GET /agent 暴露给前端。
+	SystemPrompt string `json:"-"`
 }
 
 type AgentRouteResult struct {

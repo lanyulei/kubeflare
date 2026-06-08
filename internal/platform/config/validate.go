@@ -62,6 +62,9 @@ func Validate(cfg Config) error {
 	if err := validateAIConfig(cfg.AI); err != nil {
 		return err
 	}
+	if err := validateAgentConfig(cfg.Agent); err != nil {
+		return err
+	}
 	if cfg.Upload.RootDir == "" {
 		return errors.New("upload.root_dir is required")
 	}
@@ -107,13 +110,57 @@ func validateAIConfig(cfg AIConfig) error {
 		if provider.Timeout < 0 {
 			return errors.New("ai.providers." + name + ".timeout must not be negative")
 		}
-		if provider.Temperature < 0 || provider.Temperature > 2 {
+		if provider.StreamTimeout < 0 {
+			return errors.New("ai.providers." + name + ".stream_timeout must not be negative")
+		}
+		if provider.Temperature != nil && (*provider.Temperature < 0 || *provider.Temperature > 2) {
 			return errors.New("ai.providers." + name + ".temperature must be between 0 and 2")
 		}
 		if provider.MaxTokens < 0 {
 			return errors.New("ai.providers." + name + ".max_tokens must not be negative")
 		}
+		if provider.MaxRetries < 0 || provider.MaxRetries > 10 {
+			return errors.New("ai.providers." + name + ".max_retries must be between 0 and 10")
+		}
+		if provider.RetryBackoff < 0 {
+			return errors.New("ai.providers." + name + ".retry_backoff must not be negative")
+		}
 	}
 
+	return nil
+}
+
+func validateAgentConfig(cfg AgentConfig) error {
+	if cfg.MaxSteps < 0 || cfg.MaxSteps > 20 {
+		return errors.New("agent.max_steps must be between 0 and 20")
+	}
+	if cfg.MaxTokenBudget < 0 {
+		return errors.New("agent.max_token_budget must not be negative")
+	}
+	if cfg.MaxToolErrorsPerStep < 0 || cfg.MaxToolErrorsPerStep > 10 {
+		return errors.New("agent.max_tool_errors_per_step must be between 0 and 10")
+	}
+	if cfg.StepTimeout < 0 {
+		return errors.New("agent.step_timeout must not be negative")
+	}
+	if cfg.MaxConcurrentRunsPerUser < 0 {
+		return errors.New("agent.max_concurrent_runs_per_user must not be negative")
+	}
+	if cfg.MaxConcurrentRuns < 0 {
+		return errors.New("agent.max_concurrent_runs must not be negative")
+	}
+	switch strings.TrimSpace(cfg.ToolChoice) {
+	case "", "auto", "none", "required":
+	default:
+		return errors.New("agent.tool_choice must be one of auto, none, required")
+	}
+	switch strings.TrimSpace(cfg.Prometheus.Scheme) {
+	case "", "http", "https":
+	default:
+		return errors.New("agent.prometheus.scheme must be http or https")
+	}
+	if cfg.Prometheus.QueryTimeout < 0 {
+		return errors.New("agent.prometheus.query_timeout must not be negative")
+	}
 	return nil
 }

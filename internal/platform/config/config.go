@@ -8,6 +8,7 @@ type Config struct {
 	Auth          AuthConfig          `koanf:"auth"`
 	KAPI          KAPIConfig          `koanf:"kapi"`
 	AI            AIConfig            `koanf:"ai"`
+	Agent         AgentConfig         `koanf:"agent"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
 	Secrets       SecretsConfig       `koanf:"secrets"`
@@ -58,21 +59,71 @@ type KAPIConfig struct {
 }
 
 type AIConfig struct {
-	Enabled         bool                        `koanf:"enabled"`
-	DefaultProvider string                      `koanf:"default_provider"`
-	Providers       map[string]AIProviderConfig `koanf:"providers"`
+	Enabled         bool   `koanf:"enabled"`
+	DefaultProvider string `koanf:"default_provider"`
+	// SystemPrompt 是对话助手(非 Agent)的系统提示词,留空表示不注入。
+	SystemPrompt string                      `koanf:"system_prompt"`
+	Providers    map[string]AIProviderConfig `koanf:"providers"`
 }
 
 type AIProviderConfig struct {
-	Type        string        `koanf:"type"`
-	BaseURL     string        `koanf:"base_url"`
-	ChatPath    string        `koanf:"chat_path"`
-	APIKey      string        `koanf:"api_key"`
-	Model       string        `koanf:"model"`
-	Timeout     time.Duration `koanf:"timeout"`
-	Stream      bool          `koanf:"stream"`
-	Temperature float64       `koanf:"temperature"`
-	MaxTokens   int           `koanf:"max_tokens"`
+	Type          string        `koanf:"type"`
+	BaseURL       string        `koanf:"base_url"`
+	ChatPath      string        `koanf:"chat_path"`
+	APIKey        string        `koanf:"api_key"`
+	Model         string        `koanf:"model"`
+	Timeout       time.Duration `koanf:"timeout"`
+	StreamTimeout time.Duration `koanf:"stream_timeout"`
+	Stream        bool          `koanf:"stream"`
+	Temperature   *float64      `koanf:"temperature"`
+	MaxTokens     int           `koanf:"max_tokens"`
+	// MaxRetries 是对可重试错误(网络错误/429/5xx)的最大重试次数,0 表示不重试。
+	MaxRetries int `koanf:"max_retries"`
+	// RetryBackoff 是首次重试的退避基数,后续按指数增长。
+	RetryBackoff time.Duration `koanf:"retry_backoff"`
+	// IncludeStreamUsage 控制流式请求是否下发 stream_options.include_usage,
+	// nil 表示默认开启;个别非标准 provider 可设为 false 关闭。
+	IncludeStreamUsage *bool `koanf:"include_stream_usage"`
+}
+
+// AgentConfig 控制 LLM 驱动的 Agent loop 行为。
+type AgentConfig struct {
+	// MaxSteps 单次运行的最大 think-act 轮数。
+	MaxSteps int `koanf:"max_steps"`
+	// MaxTokenBudget 单次运行的累计 token 预算上限,0 表示不限。
+	MaxTokenBudget int `koanf:"max_token_budget"`
+	// MaxToolErrorsPerStep 连续无有效工具调用的最大步数,超过则强制收尾。
+	MaxToolErrorsPerStep int `koanf:"max_tool_errors_per_step"`
+	// StepTimeout 单步 LLM 调用的超时。
+	StepTimeout time.Duration `koanf:"step_timeout"`
+	// ToolChoice 工具选择策略:""/auto/none/required。
+	ToolChoice string `koanf:"tool_choice"`
+	// LLMRouting 控制是否用 LLM 做 Agent 路由分类(失败回退关键词规则),
+	// nil 表示默认开启。
+	LLMRouting *bool `koanf:"llm_routing"`
+	// StreamThink 控制 Agent think 阶段是否流式输出(token 级 thinking 事件),
+	// nil 表示默认开启。
+	StreamThink *bool `koanf:"stream_think"`
+	// MaxConcurrentRunsPerUser 限制单个用户同时执行的 Agent run 数量,防止单个
+	// 用户瞬间发起大量 run 打爆 LLM 配额与集群 apiserver。0 表示不限(不推荐)。
+	MaxConcurrentRunsPerUser int `koanf:"max_concurrent_runs_per_user"`
+	// MaxConcurrentRuns 限制全实例同时执行的 Agent run 总数。0 表示不限(不推荐)。
+	MaxConcurrentRuns int `koanf:"max_concurrent_runs"`
+	// Prompts 是 agentType -> system prompt 的内联覆盖(最高优先级)。
+	Prompts map[string]string `koanf:"prompts"`
+	// PromptFiles 是 agentType -> system prompt 文件路径(次优先级)。
+	PromptFiles map[string]string `koanf:"prompt_files"`
+	// Prometheus 配置 Agent 如何经 K8s API Server 代理访问集群内 Prometheus。
+	Prometheus AgentPrometheusConfig `koanf:"prometheus"`
+}
+
+// AgentPrometheusConfig 定位集群内 Prometheus 服务(经 API Server 代理访问)。
+type AgentPrometheusConfig struct {
+	Namespace    string        `koanf:"namespace"`
+	Service      string        `koanf:"service"`
+	Port         string        `koanf:"port"`
+	Scheme       string        `koanf:"scheme"`
+	QueryTimeout time.Duration `koanf:"query_timeout"`
 }
 
 type AuthConfig struct {
@@ -180,6 +231,22 @@ func Default() Config {
 		AI: AIConfig{
 			Enabled:   false,
 			Providers: map[string]AIProviderConfig{},
+		},
+		Agent: AgentConfig{
+			MaxSteps:                 6,
+			MaxTokenBudget:           60000,
+			MaxToolErrorsPerStep:     3,
+			StepTimeout:              60 * time.Second,
+			ToolChoice:               "auto",
+			MaxConcurrentRunsPerUser: 3,
+			MaxConcurrentRuns:        50,
+			Prometheus: AgentPrometheusConfig{
+				Namespace:    "monitoring",
+				Service:      "prometheus-kube-prometheus-prometheus",
+				Port:         "9090",
+				Scheme:       "http",
+				QueryTimeout: 15 * time.Second,
+			},
 		},
 		Auth: AuthConfig{
 			TokenTTL:              24 * time.Hour,

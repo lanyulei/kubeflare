@@ -18,9 +18,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
+	"github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubeclient"
 )
 
 const (
@@ -29,12 +29,8 @@ const (
 	MAX_EVIDENCE_RAW_SIZE = 65536
 )
 
-type KubeconfigProvider interface {
-	KubeconfigForProxy(ctx context.Context, id string) (string, error)
-}
-
 type ToolExecutor struct {
-	kubeconfigProvider KubeconfigProvider
+	clientFactory *kubeclient.Factory
 }
 
 type evidenceSummary struct {
@@ -48,16 +44,21 @@ type evidenceSummary struct {
 	Extra      map[string]any `json:"extra,omitempty"`
 }
 
-func NewToolExecutor(kubeconfigProvider KubeconfigProvider) *ToolExecutor {
-	return &ToolExecutor{kubeconfigProvider: kubeconfigProvider}
+func NewToolExecutor(clientFactory *kubeclient.Factory) *ToolExecutor {
+	return &ToolExecutor{clientFactory: clientFactory}
+}
+
+// Source 标识该执行器归属的工具数据源。
+func (e *ToolExecutor) Source() string {
+	return domain.TOOL_SOURCE_CLUSTER
 }
 
 func (e *ToolExecutor) Execute(ctx context.Context, req domain.ToolCallRequest) (domain.ToolCallResult, error) {
-	if e == nil || e.kubeconfigProvider == nil {
+	if e == nil || e.clientFactory == nil {
 		return domain.ToolCallResult{}, errors.New("kubernetes tool executor is unavailable")
 	}
 
-	clientset, err := e.clientset(ctx, req.ClusterID)
+	clientset, err := e.clientFactory.Clientset(ctx, req.ClusterID)
 	if err != nil {
 		return domain.ToolCallResult{}, err
 	}
@@ -82,32 +83,6 @@ func (e *ToolExecutor) Execute(ctx context.Context, req domain.ToolCallRequest) 
 	default:
 		return domain.ToolCallResult{}, fmt.Errorf("unsupported tool %s", req.ToolID)
 	}
-}
-
-func (e *ToolExecutor) clientset(ctx context.Context, clusterID string) (*kubernetes.Clientset, error) {
-	clusterID = strings.TrimSpace(clusterID)
-	if clusterID == "" {
-		return nil, errors.New("cluster id is required")
-	}
-
-	kubeconfig, err := e.kubeconfigProvider.KubeconfigForProxy(ctx, clusterID)
-	if err != nil {
-		return nil, err
-	}
-	kubeconfig = strings.TrimSpace(kubeconfig)
-	if kubeconfig == "" {
-		return nil, errors.New("cluster yaml is empty")
-	}
-
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
-	if err != nil {
-		return nil, errors.New("invalid cluster yaml")
-	}
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, errors.New("failed to create kubernetes client")
-	}
-	return clientset, nil
 }
 
 func (e *ToolExecutor) listEvents(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -146,7 +121,13 @@ func (e *ToolExecutor) listEvents(ctx context.Context, clientset *kubernetes.Cli
 	if len(items) > 0 {
 		summary = fmt.Sprintf("读取到 %d 条事件，最新事件：%s %s。", len(items), items[0].Reason, items[0].Message)
 	}
-	return resultWithEvidence(summary, listEvidence("event", "events.k8s.io", "v1", "Event", scope.Namespace, "event-list", summary, items, false)), nil
+	observation := fmt.Sprintf("读取到 %d 条事件：", len(items))
+	if len(items) == 0 {
+		observation = "未读取到匹配的事件（可能资源正常或范围过滤过严）。"
+	} else {
+		observation = observationFromItems(observation, items, DEFAULT_LIST_LIMIT)
+	}
+	return resultWithObservation(summary, observation, listEvidence("event", "events.k8s.io", "v1", "Event", scope.Namespace, "event-list", summary, items, false)), nil
 }
 
 func (e *ToolExecutor) listPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -179,7 +160,24 @@ func (e *ToolExecutor) listPods(ctx context.Context, clientset *kubernetes.Clien
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 Pod，其中 %d 个可能异常。", len(items), unhealthy)
-	return resultWithEvidence(summary, listEvidence("pod", "", "v1", "Pod", scope.Namespace, "pod-list", summary, items, false)), nil
+	observation := buildPodObservation(items, unhealthy)
+	return resultWithObservation(summary, observation, listEvidence("pod", "", "v1", "Pod", scope.Namespace, "pod-list", summary, items, false)), nil
+}
+
+// buildPodObservation 构造 Pod 列表的结构化观察:优先且完整列出异常 Pod 的
+// 名称/状态/重启次数,使模型能精确下钻 get_pod / tail_log,而非只知道“有N个异常”。
+func buildPodObservation(items []evidenceSummary, unhealthy int) string {
+	unhealthyItems := make([]evidenceSummary, 0, unhealthy)
+	for _, item := range items {
+		if item.Status != "Running" && item.Status != "Succeeded" {
+			unhealthyItems = append(unhealthyItems, item)
+		}
+	}
+	if len(unhealthyItems) == 0 {
+		return fmt.Sprintf("读取到 %d 个 Pod，全部处于 Running/Succeeded，未见异常。", len(items))
+	}
+	header := fmt.Sprintf("读取到 %d 个 Pod，其中 %d 个异常，异常明细：", len(items), len(unhealthyItems))
+	return observationFromItems(header, unhealthyItems, DEFAULT_LIST_LIMIT)
 }
 
 func (e *ToolExecutor) getPod(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -195,7 +193,34 @@ func (e *ToolExecutor) getPod(ctx context.Context, clientset *kubernetes.Clients
 
 	status := podStatus(*pod)
 	summary := fmt.Sprintf("Pod %s/%s 当前状态为 %s，重启次数 %d。", pod.Namespace, pod.Name, status, podRestartCount(*pod))
-	return resultWithEvidence(summary, objectEvidence("pod", "", "v1", "Pod", pod.Namespace, pod.Name, pod.ResourceVersion, summary, pod, false)), nil
+	observation := buildPodDetailObservation(*pod, status, summary)
+	return resultWithObservation(summary, observation, objectEvidence("pod", "", "v1", "Pod", pod.Namespace, pod.Name, pod.ResourceVersion, summary, pod, false)), nil
+}
+
+// buildPodDetailObservation 汇总单个 Pod 的关键诊断信息:阶段、各容器状态/重启/
+// 等待或终止原因、未就绪原因等,使模型无需读完整 spec 即可定位故障。
+func buildPodDetailObservation(pod corev1.Pod, status string, summary string) string {
+	var builder strings.Builder
+	builder.WriteString(summary)
+	builder.WriteString(fmt.Sprintf("\nPhase=%s, Node=%s", pod.Status.Phase, strings.TrimSpace(pod.Spec.NodeName)))
+	for _, cs := range pod.Status.ContainerStatuses {
+		builder.WriteString(fmt.Sprintf("\n- 容器 %s: ready=%t restart=%d", cs.Name, cs.Ready, cs.RestartCount))
+		switch {
+		case cs.State.Waiting != nil:
+			builder.WriteString(fmt.Sprintf(" waiting=%s %s", cs.State.Waiting.Reason, truncateText(cs.State.Waiting.Message, 160)))
+		case cs.State.Terminated != nil:
+			builder.WriteString(fmt.Sprintf(" terminated=%s exit=%d %s", cs.State.Terminated.Reason, cs.State.Terminated.ExitCode, truncateText(cs.State.Terminated.Message, 160)))
+		}
+		if cs.LastTerminationState.Terminated != nil {
+			builder.WriteString(fmt.Sprintf(" lastExit=%d(%s)", cs.LastTerminationState.Terminated.ExitCode, cs.LastTerminationState.Terminated.Reason))
+		}
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Status != corev1.ConditionTrue && strings.TrimSpace(condition.Reason) != "" {
+			builder.WriteString(fmt.Sprintf("\n- 条件 %s=%s reason=%s %s", condition.Type, condition.Status, condition.Reason, truncateText(condition.Message, 160)))
+		}
+	}
+	return builder.String()
 }
 
 func (e *ToolExecutor) tailPodLog(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -241,7 +266,15 @@ func (e *ToolExecutor) tailPodLog(ctx context.Context, clientset *kubernetes.Cli
 		"line_count": lineCount,
 		"tail":       tail,
 	}
-	return resultWithEvidence(summary, listEvidence("log", "", "v1", "PodLog", namespace, name, summary, payload, true)), nil
+	// 关键修复:把日志正文(截断)回喂给模型,否则“tail 日志做诊断”无法落地——
+	// 之前只回喂“读了 N 行”而模型看不到任何内容。
+	observation := fmt.Sprintf("Pod %s/%s 容器 %s 最近 %d 行日志：", namespace, name, container, lineCount)
+	if strings.TrimSpace(tail) == "" {
+		observation += "（无日志输出）"
+	} else {
+		observation += "\n" + truncateText(tail, 1800)
+	}
+	return resultWithObservation(summary, observation, listEvidence("log", "", "v1", "PodLog", namespace, name, summary, payload, true)), nil
 }
 
 func (e *ToolExecutor) listNodes(ctx context.Context, clientset *kubernetes.Clientset) (domain.ToolCallResult, error) {
@@ -270,7 +303,8 @@ func (e *ToolExecutor) listNodes(ctx context.Context, clientset *kubernetes.Clie
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 Node，其中 %d 个不是 Ready。", len(items), notReady)
-	return resultWithEvidence(summary, listEvidence("node", "", "v1", "Node", "", "node-list", summary, items, false)), nil
+	observation := observationFromItems(fmt.Sprintf("读取到 %d 个 Node（%d 个非 Ready），明细：", len(items), notReady), items, DEFAULT_LIST_LIMIT)
+	return resultWithObservation(summary, observation, listEvidence("node", "", "v1", "Node", "", "node-list", summary, items, false)), nil
 }
 
 func (e *ToolExecutor) getNode(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -286,7 +320,29 @@ func (e *ToolExecutor) getNode(ctx context.Context, clientset *kubernetes.Client
 
 	status := nodeReadyStatus(*node)
 	summary := fmt.Sprintf("Node %s 当前状态为 %s。%s", node.Name, status, nodeNodeSummary(*node))
-	return resultWithEvidence(summary, objectEvidence("node", "", "v1", "Node", "", node.Name, node.ResourceVersion, summary, node, false)), nil
+	observation := buildNodeObservation(*node, status)
+	return resultWithObservation(summary, observation, objectEvidence("node", "", "v1", "Node", "", node.Name, node.ResourceVersion, summary, node, false)), nil
+}
+
+// buildNodeObservation 汇总 Node 的关键状态:各 condition、可分配资源、污点,
+// 便于模型判断调度/资源类问题。
+func buildNodeObservation(node corev1.Node, status string) string {
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("Node %s 状态 %s，kubelet=%s", node.Name, status, node.Status.NodeInfo.KubeletVersion))
+	for _, condition := range node.Status.Conditions {
+		// 非 Ready 条件或处于 True 的异常条件(MemoryPressure 等)都值得模型关注。
+		if condition.Type == corev1.NodeReady || condition.Status == corev1.ConditionTrue {
+			builder.WriteString(fmt.Sprintf("\n- %s=%s reason=%s %s", condition.Type, condition.Status, condition.Reason, truncateText(condition.Message, 120)))
+		}
+	}
+	if len(node.Spec.Taints) > 0 {
+		taints := make([]string, 0, len(node.Spec.Taints))
+		for _, taint := range node.Spec.Taints {
+			taints = append(taints, fmt.Sprintf("%s=%s:%s", taint.Key, taint.Value, taint.Effect))
+		}
+		builder.WriteString("\n- 污点: " + strings.Join(taints, ", "))
+	}
+	return builder.String()
 }
 
 func (e *ToolExecutor) getWorkload(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -353,7 +409,8 @@ func (e *ToolExecutor) listWorkloads(ctx context.Context, clientset *kubernetes.
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个工作负载。", len(items))
-	return resultWithEvidence(summary, listEvidence("workload", "apps", "v1", "Workload", scope.Namespace, "workload-list", summary, items, false)), nil
+	observation := observationFromItems(fmt.Sprintf("读取到 %d 个工作负载，明细：", len(items)), items, DEFAULT_LIST_LIMIT)
+	return resultWithObservation(summary, observation, listEvidence("workload", "apps", "v1", "Workload", scope.Namespace, "workload-list", summary, items, false)), nil
 }
 
 func (e *ToolExecutor) listWorkloadPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -391,7 +448,8 @@ func (e *ToolExecutor) listWorkloadPods(ctx context.Context, clientset *kubernet
 	}
 
 	summary := fmt.Sprintf("读取到工作负载关联 Pod %d 个，其中 %d 个可能异常。", len(items), unhealthy)
-	return resultWithEvidence(summary, listEvidence("pod", "", "v1", "Pod", namespace, "workload-pod-list", summary, items, false)), nil
+	observation := buildPodObservation(items, unhealthy)
+	return resultWithObservation(summary, observation, listEvidence("pod", "", "v1", "Pod", namespace, "workload-pod-list", summary, items, false)), nil
 }
 
 func (e *ToolExecutor) workloadSelector(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (labels.Selector, string, error) {
@@ -448,6 +506,67 @@ func resultWithEvidence(summary string, evidence domain.Evidence) domain.ToolCal
 		Summary:  summary,
 		Evidence: []domain.Evidence{evidence},
 	}
+}
+
+// resultWithObservation 在 resultWithEvidence 基础上附加面向 LLM 的结构化观察
+// 文本(关键明细),供 loop 的 observe 阶段回喂给模型用于精确下钻。
+func resultWithObservation(summary string, observation string, evidence domain.Evidence) domain.ToolCallResult {
+	return domain.ToolCallResult{
+		Summary:     summary,
+		Observation: strings.TrimSpace(observation),
+		Evidence:    []domain.Evidence{evidence},
+	}
+}
+
+// observationFromItems 把资源摘要列表渲染成逐行的结构化观察文本(供模型阅读),
+// 最多渲染 limit 行,超出部分提示省略。
+func observationFromItems(header string, items []evidenceSummary, limit int) string {
+	var builder strings.Builder
+	builder.WriteString(header)
+	if limit <= 0 || limit > len(items) {
+		limit = len(items)
+	}
+	for index := 0; index < limit; index++ {
+		builder.WriteString("\n- ")
+		builder.WriteString(formatEvidenceLine(items[index]))
+	}
+	if len(items) > limit {
+		builder.WriteString(fmt.Sprintf("\n…(共 %d 条,已省略其余 %d 条)", len(items), len(items)-limit))
+	}
+	return builder.String()
+}
+
+// formatEvidenceLine 把单条资源摘要渲染成一行紧凑明细(含名称/状态/关键 extra)。
+func formatEvidenceLine(item evidenceSummary) string {
+	var builder strings.Builder
+	if item.Namespace != "" {
+		builder.WriteString(item.Namespace + "/")
+	}
+	builder.WriteString(item.Name)
+	if item.Status != "" {
+		builder.WriteString(" [" + item.Status + "]")
+	}
+	if item.Reason != "" {
+		builder.WriteString(" reason=" + item.Reason)
+	}
+	for _, key := range []string{"restart_count", "ready_containers", "total_containers", "node_name"} {
+		if value, ok := item.Extra[key]; ok {
+			builder.WriteString(fmt.Sprintf(" %s=%v", key, value))
+		}
+	}
+	if item.Message != "" {
+		builder.WriteString(" " + truncateText(item.Message, 160))
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func truncateText(text string, max int) string {
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max]) + "…"
 }
 
 func objectEvidence(sourceKind string, apiGroup string, apiVersion string, resourceKind string, namespace string, name string, resourceVersion string, summary string, object runtime.Object, redacted bool) domain.Evidence {

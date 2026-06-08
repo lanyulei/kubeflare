@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +18,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	agentapplication "github.com/lanyulei/kubeflare/internal/module/agent/application"
+	agentkubeclient "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubeclient"
 	agentkubernetes "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubernetes"
 	agentpostgres "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/postgres"
+	agentprometheus "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/prometheus"
 	agenthttp "github.com/lanyulei/kubeflare/internal/module/agent/interface/http"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	aillm "github.com/lanyulei/kubeflare/internal/module/ai/infrastructure/llm"
@@ -130,15 +134,47 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			return nil, err
 		}
 	}
-	aiGenerator, err := newAIGenerator(cfg.AI)
+	aiGenerator, err := newAIGenerator(cfg.AI, encryptor)
 	if err != nil {
 		return nil, err
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
-	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator)
-	agentToolExecutor := agentkubernetes.NewToolExecutor(clusterService)
-	agentService := agentapplication.NewService(agentRepo, validator, agentToolExecutor, aiGenerator)
+	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), logger)
+	agentClientFactory := agentkubeclient.NewFactory(clusterService, 0)
+	agentKubernetesExecutor := agentkubernetes.NewToolExecutor(agentClientFactory)
+	agentPrometheusExecutor := agentprometheus.NewToolExecutor(agentClientFactory, agentprometheus.Config{
+		Namespace:    cfg.Agent.Prometheus.Namespace,
+		Service:      cfg.Agent.Prometheus.Service,
+		Port:         cfg.Agent.Prometheus.Port,
+		Scheme:       cfg.Agent.Prometheus.Scheme,
+		QueryTimeout: cfg.Agent.Prometheus.QueryTimeout,
+	})
+	agentGenerator := aiGenerator
+	if agentGenerator == nil {
+		agentGenerator = aiapplication.NewUnavailableAssistantGenerator()
+	}
+	agentService := agentapplication.NewService(agentapplication.Options{
+		Repo:      agentRepo,
+		Validator: validator,
+		ToolExecutors: []agentapplication.SourceToolExecutor{
+			agentKubernetesExecutor,
+			agentPrometheusExecutor,
+		},
+		Generator: agentGenerator,
+		Loop: agentapplication.LoopConfig{
+			MaxSteps:                 cfg.Agent.MaxSteps,
+			MaxTokenBudget:           cfg.Agent.MaxTokenBudget,
+			MaxToolErrorsPerStep:     cfg.Agent.MaxToolErrorsPerStep,
+			StepTimeout:              cfg.Agent.StepTimeout,
+			ToolChoice:               cfg.Agent.ToolChoice,
+			LLMRouting:               cfg.Agent.LLMRouting,
+			StreamThink:              cfg.Agent.StreamThink,
+			MaxConcurrentRunsPerUser: cfg.Agent.MaxConcurrentRunsPerUser,
+			MaxConcurrentRuns:        cfg.Agent.MaxConcurrentRuns,
+		},
+		SystemPrompts: resolveAgentPrompts(cfg.Agent, logger),
+	})
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
@@ -151,6 +187,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	authCleanupCtx, stopAuthCleanup := context.WithCancel(context.Background())
 	go runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore)
+	go runAIStateRecovery(authCleanupCtx, logger, aiService, agentService)
 
 	healthManager := health.NewManager(
 		cfg.HTTP.ReadinessTimeout,
@@ -224,23 +261,33 @@ func newKAPIHandler(clusterService *clusterapplication.Service, authenticator mi
 	return handler
 }
 
-func newAIGenerator(cfg config.AIConfig) (aiapplication.AssistantGenerator, error) {
+func newAIGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (aiapplication.AssistantGenerator, error) {
 	if !cfg.Enabled {
 		return nil, nil
 	}
 
 	providers := make(map[string]platformllm.ProviderConfig, len(cfg.Providers))
 	for providerName, providerConfig := range cfg.Providers {
+		// api_key 支持密文(enc:v1: 前缀,与集群 kubeconfig 同一套 AES-GCM
+		// 加密体系)或明文;Decrypt 对无前缀的明文原样透传,完全向后兼容。
+		apiKey, err := encryptor.Decrypt(strings.TrimSpace(providerConfig.APIKey))
+		if err != nil {
+			return nil, fmt.Errorf("decrypt api_key for ai provider %q: %w", providerName, err)
+		}
 		providers[providerName] = platformllm.ProviderConfig{
-			Type:        providerConfig.Type,
-			BaseURL:     providerConfig.BaseURL,
-			ChatPath:    providerConfig.ChatPath,
-			APIKey:      providerConfig.APIKey,
-			Model:       providerConfig.Model,
-			Timeout:     providerConfig.Timeout,
-			Stream:      providerConfig.Stream,
-			Temperature: providerConfig.Temperature,
-			MaxTokens:   providerConfig.MaxTokens,
+			Type:               providerConfig.Type,
+			BaseURL:            providerConfig.BaseURL,
+			ChatPath:           providerConfig.ChatPath,
+			APIKey:             apiKey,
+			Model:              providerConfig.Model,
+			Timeout:            providerConfig.Timeout,
+			StreamTimeout:      providerConfig.StreamTimeout,
+			Stream:             providerConfig.Stream,
+			Temperature:        providerConfig.Temperature,
+			MaxTokens:          providerConfig.MaxTokens,
+			MaxRetries:         providerConfig.MaxRetries,
+			RetryBackoff:       providerConfig.RetryBackoff,
+			IncludeStreamUsage: providerConfig.IncludeStreamUsage,
 		}
 	}
 
@@ -249,6 +296,33 @@ func newAIGenerator(cfg config.AIConfig) (aiapplication.AssistantGenerator, erro
 		return nil, err
 	}
 	return aillm.NewAssistantGenerator(registry), nil
+}
+
+// resolveAgentPrompts 解析各 Agent 的 system prompt 覆盖来源:内联 Prompts
+// 优先,其次读取 PromptFiles 指定的文件。读文件失败仅告警并跳过(回退到代码
+// 内置默认),不阻断启动。
+func resolveAgentPrompts(cfg config.AgentConfig, logger *slog.Logger) map[string]string {
+	prompts := make(map[string]string)
+	for agentType, path := range cfg.PromptFiles {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			logger.Warn("read agent prompt file failed", "agent", agentType, "path", path, "error", err)
+			continue
+		}
+		if content := strings.TrimSpace(string(data)); content != "" {
+			prompts[agentType] = content
+		}
+	}
+	for agentType, prompt := range cfg.Prompts {
+		if content := strings.TrimSpace(prompt); content != "" {
+			prompts[agentType] = content
+		}
+	}
+	return prompts
 }
 
 func newAPIHandler(
@@ -353,6 +427,42 @@ func runAuthStateCleanup(ctx context.Context, logger *slog.Logger, authStateRepo
 			return
 		case <-ticker.C:
 			cleanup()
+		}
+	}
+}
+
+// runAIStateRecovery 周期性回收 AI 对话与 Agent 运行中残留的"僵尸"状态
+// (进程在生成过程中重启/崩溃后留下的 pending/streaming 消息与 running 运行),
+// 将其标记为 failed,避免前端看到永远"生成中"的记录。启动时立即执行一次。
+func runAIStateRecovery(ctx context.Context, logger *slog.Logger, aiService *aiapplication.Service, agentService *agentapplication.Service) {
+	recover := func() {
+		recoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if aiService != nil {
+			if affected, err := aiService.RecoverStaleMessages(recoverCtx, aiapplication.DEFAULT_STALE_AFTER); err != nil {
+				logger.Warn("ai stale message recovery failed", "error", err)
+			} else if affected > 0 {
+				logger.Info("ai stale messages recovered", "count", affected)
+			}
+		}
+		if agentService != nil {
+			if affected, err := agentService.RecoverStaleRuns(recoverCtx, agentapplication.DEFAULT_STALE_AFTER); err != nil {
+				logger.Warn("agent stale run recovery failed", "error", err)
+			} else if affected > 0 {
+				logger.Info("agent stale runs recovered", "count", affected)
+			}
+		}
+	}
+
+	recover()
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			recover()
 		}
 	}
 }

@@ -248,6 +248,30 @@ func (r *AgentRepository) ListEvidence(ctx context.Context, runID string) ([]dom
 	return items, nil
 }
 
+func (r *AgentRepository) FailStaleRuns(ctx context.Context, before time.Time, errorMessage string) (int64, error) {
+	if r.db == nil {
+		return 0, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	now := time.Now().UTC()
+	result := r.db.WithContext(queryCtx).
+		Model(&agentRunRecord{}).
+		Where("status IN ?", []string{domain.RUN_STATUS_PENDING, domain.RUN_STATUS_RUNNING}).
+		Where("created_at < ?", before).
+		Updates(map[string]any{
+			"status":        domain.RUN_STATUS_FAILED,
+			"error_message": errorMessage,
+			"completed_at":  now,
+		})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 func toDomainRun(record agentRunRecord) domain.AgentRun {
 	run := domain.AgentRun{
 		ID:           record.ID,

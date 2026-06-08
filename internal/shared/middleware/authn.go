@@ -388,6 +388,21 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 	return principal, ok
 }
 
+// RequireSubject 从 gin 请求上下文中取出已认证主体的 subject。
+// 当上下文中没有有效主体时,返回标准的未授权 AppError,供各 handler 复用。
+func RequireSubject(c *gin.Context) (string, error) {
+	principal, ok := PrincipalFromContext(c.Request.Context())
+	if ok && principal.Subject != "" {
+		return principal.Subject, nil
+	}
+	return "", &sharedErrors.AppError{
+		Code:    sharedErrors.CodeUnauthorized,
+		Message: ErrUnauthorized.Error(),
+		Status:  http.StatusUnauthorized,
+		Err:     ErrUnauthorized,
+	}
+}
+
 func HasRole(principal Principal, role string) bool {
 	for _, existingRole := range principal.Roles {
 		if existingRole == role {

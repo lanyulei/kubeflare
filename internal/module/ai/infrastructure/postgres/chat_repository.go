@@ -285,6 +285,31 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 	return toDomainMessage(record), nil
 }
 
+func (r *ChatRepository) FailStaleMessages(ctx context.Context, before time.Time, errorMessage string) (int64, error) {
+	if r.db == nil {
+		return 0, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	now := time.Now().UTC()
+	result := r.db.WithContext(queryCtx).
+		Model(&chatMessageRecord{}).
+		Where("role = ?", domain.MESSAGE_ROLE_ASSISTANT).
+		Where("status IN ?", []string{domain.MESSAGE_STATUS_PENDING, domain.MESSAGE_STATUS_STREAMING}).
+		Where("created_at < ?", before).
+		Updates(map[string]any{
+			"status":        domain.MESSAGE_STATUS_FAILED,
+			"error_message": errorMessage,
+			"completed_at":  now,
+		})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 func (r *ChatRepository) ensureSession(ctx context.Context, userID string, sessionID string) error {
 	var record chatSessionRecord
 	return r.db.WithContext(ctx).
