@@ -1,0 +1,2 @@
+ALTER TABLE ai_chat_message
+  ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';

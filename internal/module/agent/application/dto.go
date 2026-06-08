@@ -12,6 +12,7 @@ type RouteAgentRequest struct {
 type RunAgentRequest struct {
 	Message       string            `json:"message" validate:"required,min=1,max=20000"`
 	SelectedAgent string            `json:"selected_agent" validate:"omitempty,max=64"`
+	SessionID     string            `json:"session_id" validate:"omitempty,max=64"`
 	ClusterID     string            `json:"cluster_id" validate:"omitempty,max=64"`
 	Scope         domain.AgentScope `json:"scope"`
 }

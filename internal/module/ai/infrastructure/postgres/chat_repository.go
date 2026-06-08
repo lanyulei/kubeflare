@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -17,6 +20,8 @@ type ChatRepository struct {
 	timeout time.Duration
 }
 
+type jsonbValue []byte
+
 type chatSessionRecord struct {
 	ID        string         `gorm:"primaryKey;size:48"`
 	UserID    string         `gorm:"size:128;not null;index"`
@@ -29,20 +34,21 @@ type chatSessionRecord struct {
 }
 
 type chatMessageRecord struct {
-	ID               string    `gorm:"primaryKey;size:56"`
-	SessionID        string    `gorm:"size:48;not null;index"`
-	Role             string    `gorm:"size:32;not null"`
-	Content          string    `gorm:"type:text;not null"`
-	ContentType      string    `gorm:"size:32;not null;default:'markdown'"`
-	Status           string    `gorm:"size:32;not null;default:'completed'"`
-	Sequence         int       `gorm:"not null"`
-	Provider         string    `gorm:"size:64;not null;default:''"`
-	Model            string    `gorm:"size:128;not null;default:''"`
-	PromptTokens     int       `gorm:"not null;default:0"`
-	CompletionTokens int       `gorm:"not null;default:0"`
-	TotalTokens      int       `gorm:"not null;default:0"`
-	ErrorMessage     string    `gorm:"type:text;not null;default:''"`
-	CreatedAt        time.Time `gorm:"not null"`
+	ID               string     `gorm:"primaryKey;size:56"`
+	SessionID        string     `gorm:"size:48;not null;index"`
+	Role             string     `gorm:"size:32;not null"`
+	Content          string     `gorm:"type:text;not null"`
+	ContentType      string     `gorm:"size:32;not null;default:'markdown'"`
+	Status           string     `gorm:"size:32;not null;default:'completed'"`
+	Sequence         int        `gorm:"not null"`
+	Provider         string     `gorm:"size:64;not null;default:''"`
+	Model            string     `gorm:"size:128;not null;default:''"`
+	Metadata         jsonbValue `gorm:"type:jsonb;not null;default:'{}'"`
+	PromptTokens     int        `gorm:"not null;default:0"`
+	CompletionTokens int        `gorm:"not null;default:0"`
+	TotalTokens      int        `gorm:"not null;default:0"`
+	ErrorMessage     string     `gorm:"type:text;not null;default:''"`
+	CreatedAt        time.Time  `gorm:"not null"`
 	CompletedAt      *time.Time
 	DeletedAt        gorm.DeletedAt `gorm:"index"`
 }
@@ -57,6 +63,30 @@ func (chatMessageRecord) TableName() string {
 
 func NewChatRepository(db *gorm.DB, timeout time.Duration) *ChatRepository {
 	return &ChatRepository{db: db, timeout: timeout}
+}
+
+func (v jsonbValue) Value() (driver.Value, error) {
+	if len(v) == 0 {
+		return "{}", nil
+	}
+	if !json.Valid(v) {
+		return nil, fmt.Errorf("invalid jsonb value")
+	}
+	return string(v), nil
+}
+
+func (v *jsonbValue) Scan(value any) error {
+	switch data := value.(type) {
+	case nil:
+		*v = jsonbValue("{}")
+	case []byte:
+		*v = append((*v)[:0], data...)
+	case string:
+		*v = append((*v)[:0], data...)
+	default:
+		return fmt.Errorf("unsupported jsonb scan value %T", value)
+	}
+	return nil
 }
 
 func (r *ChatRepository) ListSessions(ctx context.Context, userID string) ([]domain.ChatSession, error) {
@@ -274,6 +304,7 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 	record.Content = message.Content
 	record.Provider = message.Provider
 	record.Model = message.Model
+	record.Metadata = newJSONBValue(message.Metadata)
 	record.PromptTokens = message.PromptTokens
 	record.CompletionTokens = message.CompletionTokens
 	record.TotalTokens = message.TotalTokens
@@ -364,6 +395,9 @@ func toDomainMessage(record chatMessageRecord) domain.ChatMessage {
 		CreatedAt:        record.CreatedAt,
 		CompletedAt:      record.CompletedAt,
 	}
+	if !isEmptyJSONObject(record.Metadata) {
+		message.Metadata = json.RawMessage(record.Metadata)
+	}
 	if record.DeletedAt.Valid {
 		deletedAt := record.DeletedAt.Time
 		message.DeletedAt = &deletedAt
@@ -382,6 +416,7 @@ func fromDomainMessage(message domain.ChatMessage) chatMessageRecord {
 		Sequence:         message.Sequence,
 		Provider:         message.Provider,
 		Model:            message.Model,
+		Metadata:         newJSONBValue(message.Metadata),
 		PromptTokens:     message.PromptTokens,
 		CompletionTokens: message.CompletionTokens,
 		TotalTokens:      message.TotalTokens,
@@ -389,6 +424,24 @@ func fromDomainMessage(message domain.ChatMessage) chatMessageRecord {
 		CreatedAt:        message.CreatedAt,
 		CompletedAt:      message.CompletedAt,
 	}
+}
+
+func newJSONBValue(data []byte) jsonbValue {
+	if len(data) == 0 || !json.Valid(data) {
+		return jsonbValue("{}")
+	}
+	return append(jsonbValue(nil), data...)
+}
+
+func isEmptyJSONObject(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return true
+	}
+	return len(value) == 0
 }
 
 func deleteResultError(err error, rowsAffected int64) error {

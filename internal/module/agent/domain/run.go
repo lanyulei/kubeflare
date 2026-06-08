@@ -3,6 +3,8 @@ package domain
 import (
 	"encoding/json"
 	"time"
+
+	aidomain "github.com/lanyulei/kubeflare/internal/module/ai/domain"
 )
 
 const (
@@ -68,11 +70,16 @@ type Evidence struct {
 }
 
 type AgentRunEvent struct {
-	Event        string            `json:"-"`
-	Run          *AgentRun         `json:"run,omitempty"`
-	Route        *AgentRouteResult `json:"route,omitempty"`
-	ToolCall     *AgentToolCall    `json:"tool_call,omitempty"`
-	Evidence     *Evidence         `json:"evidence,omitempty"`
-	Delta        string            `json:"delta,omitempty"`
-	ErrorMessage string            `json:"error_message,omitempty"`
+	Event            string                `json:"-"`
+	Run              *AgentRun             `json:"run,omitempty"`
+	Route            *AgentRouteResult     `json:"route,omitempty"`
+	ToolCall         *AgentToolCall        `json:"tool_call,omitempty"`
+	Evidence         *Evidence             `json:"evidence,omitempty"`
+	Delta            string                `json:"delta,omitempty"`
+	ErrorMessage     string                `json:"error_message,omitempty"`
+	Session          *aidomain.ChatSession `json:"session,omitempty"`
+	UserMessage      *aidomain.ChatMessage `json:"user_message,omitempty"`
+	AssistantMessage *aidomain.ChatMessage `json:"assistant_message,omitempty"`
+	Message          *aidomain.ChatMessage `json:"message,omitempty"`
+	MessageID        string                `json:"message_id,omitempty"`
 }

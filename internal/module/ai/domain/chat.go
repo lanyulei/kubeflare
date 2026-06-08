@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	SESSION_STATUS_ACTIVE = "active"
@@ -29,22 +32,23 @@ type ChatSession struct {
 }
 
 type ChatMessage struct {
-	ID               string     `json:"id"`
-	SessionID        string     `json:"session_id"`
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	ContentType      string     `json:"content_type"`
-	Status           string     `json:"status"`
-	Sequence         int        `json:"sequence"`
-	Provider         string     `json:"provider,omitempty"`
-	Model            string     `json:"model,omitempty"`
-	PromptTokens     int        `json:"prompt_tokens,omitempty"`
-	CompletionTokens int        `json:"completion_tokens,omitempty"`
-	TotalTokens      int        `json:"total_tokens,omitempty"`
-	ErrorMessage     string     `json:"error_message,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	CompletedAt      *time.Time `json:"completed_at,omitempty"`
-	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+	ID               string          `json:"id"`
+	SessionID        string          `json:"session_id"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	ContentType      string          `json:"content_type"`
+	Status           string          `json:"status"`
+	Sequence         int             `json:"sequence"`
+	Provider         string          `json:"provider,omitempty"`
+	Model            string          `json:"model,omitempty"`
+	Metadata         json.RawMessage `json:"metadata,omitempty"`
+	PromptTokens     int             `json:"prompt_tokens,omitempty"`
+	CompletionTokens int             `json:"completion_tokens,omitempty"`
+	TotalTokens      int             `json:"total_tokens,omitempty"`
+	ErrorMessage     string          `json:"error_message,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
+	DeletedAt        *time.Time      `json:"deleted_at,omitempty"`
 }
 
 type ChatSessionDetail struct {

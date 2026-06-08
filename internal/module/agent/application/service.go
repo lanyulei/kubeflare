@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	aidomain "github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
@@ -46,6 +48,33 @@ const (
 
 type ToolExecutor interface {
 	Execute(ctx context.Context, req domain.ToolCallRequest) (domain.ToolCallResult, error)
+}
+
+type chatMessageStore interface {
+	GetSession(ctx context.Context, userID string, sessionID string) (aidomain.ChatSession, error)
+	AppendMessages(ctx context.Context, userID string, sessionID string, messages []aidomain.ChatMessage, session aidomain.ChatSession) (aidomain.ChatSession, []aidomain.ChatMessage, error)
+	UpdateSession(ctx context.Context, session aidomain.ChatSession) (aidomain.ChatSession, error)
+	UpdateMessage(ctx context.Context, userID string, message aidomain.ChatMessage) (aidomain.ChatMessage, error)
+}
+
+type runChatContext struct {
+	enabled          bool
+	session          aidomain.ChatSession
+	userMessage      aidomain.ChatMessage
+	assistantMessage aidomain.ChatMessage
+}
+
+type chatMessageAgentMetadata struct {
+	AgentRun *chatMessageAgentRunSnapshot `json:"agent_run,omitempty"`
+}
+
+type chatMessageAgentRunSnapshot struct {
+	Run          *domain.AgentRun         `json:"run,omitempty"`
+	Route        *domain.AgentRouteResult `json:"route,omitempty"`
+	ToolCalls    []domain.AgentToolCall   `json:"tool_calls,omitempty"`
+	Evidences    []domain.Evidence        `json:"evidences,omitempty"`
+	Status       string                   `json:"status,omitempty"`
+	ErrorMessage string                   `json:"error_message,omitempty"`
 }
 
 // LoopConfig 是 Agent loop 的运行参数(provider 无关,避免 application 依赖
@@ -97,6 +126,8 @@ func (c LoopConfig) withDefaults() LoopConfig {
 type Options struct {
 	Repo      domain.Repository
 	Validator *validation.Validate
+	// ChatRepo 可选。传入后,Agent 从聊天窗口发起时会同步写入 ai_chat_message。
+	ChatRepo chatMessageStore
 	// ToolExecutor 是单一执行器(测试或单数据源场景);与 ToolExecutors
 	// 二选一,后者优先。
 	ToolExecutor ToolExecutor
@@ -112,6 +143,7 @@ type Options struct {
 
 type Service struct {
 	repo          domain.Repository
+	chatRepo      chatMessageStore
 	validator     *validation.Validate
 	agentRegistry *AgentRegistry
 	toolRegistry  *ToolRegistry
@@ -144,6 +176,7 @@ func NewService(options Options) *Service {
 
 	return &Service{
 		repo:          options.Repo,
+		chatRepo:      options.ChatRepo,
 		validator:     validator,
 		agentRegistry: agentRegistry,
 		toolRegistry:  toolRegistry,
@@ -179,6 +212,7 @@ func (s *Service) Route(ctx context.Context, userID string, req RouteAgentReques
 func (s *Service) StreamRun(ctx context.Context, userID string, agentType string, req RunAgentRequest) (<-chan domain.AgentRunEvent, error) {
 	req.Message = strings.TrimSpace(req.Message)
 	req.SelectedAgent = normalizeAgentType(req.SelectedAgent)
+	req.SessionID = strings.TrimSpace(req.SessionID)
 	req.ClusterID = strings.TrimSpace(req.ClusterID)
 	req.Scope = normalizeScope(req.Scope)
 	if err := s.validateRequest(req); err != nil {
@@ -237,6 +271,11 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 			Status:  http.StatusTooManyRequests,
 		}
 	}
+	chatContext, err := s.prepareRunChatContext(ctx, normalizedUserID, req, agent)
+	if err != nil {
+		release()
+		return nil, err
+	}
 
 	events := make(chan domain.AgentRunEvent, 16)
 	// 预先生成 runID 并登记可取消的 context,使 CancelRun 能在 run 落库前/中
@@ -248,7 +287,7 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 		defer release()
 		defer s.activeRuns.Delete(runID)
 		defer cancelRun()
-		s.run(runCtx, events, runID, normalizedUserID, agent, req, route)
+		s.run(runCtx, events, runID, normalizedUserID, agent, req, route, chatContext)
 	}()
 	return events, nil
 }
@@ -501,7 +540,7 @@ func (s *Service) rankCandidates(req RouteAgentRequest) []domain.AgentCandidate 
 	return candidates
 }
 
-func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, runID string, userID string, agent domain.AgentDefinition, req RunAgentRequest, route domain.AgentRouteResult) {
+func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, runID string, userID string, agent domain.AgentDefinition, req RunAgentRequest, route domain.AgentRouteResult, chatContext runChatContext) {
 	defer close(events)
 
 	// 持久化统一使用不受客户端断连影响的 context,确保 run / 工具调用 / 证据
@@ -540,9 +579,11 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 			run.ErrorMessage = "run interrupted"
 		}
 		_ = s.updateRun(persistCtx, run)
+		chatContext = s.finalizeRunChatContext(persistCtx, userID, chatContext, run.Summary, run)
 	}()
 
-	if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_RUN_CREATED, Run: &run}) {
+	chatContext = s.markRunChatContextStreaming(persistCtx, userID, chatContext)
+	if !sendRunEvent(ctx, events, s.withRunChatCreated(domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_RUN_CREATED, Run: &run}, chatContext)) {
 		return
 	}
 	// 保留 PLAN_CREATED 事件以兼容既有前端时序(LLM loop 下不再有预先规划,
@@ -574,13 +615,186 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 		run.Summary = answer
 	}
 	run = s.updateRun(persistCtx, run)
+	chatContext = s.finalizeRunChatContext(persistCtx, userID, chatContext, answer, run)
 	finalized = true
 
 	eventName := STREAM_EVENT_AGENT_RUN_COMPLETED
 	if run.Status == domain.RUN_STATUS_FAILED {
 		eventName = STREAM_EVENT_AGENT_RUN_FAILED
 	}
-	_ = sendRunEvent(ctx, events, domain.AgentRunEvent{Event: eventName, Run: &run, ErrorMessage: run.ErrorMessage})
+	_ = sendRunEvent(ctx, events, s.withRunChatMessage(domain.AgentRunEvent{Event: eventName, Run: &run, ErrorMessage: run.ErrorMessage}, chatContext))
+}
+
+func (s *Service) prepareRunChatContext(ctx context.Context, userID string, req RunAgentRequest, agent domain.AgentDefinition) (runChatContext, error) {
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		return runChatContext{}, nil
+	}
+	if s == nil || s.chatRepo == nil {
+		return runChatContext{}, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: "chat repository is unavailable",
+			Status:  http.StatusInternalServerError,
+		}
+	}
+
+	session, err := s.chatRepo.GetSession(ctx, userID, sessionID)
+	if err != nil {
+		return runChatContext{}, mapChatRepositoryError(err, "chat session not found")
+	}
+
+	now := time.Now().UTC()
+	userMessage := aidomain.ChatMessage{
+		ID:          newID("message-user"),
+		SessionID:   sessionID,
+		Role:        aidomain.MESSAGE_ROLE_USER,
+		Content:     req.Message,
+		ContentType: aidomain.MESSAGE_CONTENT_TYPE_MARKDOWN,
+		Status:      aidomain.MESSAGE_STATUS_COMPLETED,
+		Provider:    "agent",
+		Model:       agent.Type,
+		CreatedAt:   now,
+		CompletedAt: &now,
+	}
+	assistantMessage := aidomain.ChatMessage{
+		ID:          newID("message-assistant"),
+		SessionID:   sessionID,
+		Role:        aidomain.MESSAGE_ROLE_ASSISTANT,
+		ContentType: aidomain.MESSAGE_CONTENT_TYPE_MARKDOWN,
+		Status:      aidomain.MESSAGE_STATUS_PENDING,
+		Provider:    "agent",
+		Model:       agent.Type,
+		CreatedAt:   now,
+	}
+
+	session.Title = titleForAgentMessage(session.Title, req.Message)
+	session.UpdatedAt = now
+	updatedSession, messages, err := s.chatRepo.AppendMessages(ctx, userID, sessionID, []aidomain.ChatMessage{userMessage, assistantMessage}, session)
+	if err != nil {
+		return runChatContext{}, mapChatRepositoryError(err, "chat session not found")
+	}
+	if len(messages) >= 2 {
+		userMessage = messages[0]
+		assistantMessage = messages[1]
+	}
+
+	return runChatContext{
+		enabled:          true,
+		session:          updatedSession,
+		userMessage:      userMessage,
+		assistantMessage: assistantMessage,
+	}, nil
+}
+
+func (s *Service) markRunChatContextStreaming(ctx context.Context, userID string, chatContext runChatContext) runChatContext {
+	if !chatContext.enabled || s == nil || s.chatRepo == nil {
+		return chatContext
+	}
+	chatContext.assistantMessage.Status = aidomain.MESSAGE_STATUS_STREAMING
+	if updated, err := s.chatRepo.UpdateMessage(ctx, userID, chatContext.assistantMessage); err == nil {
+		chatContext.assistantMessage = updated
+	}
+	return chatContext
+}
+
+func (s *Service) finalizeRunChatContext(ctx context.Context, userID string, chatContext runChatContext, answer string, run domain.AgentRun) runChatContext {
+	if !chatContext.enabled || s == nil || s.chatRepo == nil {
+		return chatContext
+	}
+
+	completedAt := time.Now().UTC()
+	if run.CompletedAt != nil {
+		completedAt = *run.CompletedAt
+	}
+
+	chatContext.assistantMessage.Content = strings.TrimSpace(answer)
+	chatContext.assistantMessage.Provider = "agent"
+	chatContext.assistantMessage.Model = run.AgentType
+	chatContext.assistantMessage.Metadata = s.agentChatMessageMetadata(ctx, run)
+	chatContext.assistantMessage.CompletedAt = &completedAt
+	chatContext.assistantMessage.ErrorMessage = ""
+	if run.Status == domain.RUN_STATUS_COMPLETED {
+		chatContext.assistantMessage.Status = aidomain.MESSAGE_STATUS_COMPLETED
+	} else {
+		chatContext.assistantMessage.Status = aidomain.MESSAGE_STATUS_FAILED
+		chatContext.assistantMessage.ErrorMessage = firstNonEmpty(run.ErrorMessage, "agent run interrupted")
+	}
+	if updated, err := s.chatRepo.UpdateMessage(ctx, userID, chatContext.assistantMessage); err == nil {
+		chatContext.assistantMessage = updated
+	}
+
+	chatContext.session.Summary = summaryForAgentMessage(chatContext.assistantMessage)
+	chatContext.session.UpdatedAt = completedAt
+	if updatedSession, err := s.chatRepo.UpdateSession(ctx, chatContext.session); err == nil {
+		chatContext.session = updatedSession
+	}
+	return chatContext
+}
+
+func (s *Service) agentChatMessageMetadata(ctx context.Context, run domain.AgentRun) json.RawMessage {
+	snapshot := chatMessageAgentRunSnapshot{
+		Run: &run,
+		Route: &domain.AgentRouteResult{
+			AgentType:   run.AgentType,
+			Confidence:  run.Confidence,
+			Reason:      run.RouteReason,
+			NeedConfirm: false,
+		},
+		Status:       run.Status,
+		ErrorMessage: run.ErrorMessage,
+	}
+	if s != nil && s.repo != nil && strings.TrimSpace(run.ID) != "" {
+		if toolCalls, err := s.repo.ListToolCalls(ctx, run.ID); err == nil {
+			snapshot.ToolCalls = compactToolCalls(toolCalls)
+		}
+		if evidences, err := s.repo.ListEvidence(ctx, run.ID); err == nil {
+			snapshot.Evidences = compactEvidences(evidences)
+		}
+	}
+	metadata, err := json.Marshal(chatMessageAgentMetadata{AgentRun: &snapshot})
+	if err != nil {
+		return nil
+	}
+	return metadata
+}
+
+func compactToolCalls(toolCalls []domain.AgentToolCall) []domain.AgentToolCall {
+	items := make([]domain.AgentToolCall, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		toolCall.Input = nil
+		items = append(items, toolCall)
+	}
+	return items
+}
+
+func compactEvidences(evidences []domain.Evidence) []domain.Evidence {
+	items := make([]domain.Evidence, 0, len(evidences))
+	for _, evidence := range evidences {
+		evidence.RawJSON = nil
+		items = append(items, evidence)
+	}
+	return items
+}
+
+func (s *Service) withRunChatCreated(event domain.AgentRunEvent, chatContext runChatContext) domain.AgentRunEvent {
+	if !chatContext.enabled {
+		return event
+	}
+	event.Session = &chatContext.session
+	event.UserMessage = &chatContext.userMessage
+	event.AssistantMessage = &chatContext.assistantMessage
+	event.MessageID = chatContext.assistantMessage.ID
+	return event
+}
+
+func (s *Service) withRunChatMessage(event domain.AgentRunEvent, chatContext runChatContext) domain.AgentRunEvent {
+	if !chatContext.enabled {
+		return event
+	}
+	event.Session = &chatContext.session
+	event.Message = &chatContext.assistantMessage
+	event.MessageID = chatContext.assistantMessage.ID
+	return event
 }
 
 func (s *Service) executeTool(ctx context.Context, tool domain.ToolDefinition, req domain.ToolCallRequest) (domain.ToolCallResult, error) {
@@ -730,6 +944,50 @@ func containsAny(value string, keywords []string) bool {
 		}
 	}
 	return false
+}
+
+func titleForAgentMessage(title string, content string) string {
+	trimmedTitle := strings.TrimSpace(title)
+	if trimmedTitle != "" && trimmedTitle != aiapplication.DEFAULT_SESSION_TITLE {
+		return trimmedTitle
+	}
+
+	normalizedContent := strings.Join(strings.Fields(content), " ")
+	if normalizedContent == "" {
+		return aiapplication.DEFAULT_SESSION_TITLE
+	}
+	if len([]rune(normalizedContent)) <= aiapplication.MAX_TITLE_LENGTH {
+		return normalizedContent
+	}
+	return string([]rune(normalizedContent)[:aiapplication.MAX_TITLE_LENGTH]) + "..."
+}
+
+func summaryForAgentMessage(message aidomain.ChatMessage) string {
+	normalizedContent := strings.Join(strings.Fields(message.Content), " ")
+	if normalizedContent == "" {
+		return ""
+	}
+
+	runes := []rune(normalizedContent)
+	if len(runes) <= aiapplication.MAX_SUMMARY_LENGTH {
+		return normalizedContent
+	}
+	return string(runes[:aiapplication.MAX_SUMMARY_LENGTH-3]) + "..."
+}
+
+func mapChatRepositoryError(err error, notFoundMessage string) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeNotFound,
+			Message: notFoundMessage,
+			Status:  http.StatusNotFound,
+			Err:     err,
+		}
+	}
+	return err
 }
 
 func userFacingError(err error) string {

@@ -210,6 +210,29 @@ func (r *AgentRepository) UpdateToolCall(ctx context.Context, call domain.AgentT
 	return toDomainToolCall(record), nil
 }
 
+func (r *AgentRepository) ListToolCalls(ctx context.Context, runID string) ([]domain.AgentToolCall, error) {
+	if r.db == nil {
+		return []domain.AgentToolCall{}, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var records []agentToolCallRecord
+	if err := r.db.WithContext(queryCtx).
+		Where("run_id = ?", runID).
+		Order("started_at ASC").
+		Find(&records).Error; err != nil {
+		return nil, err
+	}
+
+	items := make([]domain.AgentToolCall, 0, len(records))
+	for _, record := range records {
+		items = append(items, toDomainToolCall(record))
+	}
+	return items, nil
+}
+
 func (r *AgentRepository) CreateEvidence(ctx context.Context, evidence domain.Evidence) (domain.Evidence, error) {
 	if r.db == nil {
 		return evidence, nil

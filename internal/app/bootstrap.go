@@ -157,6 +157,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	agentService := agentapplication.NewService(agentapplication.Options{
 		Repo:      agentRepo,
 		Validator: validator,
+		ChatRepo:  aiRepo,
 		ToolExecutors: []agentapplication.SourceToolExecutor{
 			agentKubernetesExecutor,
 			agentPrometheusExecutor,
