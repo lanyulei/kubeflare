@@ -155,9 +155,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		agentGenerator = aiapplication.NewUnavailableAssistantGenerator()
 	}
 	agentService := agentapplication.NewService(agentapplication.Options{
-		Repo:      agentRepo,
-		Validator: validator,
-		ChatRepo:  aiRepo,
+		Repo:              agentRepo,
+		Validator:         validator,
+		ChatRepo:          aiRepo,
+		AssistantStreamer: aiService,
 		ToolExecutors: []agentapplication.SourceToolExecutor{
 			agentKubernetesExecutor,
 			agentPrometheusExecutor,

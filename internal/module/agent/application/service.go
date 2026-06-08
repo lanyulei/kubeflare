@@ -61,6 +61,10 @@ type chatMessageStore interface {
 	UpdateMessage(ctx context.Context, userID string, message aidomain.ChatMessage) (aidomain.ChatMessage, error)
 }
 
+type assistantMessageStreamer interface {
+	StreamMessage(ctx context.Context, userID string, sessionID string, req aiapplication.CreateMessageRequest) (<-chan aiapplication.StreamMessageEvent, error)
+}
+
 type runChatContext struct {
 	enabled          bool
 	session          aidomain.ChatSession
@@ -132,6 +136,9 @@ type Options struct {
 	Validator *validation.Validate
 	// ChatRepo 可选。传入后,Agent 从聊天窗口发起时会同步写入 ai_chat_message。
 	ChatRepo chatMessageStore
+	// AssistantStreamer 可选。传入后,/agent/auto/run/stream 在路由到
+	// assistant/none 时会复用普通 AI 对话流,避免非 Agent 输入返回 HTTP 错误。
+	AssistantStreamer assistantMessageStreamer
 	// ToolExecutor 是单一执行器(测试或单数据源场景);与 ToolExecutors
 	// 二选一,后者优先。
 	ToolExecutor ToolExecutor
@@ -148,6 +155,7 @@ type Options struct {
 type Service struct {
 	repo          domain.Repository
 	chatRepo      chatMessageStore
+	assistant     assistantMessageStreamer
 	validator     *validation.Validate
 	agentRegistry *AgentRegistry
 	toolRegistry  *ToolRegistry
@@ -181,6 +189,7 @@ func NewService(options Options) *Service {
 	return &Service{
 		repo:          options.Repo,
 		chatRepo:      options.ChatRepo,
+		assistant:     options.AssistantStreamer,
 		validator:     validator,
 		agentRegistry: agentRegistry,
 		toolRegistry:  toolRegistry,
@@ -239,11 +248,7 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 		agentType = route.AgentType
 	}
 	if agentType == domain.AGENT_TYPE_ASSISTANT || agentType == domain.AGENT_TYPE_NONE {
-		return nil, &sharedErrors.AppError{
-			Code:    sharedErrors.CodeBadRequest,
-			Message: "message does not match an executable Agent; use assistant chat",
-			Status:  http.StatusBadRequest,
-		}
+		return s.streamAssistantMessage(ctx, normalizedUserID, req, route)
 	}
 	agent, ok := s.agentRegistry.Get(agentType)
 	if !ok || !agent.Available {
@@ -712,6 +717,48 @@ func (s *Service) markRunChatContextStreaming(ctx context.Context, userID string
 		chatContext.assistantMessage = updated
 	}
 	return chatContext
+}
+
+func (s *Service) streamAssistantMessage(ctx context.Context, userID string, req RunAgentRequest, route domain.AgentRouteResult) (<-chan domain.AgentRunEvent, error) {
+	if s == nil || s.assistant == nil {
+		return nil, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: "AI assistant is unavailable",
+			Status:  http.StatusServiceUnavailable,
+		}
+	}
+
+	stream, err := s.assistant.StreamMessage(ctx, userID, req.SessionID, aiapplication.CreateMessageRequest{Content: req.Message})
+	if err != nil {
+		return nil, err
+	}
+
+	events := make(chan domain.AgentRunEvent, 16)
+	go func() {
+		defer close(events)
+		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ROUTE_COMPLETED, Route: &route}) {
+			return
+		}
+		for event := range stream {
+			if !sendRunEvent(ctx, events, assistantStreamEvent(event)) {
+				return
+			}
+		}
+	}()
+	return events, nil
+}
+
+func assistantStreamEvent(event aiapplication.StreamMessageEvent) domain.AgentRunEvent {
+	return domain.AgentRunEvent{
+		Event:            event.Event,
+		Session:          event.Session,
+		UserMessage:      event.UserMessage,
+		AssistantMessage: event.AssistantMessage,
+		Message:          event.Message,
+		MessageID:        event.MessageID,
+		Delta:            event.Delta,
+		ErrorMessage:     event.ErrorMessage,
+	}
 }
 
 func (s *Service) finalizeRunChatContext(ctx context.Context, userID string, chatContext runChatContext, answer string, run domain.AgentRun) runChatContext {
