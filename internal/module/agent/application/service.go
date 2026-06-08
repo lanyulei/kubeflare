@@ -44,6 +44,10 @@ const (
 	DEFAULT_MAX_STEPS                = 6
 	DEFAULT_MAX_TOOL_ERRORS_PER_STEP = 3
 	DEFAULT_STEP_TIMEOUT             = 60 * time.Second
+
+	// Agent 自动路由的最低执行置信度。低于该阈值时返回普通对话助手,
+	// 避免寒暄、身份询问等非诊断输入被硬路由到 diagnostic。
+	MIN_AGENT_ROUTE_CONFIDENCE = 0.7
 )
 
 type ToolExecutor interface {
@@ -233,6 +237,13 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 	})
 	if agentType == "" || agentType == domain.AGENT_TYPE_AUTO {
 		agentType = route.AgentType
+	}
+	if agentType == domain.AGENT_TYPE_ASSISTANT || agentType == domain.AGENT_TYPE_NONE {
+		return nil, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeBadRequest,
+			Message: "message does not match an executable Agent; use assistant chat",
+			Status:  http.StatusBadRequest,
+		}
 	}
 	agent, ok := s.agentRegistry.Get(agentType)
 	if !ok || !agent.Available {
@@ -434,6 +445,9 @@ func (s *Service) RecoverStaleRuns(ctx context.Context, staleAfter time.Duration
 func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.AgentRouteResult {
 	selectedAgent := normalizeAgentType(req.SelectedAgent)
 	if selectedAgent != "" && selectedAgent != domain.AGENT_TYPE_AUTO {
+		if selectedAgent == domain.AGENT_TYPE_ASSISTANT || selectedAgent == domain.AGENT_TYPE_NONE {
+			return assistantRouteResult("用户显式选择普通对话助手。", agentDefinitionCandidates(availableAgents(s.agentRegistry.List())))
+		}
 		if agent, ok := s.agentRegistry.Get(selectedAgent); ok {
 			return domain.AgentRouteResult{
 				AgentType:   agent.Type,
@@ -460,6 +474,9 @@ func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.Agent
 		candidates = []domain.AgentCandidate{toCandidate(agent, 0.6, "当前仅启用集群诊断助手。")}
 	}
 	best := candidates[0]
+	if best.Confidence < MIN_AGENT_ROUTE_CONFIDENCE {
+		return assistantRouteResult("用户问题不匹配可执行 Agent,使用普通对话助手。", candidates)
+	}
 	needConfirm := best.Confidence < 0.7 && len(availableCandidates(candidates)) > 1
 	reason := best.Reason
 	if reason == "" {
@@ -917,6 +934,40 @@ func toCandidate(agent domain.AgentDefinition, confidence float64, reason string
 		Available:  agent.Available,
 		Confidence: confidence,
 	}
+}
+
+func assistantRouteResult(reason string, candidates []domain.AgentCandidate) domain.AgentRouteResult {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "用户问题不需要执行 Agent,使用普通对话助手。"
+	}
+
+	routedCandidates := make([]domain.AgentCandidate, 0, len(candidates)+1)
+	routedCandidates = append(routedCandidates, domain.AgentCandidate{
+		AgentType:  domain.AGENT_TYPE_ASSISTANT,
+		Name:       "普通对话助手",
+		Reason:     reason,
+		Available:  true,
+		Confidence: 1,
+	})
+	routedCandidates = append(routedCandidates, candidates...)
+
+	return domain.AgentRouteResult{
+		AgentType:    domain.AGENT_TYPE_ASSISTANT,
+		Confidence:   1,
+		Reason:       reason,
+		NeedConfirm:  false,
+		Candidates:   routedCandidates,
+		Alternatives: candidateAgentTypes(candidates),
+	}
+}
+
+func agentDefinitionCandidates(agents []domain.AgentDefinition) []domain.AgentCandidate {
+	candidates := make([]domain.AgentCandidate, 0, len(agents))
+	for _, agent := range agents {
+		candidates = append(candidates, toCandidate(agent, 0, agent.Description))
+	}
+	return candidates
 }
 
 func availableCandidates(candidates []domain.AgentCandidate) []domain.AgentCandidate {

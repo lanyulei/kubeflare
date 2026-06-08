@@ -3,6 +3,7 @@ package domain
 const (
 	AGENT_TYPE_AUTO       = "auto"
 	AGENT_TYPE_ASSISTANT  = "assistant"
+	AGENT_TYPE_NONE       = "none"
 	AGENT_TYPE_DIAGNOSTIC = "diagnostic"
 	AGENT_TYPE_SECURITY   = "security"
 	AGENT_TYPE_CAPACITY   = "capacity"

@@ -10,16 +10,19 @@ import (
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 )
 
-// routeSystemPrompt 指示 LLM 在可用 Agent 中选择最合适的一个,并以严格 JSON 返回。
-const routeSystemPrompt = `你是 Kubernetes 运维助手的路由分类器。根据用户问题和分析范围,从下列可用 Agent 中选择最合适的一个。
+// routeSystemPrompt 指示 LLM 在可用 Agent 或普通助手中选择最合适的路由,
+// 并以严格 JSON 返回。
+const routeSystemPrompt = `你是 Kubernetes 运维助手的路由分类器。根据用户问题和分析范围,从下列可用 Agent 或普通助手中选择最合适的路由。
 
 只输出一个 JSON 对象,不要任何额外文字或代码块标记,格式:
 {"agent_type":"<类型>","confidence":<0到1的小数>,"reason":"<中文简要理由>"}
 
-可用 Agent:
+可选路由:
 %s
+- assistant(普通对话助手):寒暄、身份询问、闲聊、解释性问答,或任何不需要调用集群只读工具的问题。
+- none(不使用 Agent):无法判断用户要执行 Agent 任务时使用。
 
-要求:agent_type 必须是上面列出的类型之一;confidence 表示你的把握程度;reason 用一句中文说明。`
+要求:agent_type 必须是上面列出的类型之一;只有用户明确需要 Kubernetes 集群诊断、排障、容量、安全、变更、成本或修复建议时才选择 Agent;confidence 表示你的把握程度;reason 用一句中文说明。`
 
 // llmRoutingEnabled 判定是否启用 LLM 路由(配置开启且 generator 可用)。
 func (s *Service) llmRoutingEnabled() bool {
@@ -61,13 +64,18 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 	if !ok {
 		return domain.AgentRouteResult{}, false
 	}
-	agent, ok := s.agentRegistry.Get(normalizeAgentType(parsed.AgentType))
+	agentType := normalizeAgentType(parsed.AgentType)
+	confidence := clampConfidence(parsed.Confidence)
+	reason := strings.TrimSpace(parsed.Reason)
+	if agentType == domain.AGENT_TYPE_ASSISTANT || agentType == domain.AGENT_TYPE_NONE {
+		return assistantRouteResult(reason, agentDefinitionCandidates(available)), true
+	}
+
+	agent, ok := s.agentRegistry.Get(agentType)
 	if !ok || !agent.Available {
 		return domain.AgentRouteResult{}, false
 	}
 
-	confidence := clampConfidence(parsed.Confidence)
-	reason := strings.TrimSpace(parsed.Reason)
 	if reason == "" {
 		reason = "根据用户问题由 AI 路由选择。"
 	}
@@ -78,6 +86,9 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 			continue
 		}
 		candidates = append(candidates, toCandidate(other, 0, other.Description))
+	}
+	if confidence < MIN_AGENT_ROUTE_CONFIDENCE {
+		return assistantRouteResult("用户问题与可用 Agent 的匹配置信度低,使用普通对话助手。", candidates), true
 	}
 	return domain.AgentRouteResult{
 		AgentType:    agent.Type,
