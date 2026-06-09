@@ -9,19 +9,13 @@ import (
 
 // TestToolSchemasAreValidJSON 确认所有工具的 schema 均为合法 JSON object。
 func TestToolSchemasAreValidJSON(t *testing.T) {
-	ids := []string{
-		domain.TOOL_ID_EVENT_LIST, domain.TOOL_ID_POD_LIST, domain.TOOL_ID_POD_GET,
-		domain.TOOL_ID_POD_LOG_TAIL, domain.TOOL_ID_NODE_LIST, domain.TOOL_ID_NODE_GET,
-		domain.TOOL_ID_WORKLOAD_GET, domain.TOOL_ID_WORKLOAD_PODS,
-	}
-	for _, id := range ids {
-		schema := toolSchemaFor(id)
+	for _, tool := range NewToolRegistry().List() {
 		var obj map[string]any
-		if err := json.Unmarshal(schema, &obj); err != nil {
-			t.Errorf("tool %s schema invalid: %v", id, err)
+		if err := json.Unmarshal(tool.Parameters, &obj); err != nil {
+			t.Errorf("tool %s schema invalid: %v", tool.ID, err)
 		}
 		if obj["type"] != "object" {
-			t.Errorf("tool %s schema type = %v, want object", id, obj["type"])
+			t.Errorf("tool %s schema type = %v, want object", tool.ID, obj["type"])
 		}
 	}
 }
@@ -55,20 +49,21 @@ func TestSanitizeAndResolveRoundTrip(t *testing.T) {
 	}
 }
 
-// TestArgsToScopeOverrides 验证 LLM 参数覆盖预设 scope 的语义。
-func TestArgsToScopeOverrides(t *testing.T) {
+// TestResolveScopeOverrides 验证 LLM 参数覆盖预设 scope 的语义(解析已下沉至
+// domain.ResolveScope)。
+func TestResolveScopeOverrides(t *testing.T) {
 	base := domain.AgentScope{Namespace: "preset-ns", ResourceName: "preset-pod", Container: "c1"}
 
 	// 空参数保留预设。
-	scope, err := argsToScope(base, "{}")
+	scope, err := domain.ResolveScope(base, "{}")
 	if err != nil || scope.Namespace != "preset-ns" || scope.ResourceName != "preset-pod" {
 		t.Errorf("empty args should keep base: %+v err=%v", scope, err)
 	}
 
 	// 提供的字段覆盖,未提供的保留。
-	scope, err = argsToScope(base, `{"resource_name":"new-pod"}`)
+	scope, err = domain.ResolveScope(base, `{"resource_name":"new-pod"}`)
 	if err != nil {
-		t.Fatalf("argsToScope: %v", err)
+		t.Fatalf("ResolveScope: %v", err)
 	}
 	if scope.ResourceName != "new-pod" {
 		t.Errorf("resource_name = %q, want new-pod", scope.ResourceName)
@@ -81,14 +76,14 @@ func TestArgsToScopeOverrides(t *testing.T) {
 	}
 
 	// 非法 JSON 返回错误。
-	if _, err := argsToScope(base, `{bad`); err == nil {
-		t.Error("argsToScope should error on invalid JSON")
+	if _, err := domain.ResolveScope(base, `{bad`); err == nil {
+		t.Error("ResolveScope should error on invalid JSON")
 	}
 }
 
 // TestValidateAgainstSchema 验证轻量参数校验。
 func TestValidateAgainstSchema(t *testing.T) {
-	schema := toolSchemaFor(domain.TOOL_ID_POD_GET) // required: resource_name
+	schema := json.RawMessage(schemaPodGet) // required: resource_name
 
 	// 合法。
 	if err := validateAgainstSchema(schema, `{"resource_name":"p1","namespace":"default"}`); err != nil {
@@ -114,7 +109,7 @@ func TestValidateAgainstSchema(t *testing.T) {
 
 // TestValidateAgainstSchemaEnum 验证 enum 字段取值校验。
 func TestValidateAgainstSchemaEnum(t *testing.T) {
-	schema := toolSchemaFor(domain.TOOL_ID_WORKLOAD_GET) // resource_kind enum: deployment/statefulset/daemonset
+	schema := json.RawMessage(schemaWorkloadGet) // resource_kind enum: deployment/statefulset/daemonset
 
 	// 合法枚举值。
 	if err := validateAgainstSchema(schema, `{"resource_kind":"deployment"}`); err != nil {

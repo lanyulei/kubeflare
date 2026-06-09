@@ -56,6 +56,27 @@ func (r *Registry) Handler() http.Handler {
 	return promhttp.HandlerFor(r.promRegistry, promhttp.HandlerOpts{})
 }
 
+// Register 向底层 Prometheus 注册表登记自定义采集器,返回错误供调用方处理(如
+// 重复注册)。供 HTTP 之外的子系统(如 Agent 的 MCP per-server 指标)挂靠其
+// collector,而无需暴露内部 promRegistry。
+func (r *Registry) Register(collectors ...prometheus.Collector) error {
+	for _, collector := range collectors {
+		if collector == nil {
+			continue
+		}
+		if err := r.promRegistry.Register(collector); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MustRegister 是 Register 的便捷形式,注册失败直接 panic,适用于进程启动期
+// 一次性注册、失败即视为编程错误的场景。
+func (r *Registry) MustRegister(collectors ...prometheus.Collector) {
+	r.promRegistry.MustRegister(collectors...)
+}
+
 func (r *Registry) Observe(route, method string, status int, duration time.Duration) {
 	statusLabel := http.StatusText(status)
 	if statusLabel == "" {

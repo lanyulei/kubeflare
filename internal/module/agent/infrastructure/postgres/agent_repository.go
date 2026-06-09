@@ -2,10 +2,8 @@ package postgres
 
 import (
 	"context"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -19,56 +17,54 @@ type AgentRepository struct {
 	timeout time.Duration
 }
 
-type jsonbValue []byte
-
 type agentRunRecord struct {
-	ID           string     `gorm:"primaryKey;size:64"`
-	AgentType    string     `gorm:"size:64;not null;index"`
-	UserID       string     `gorm:"size:128;not null;index"`
-	ClusterID    string     `gorm:"size:64;not null;index"`
-	Input        string     `gorm:"type:text;not null"`
-	Scope        jsonbValue `gorm:"type:jsonb;not null;default:'{}'"`
-	Status       string     `gorm:"size:32;not null;index"`
-	Confidence   float64    `gorm:"not null;default:0"`
-	RouteReason  string     `gorm:"type:text;not null;default:''"`
-	Summary      string     `gorm:"type:text;not null;default:''"`
-	ErrorMessage string     `gorm:"type:text;not null;default:''"`
-	CreatedAt    time.Time  `gorm:"not null;index"`
+	ID           string           `gorm:"primaryKey;size:64"`
+	AgentType    string           `gorm:"size:64;not null;index"`
+	UserID       string           `gorm:"size:128;not null;index"`
+	ClusterID    string           `gorm:"size:64;not null;index"`
+	Input        string           `gorm:"type:text;not null"`
+	Scope        dbplatform.JSONB `gorm:"type:jsonb;not null;default:'{}'"`
+	Status       string           `gorm:"size:32;not null;index"`
+	Confidence   float64          `gorm:"not null;default:0"`
+	RouteReason  string           `gorm:"type:text;not null;default:''"`
+	Summary      string           `gorm:"type:text;not null;default:''"`
+	ErrorMessage string           `gorm:"type:text;not null;default:''"`
+	CreatedAt    time.Time        `gorm:"not null;index"`
 	CompletedAt  *time.Time
 	DeletedAt    gorm.DeletedAt `gorm:"index"`
 }
 
 type agentToolCallRecord struct {
-	ID            string     `gorm:"primaryKey;size:64"`
-	RunID         string     `gorm:"size:64;not null;index"`
-	AgentType     string     `gorm:"size:64;not null;index"`
-	ToolID        string     `gorm:"size:128;not null;index"`
-	Input         jsonbValue `gorm:"type:jsonb;not null;default:'{}'"`
-	OutputSummary string     `gorm:"type:text;not null;default:''"`
-	Status        string     `gorm:"size:32;not null;index"`
-	ErrorMessage  string     `gorm:"type:text;not null;default:''"`
-	StartedAt     time.Time  `gorm:"not null;index"`
+	ID            string           `gorm:"primaryKey;size:64"`
+	RunID         string           `gorm:"size:64;not null;index"`
+	AgentType     string           `gorm:"size:64;not null;index"`
+	ToolID        string           `gorm:"size:128;not null;index"`
+	Input         dbplatform.JSONB `gorm:"type:jsonb;not null;default:'{}'"`
+	OutputSummary string           `gorm:"type:text;not null;default:''"`
+	Status        string           `gorm:"size:32;not null;index"`
+	ErrorMessage  string           `gorm:"type:text;not null;default:''"`
+	StartedAt     time.Time        `gorm:"not null;index"`
 	CompletedAt   *time.Time
 	DeletedAt     gorm.DeletedAt `gorm:"index"`
 }
 
 type agentEvidenceRecord struct {
-	ID              string         `gorm:"primaryKey;size:64"`
-	RunID           string         `gorm:"size:64;not null;index"`
-	ToolCallID      string         `gorm:"size:64;not null;index"`
-	SourceKind      string         `gorm:"size:64;not null;index"`
-	APIGroup        string         `gorm:"size:128;not null;default:''"`
-	APIVersion      string         `gorm:"size:64;not null;default:''"`
-	ResourceKind    string         `gorm:"size:64;not null;default:''"`
-	Namespace       string         `gorm:"size:128;not null;default:'';index"`
-	Name            string         `gorm:"size:256;not null;default:'';index"`
-	ResourceVersion string         `gorm:"size:128;not null;default:''"`
-	Summary         string         `gorm:"type:text;not null;default:''"`
-	RawJSON         jsonbValue     `gorm:"type:jsonb;not null;default:'{}'"`
-	Hash            string         `gorm:"size:128;not null;default:'';index"`
-	Redacted        bool           `gorm:"not null;default:false"`
-	CollectedAt     time.Time      `gorm:"not null;index"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
+	ID              string           `gorm:"primaryKey;size:64"`
+	RunID           string           `gorm:"size:64;not null;index"`
+	ToolCallID      string           `gorm:"size:64;not null;index"`
+	SourceKind      string           `gorm:"size:64;not null;index"`
+	APIGroup        string           `gorm:"size:128;not null;default:''"`
+	APIVersion      string           `gorm:"size:64;not null;default:''"`
+	ResourceKind    string           `gorm:"size:64;not null;default:''"`
+	Namespace       string           `gorm:"size:128;not null;default:'';index"`
+	Name            string           `gorm:"size:256;not null;default:'';index"`
+	ResourceVersion string           `gorm:"size:128;not null;default:''"`
+	Summary         string           `gorm:"type:text;not null;default:''"`
+	RawJSON         dbplatform.JSONB `gorm:"type:jsonb;not null;default:'{}'"`
+	Hash            string           `gorm:"size:128;not null;default:'';index"`
+	Redacted        bool             `gorm:"not null;default:false"`
+	CollectedAt     time.Time        `gorm:"not null;index"`
+	DeletedAt       gorm.DeletedAt   `gorm:"index"`
 }
 
 func (agentRunRecord) TableName() string {
@@ -85,30 +81,6 @@ func (agentEvidenceRecord) TableName() string {
 
 func NewAgentRepository(db *gorm.DB, timeout time.Duration) *AgentRepository {
 	return &AgentRepository{db: db, timeout: timeout}
-}
-
-func (v jsonbValue) Value() (driver.Value, error) {
-	if len(v) == 0 {
-		return "{}", nil
-	}
-	if !json.Valid(v) {
-		return nil, fmt.Errorf("invalid jsonb value")
-	}
-	return string(v), nil
-}
-
-func (v *jsonbValue) Scan(value any) error {
-	switch data := value.(type) {
-	case nil:
-		*v = jsonbValue("{}")
-	case []byte:
-		*v = append((*v)[:0], data...)
-	case string:
-		*v = append((*v)[:0], data...)
-	default:
-		return fmt.Errorf("unsupported jsonb scan value %T", value)
-	}
-	return nil
 }
 
 func (r *AgentRepository) CreateRun(ctx context.Context, run domain.AgentRun) (domain.AgentRun, error) {
@@ -146,7 +118,7 @@ func (r *AgentRepository) UpdateRun(ctx context.Context, run domain.AgentRun) (d
 	record.ErrorMessage = run.ErrorMessage
 	record.CompletedAt = run.CompletedAt
 	if scopeJSON, err := json.Marshal(run.Scope); err == nil {
-		record.Scope = newJSONBValue(scopeJSON)
+		record.Scope = dbplatform.NewJSONB(scopeJSON)
 	}
 	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
 		return domain.AgentRun{}, err
@@ -202,7 +174,7 @@ func (r *AgentRepository) UpdateToolCall(ctx context.Context, call domain.AgentT
 	record.ErrorMessage = call.ErrorMessage
 	record.CompletedAt = call.CompletedAt
 	if len(call.Input) > 0 {
-		record.Input = newJSONBValue(call.Input)
+		record.Input = dbplatform.NewJSONB(call.Input)
 	}
 	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
 		return domain.AgentToolCall{}, err
@@ -313,10 +285,7 @@ func toDomainRun(record agentRunRecord) domain.AgentRun {
 	if len(record.Scope) > 0 {
 		_ = json.Unmarshal([]byte(record.Scope), &run.Scope)
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		run.DeletedAt = &deletedAt
-	}
+	run.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return run
 }
 
@@ -331,7 +300,7 @@ func fromDomainRun(run domain.AgentRun) agentRunRecord {
 		UserID:       run.UserID,
 		ClusterID:    run.ClusterID,
 		Input:        run.Input,
-		Scope:        newJSONBValue(scopeJSON),
+		Scope:        dbplatform.NewJSONB(scopeJSON),
 		Status:       run.Status,
 		Confidence:   run.Confidence,
 		RouteReason:  run.RouteReason,
@@ -355,10 +324,7 @@ func toDomainToolCall(record agentToolCallRecord) domain.AgentToolCall {
 		StartedAt:     record.StartedAt,
 		CompletedAt:   record.CompletedAt,
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		call.DeletedAt = &deletedAt
-	}
+	call.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return call
 }
 
@@ -372,7 +338,7 @@ func fromDomainToolCall(call domain.AgentToolCall) agentToolCallRecord {
 		RunID:         call.RunID,
 		AgentType:     call.AgentType,
 		ToolID:        call.ToolID,
-		Input:         newJSONBValue(inputJSON),
+		Input:         dbplatform.NewJSONB(inputJSON),
 		OutputSummary: call.OutputSummary,
 		Status:        call.Status,
 		ErrorMessage:  call.ErrorMessage,
@@ -399,10 +365,7 @@ func toDomainEvidence(record agentEvidenceRecord) domain.Evidence {
 		Redacted:        record.Redacted,
 		CollectedAt:     record.CollectedAt,
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		evidence.DeletedAt = &deletedAt
-	}
+	evidence.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return evidence
 }
 
@@ -423,16 +386,9 @@ func fromDomainEvidence(evidence domain.Evidence) agentEvidenceRecord {
 		Name:            evidence.Name,
 		ResourceVersion: evidence.ResourceVersion,
 		Summary:         evidence.Summary,
-		RawJSON:         newJSONBValue(rawJSON),
+		RawJSON:         dbplatform.NewJSONB(rawJSON),
 		Hash:            evidence.Hash,
 		Redacted:        evidence.Redacted,
 		CollectedAt:     evidence.CollectedAt,
 	}
-}
-
-func newJSONBValue(data []byte) jsonbValue {
-	if len(data) == 0 || !json.Valid(data) {
-		return jsonbValue("{}")
-	}
-	return append(jsonbValue(nil), data...)
 }

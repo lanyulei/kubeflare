@@ -107,6 +107,32 @@ agent:
   #   diagnostic: "自定义诊断提示词"
   # prompt_files:
   #   diagnostic: /etc/kubeflare/prompts/diagnostic.md
+  # 可选:工具治理,不改代码即可启停工具或微调元数据(按工具 ID 覆盖,仅覆盖所列字段)
+  # tools:
+  #   overrides:
+  #     cluster.pod.log.tail:
+  #       enabled: true            # 启停该工具(false 则既不暴露给模型也不可调用)
+  #       timeout_ms: 12000        # 覆盖单次执行超时(毫秒)
+  #     cluster.rbac.get:
+  #       enabled: false           # 关闭 RBAC 读取工具
+  # 可选:被动技能,按关键字命中后收窄工具集 + 追加专家提示(无额外 LLM 调用)。
+  # 运行时可经 POST /agent/tool/reload 热重载(空请求体回滚到启动配置)。
+  # skills:
+  #   - id: diagnose.ingress-unreachable
+  #     name: "Ingress 不通排查"
+  #     enabled: true
+  #     agent_types: [diagnostic]        # 留空表示适用于任意 Agent
+  #     triggers: ["ingress", "访问不通", "503", "无法访问"]  # 命中任一即触发
+  #     allowed_tools:                   # 收窄为这些工具(留空则不收窄)
+  #       - cluster.ingress.get
+  #       - cluster.service.get
+  #       - cluster.pod.list
+  #       - cluster.event.list
+  #     system_prompt: "用户反馈服务从外部访问不通,按 Ingress→Service→Endpoint→Pod 顺序定位。"
+  #     hints:
+  #       - "先查 Ingress 规则与后端 Service 绑定"
+  #       - "再查 Service 的 Endpoint 是否就绪"
+  #       - "最后查后端 Pod 状态与事件"
 
 database:
   enabled: true

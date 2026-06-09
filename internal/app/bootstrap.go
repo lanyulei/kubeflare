@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	agentapplication "github.com/lanyulei/kubeflare/internal/module/agent/application"
+	agentdomain "github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	agentkubeclient "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubeclient"
 	agentkubernetes "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubernetes"
 	agentpostgres "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/postgres"
@@ -176,6 +177,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			MaxConcurrentRuns:        cfg.Agent.MaxConcurrentRuns,
 		},
 		SystemPrompts: resolveAgentPrompts(cfg.Agent, logger),
+		ToolOverrides: resolveAgentToolOverrides(cfg.Agent),
+		Skills:        resolveAgentSkills(cfg.Agent),
 	})
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
@@ -325,6 +328,58 @@ func resolveAgentPrompts(cfg config.AgentConfig, logger *slog.Logger) map[string
 		}
 	}
 	return prompts
+}
+
+// resolveAgentToolOverrides 把配置中的工具治理覆盖转换为 domain 层补丁(provider
+// 无关),供 Service 注入工具注册表。空配置返回 nil,Service 据此不施加任何覆盖。
+func resolveAgentToolOverrides(cfg config.AgentConfig) map[string]agentdomain.ToolOverride {
+	if len(cfg.Tools.Overrides) == 0 {
+		return nil
+	}
+	overrides := make(map[string]agentdomain.ToolOverride, len(cfg.Tools.Overrides))
+	for toolID, override := range cfg.Tools.Overrides {
+		toolID = strings.TrimSpace(toolID)
+		if toolID == "" {
+			continue
+		}
+		overrides[toolID] = agentdomain.ToolOverride{
+			Enabled:     override.Enabled,
+			Description: override.Description,
+			TimeoutMS:   override.TimeoutMS,
+		}
+	}
+	return overrides
+}
+
+// resolveAgentSkills 把配置中的技能声明转换为 domain 层定义(provider 无关),
+// 供 Service 注册。空配置返回 nil,Service 据此不注册任何技能。
+func resolveAgentSkills(cfg config.AgentConfig) []agentdomain.SkillDefinition {
+	if len(cfg.Skills) == 0 {
+		return nil
+	}
+	skills := make([]agentdomain.SkillDefinition, 0, len(cfg.Skills))
+	for _, skill := range cfg.Skills {
+		id := strings.TrimSpace(skill.ID)
+		if id == "" {
+			continue
+		}
+		enabled := true
+		if skill.Enabled != nil {
+			enabled = *skill.Enabled
+		}
+		skills = append(skills, agentdomain.SkillDefinition{
+			ID:           id,
+			Name:         strings.TrimSpace(skill.Name),
+			Description:  strings.TrimSpace(skill.Description),
+			Enabled:      enabled,
+			AgentTypes:   skill.AgentTypes,
+			Triggers:     skill.Triggers,
+			SystemPrompt: skill.SystemPrompt,
+			AllowedTools: skill.AllowedTools,
+			Hints:        skill.Hints,
+		})
+	}
+	return skills
 }
 
 func newAPIHandler(

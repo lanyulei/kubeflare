@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -17,6 +18,7 @@ type Checker interface {
 type Manager struct {
 	timeout  time.Duration
 	draining atomic.Bool
+	mu       sync.RWMutex
 	checkers []Checker
 }
 
@@ -25,6 +27,17 @@ func NewManager(timeout time.Duration, checkers ...Checker) *Manager {
 		timeout:  timeout,
 		checkers: checkers,
 	}
+}
+
+// AddChecker 在运行期追加一个就绪检查项(并发安全),供启动后才就绪的长生命周期
+// 组件(如 Agent 的 MCP server)接入 /readyz。nil 检查项忽略。
+func (m *Manager) AddChecker(checker Checker) {
+	if checker == nil {
+		return
+	}
+	m.mu.Lock()
+	m.checkers = append(m.checkers, checker)
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetDraining(draining bool) {
@@ -47,7 +60,11 @@ func (m *Manager) ReadyHandler() http.Handler {
 
 		status := http.StatusOK
 		details := map[string]string{"status": "ready"}
-		for _, checker := range m.checkers {
+		m.mu.RLock()
+		checkers := make([]Checker, len(m.checkers))
+		copy(checkers, m.checkers)
+		m.mu.RUnlock()
+		for _, checker := range checkers {
 			ctx, cancel := context.WithTimeout(r.Context(), m.timeout)
 			err := checker.Check(ctx)
 			cancel()

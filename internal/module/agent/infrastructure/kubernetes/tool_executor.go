@@ -2,8 +2,6 @@ package kubernetes
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,9 +22,11 @@ import (
 )
 
 const (
-	DEFAULT_LIST_LIMIT    = 40
-	DEFAULT_LOG_LINES     = 120
-	MAX_EVIDENCE_RAW_SIZE = 65536
+	DEFAULT_LIST_LIMIT = 40
+	DEFAULT_LOG_LINES  = 120
+	// MAX_EVIDENCE_RAW_SIZE 复用 domain 单一来源,既用于日志读取的字节上限,
+	// 也是证据 RawJSON 的截断阈值(由 domain.Evidence.WithRawJSON 实施)。
+	MAX_EVIDENCE_RAW_SIZE = domain.MaxEvidenceRawSize
 )
 
 type ToolExecutor struct {
@@ -63,33 +63,77 @@ func (e *ToolExecutor) Execute(ctx context.Context, req domain.ToolCallRequest) 
 		return domain.ToolCallResult{}, err
 	}
 
+	// 把 LLM 生成的参数合并进预设 Scope:loop 仅透传原始 Arguments,K8s 专属的
+	// namespace/resource_* 解析在此自行完成(与 Prometheus 执行器自解析 Arguments
+	// 对称),使 loop 对工具参数形状无知。
+	scope, err := domain.ResolveScope(req.Scope, req.Arguments)
+	if err != nil {
+		return domain.ToolCallResult{}, fmt.Errorf("invalid tool arguments: %w", err)
+	}
+
 	switch req.ToolID {
 	case domain.TOOL_ID_EVENT_LIST:
-		return e.listEvents(ctx, clientset, req.Scope)
+		return e.listEvents(ctx, clientset, scope)
 	case domain.TOOL_ID_POD_LIST:
-		return e.listPods(ctx, clientset, req.Scope)
+		return e.listPods(ctx, clientset, scope)
 	case domain.TOOL_ID_POD_GET:
-		return e.getPod(ctx, clientset, req.Scope)
+		return e.getPod(ctx, clientset, scope)
 	case domain.TOOL_ID_POD_LOG_TAIL:
-		return e.tailPodLog(ctx, clientset, req.Scope)
+		return e.tailPodLog(ctx, clientset, scope)
 	case domain.TOOL_ID_NODE_LIST:
 		return e.listNodes(ctx, clientset)
 	case domain.TOOL_ID_NODE_GET:
-		return e.getNode(ctx, clientset, req.Scope)
+		return e.getNode(ctx, clientset, scope)
 	case domain.TOOL_ID_WORKLOAD_GET:
-		return e.getWorkload(ctx, clientset, req.Scope)
+		return e.getWorkload(ctx, clientset, scope)
 	case domain.TOOL_ID_WORKLOAD_PODS:
-		return e.listWorkloadPods(ctx, clientset, req.Scope)
+		return e.listWorkloadPods(ctx, clientset, scope)
+	case domain.TOOL_ID_CONFIGMAP_GET:
+		return e.getConfigMap(ctx, clientset, scope)
+	case domain.TOOL_ID_SERVICE_GET:
+		return e.getService(ctx, clientset, scope)
+	case domain.TOOL_ID_INGRESS_GET:
+		return e.getIngress(ctx, clientset, scope)
+	case domain.TOOL_ID_PVC_GET:
+		return e.getPVC(ctx, clientset, scope)
+	case domain.TOOL_ID_HPA_GET:
+		return e.getHPA(ctx, clientset, scope)
+	case domain.TOOL_ID_RBAC_GET:
+		return e.getRBAC(ctx, clientset, scope)
+	case domain.TOOL_ID_DESCRIBE:
+		return e.describe(ctx, clientset, scope)
 	default:
 		return domain.ToolCallResult{}, fmt.Errorf("unsupported tool %s", req.ToolID)
 	}
 }
 
 func (e *ToolExecutor) listEvents(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
+	items, err := collectEventSummaries(ctx, clientset, scope)
+	if err != nil {
+		return domain.ToolCallResult{}, err
+	}
+
+	summary := fmt.Sprintf("读取到 %d 条事件。", len(items))
+	if len(items) > 0 {
+		summary = fmt.Sprintf("读取到 %d 条事件，最新事件：%s %s。", len(items), items[0].Reason, items[0].Message)
+	}
+	observation := fmt.Sprintf("读取到 %d 条事件：", len(items))
+	if len(items) == 0 {
+		observation = "未读取到匹配的事件（可能资源正常或范围过滤过严）。"
+	} else {
+		observation = observationFromItems(observation, items, DEFAULT_LIST_LIMIT)
+	}
+	return resultWithObservation(summary, observation, listEvidence("event", "events.k8s.io", "v1", "Event", scope.Namespace, "event-list", summary, items, false)), nil
+}
+
+// collectEventSummaries 列出命名空间下事件并按 scope 过滤,构造为统一的
+// evidenceSummary 列表(最多 DEFAULT_LIST_LIMIT 条)。listEvents 与 describe 的
+// 关联事件收集共用此函数,避免事件读取/过滤/摘要逻辑分散重复。
+func collectEventSummaries(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) ([]evidenceSummary, error) {
 	namespace := namespaceOrAll(scope.Namespace)
 	events, err := clientset.EventsV1().Events(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
 	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list events: %w", err)
+		return nil, fmt.Errorf("failed to list events: %w", err)
 	}
 
 	items := make([]evidenceSummary, 0, len(events.Items))
@@ -116,18 +160,7 @@ func (e *ToolExecutor) listEvents(ctx context.Context, clientset *kubernetes.Cli
 			break
 		}
 	}
-
-	summary := fmt.Sprintf("读取到 %d 条事件。", len(items))
-	if len(items) > 0 {
-		summary = fmt.Sprintf("读取到 %d 条事件，最新事件：%s %s。", len(items), items[0].Reason, items[0].Message)
-	}
-	observation := fmt.Sprintf("读取到 %d 条事件：", len(items))
-	if len(items) == 0 {
-		observation = "未读取到匹配的事件（可能资源正常或范围过滤过严）。"
-	} else {
-		observation = observationFromItems(observation, items, DEFAULT_LIST_LIMIT)
-	}
-	return resultWithObservation(summary, observation, listEvidence("event", "events.k8s.io", "v1", "Event", scope.Namespace, "event-list", summary, items, false)), nil
+	return items, nil
 }
 
 func (e *ToolExecutor) listPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -303,8 +336,7 @@ func (e *ToolExecutor) listNodes(ctx context.Context, clientset *kubernetes.Clie
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 Node，其中 %d 个不是 Ready。", len(items), notReady)
-	observation := observationFromItems(fmt.Sprintf("读取到 %d 个 Node（%d 个非 Ready），明细：", len(items), notReady), items, DEFAULT_LIST_LIMIT)
-	return resultWithObservation(summary, observation, listEvidence("node", "", "v1", "Node", "", "node-list", summary, items, false)), nil
+	return listResult(summary, items, "node", "", "v1", "Node", "", "node-list"), nil
 }
 
 func (e *ToolExecutor) getNode(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -353,30 +385,48 @@ func (e *ToolExecutor) getWorkload(ctx context.Context, clientset *kubernetes.Cl
 		return e.listWorkloads(ctx, clientset, scope)
 	}
 
+	info, err := fetchWorkload(ctx, clientset, kind, namespace, name)
+	if err != nil {
+		return domain.ToolCallResult{}, err
+	}
+	evidence := objectEvidence("workload", "apps", "v1", info.eventKind, namespace, name, info.meta.GetResourceVersion(), info.summary, info.object, false)
+	return resultWithEvidence(info.summary, evidence), nil
+}
+
+// workloadInfo 聚合一个工作负载的取值结果,作为 getWorkload 与 workloadSelector
+// 的共同返回,避免两处各写一份 deployment/statefulset/daemonset 三分支 switch。
+type workloadInfo struct {
+	object    runtime.Object        // 落证据用(*appsv1.X 同时实现 runtime.Object 与 metav1.Object)
+	meta      metav1.Object         // 取 ResourceVersion 等元数据
+	selector  *metav1.LabelSelector // 关联 Pod 的标签选择器
+	summary   string                // 人类可读摘要
+	eventKind string                // K8s Kind,用于关联事件过滤
+}
+
+// fetchWorkload 按类型取得工作负载并归一为 workloadInfo,是工作负载读取的唯一来源。
+// 新增工作负载类型只需在此登记一处。
+func fetchWorkload(ctx context.Context, clientset *kubernetes.Clientset, kind, namespace, name string) (workloadInfo, error) {
 	switch kind {
 	case "deployment":
 		workload, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to get deployment: %w", err)
+			return workloadInfo{}, fmt.Errorf("failed to get deployment: %w", err)
 		}
-		summary := deploymentSummary(*workload)
-		return resultWithEvidence(summary, objectEvidence("workload", "apps", "v1", "Deployment", namespace, name, workload.ResourceVersion, summary, workload, false)), nil
+		return workloadInfo{object: workload, meta: workload, selector: workload.Spec.Selector, summary: deploymentSummary(*workload), eventKind: "Deployment"}, nil
 	case "statefulset":
 		workload, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to get statefulset: %w", err)
+			return workloadInfo{}, fmt.Errorf("failed to get statefulset: %w", err)
 		}
-		summary := statefulSetSummary(*workload)
-		return resultWithEvidence(summary, objectEvidence("workload", "apps", "v1", "StatefulSet", namespace, name, workload.ResourceVersion, summary, workload, false)), nil
+		return workloadInfo{object: workload, meta: workload, selector: workload.Spec.Selector, summary: statefulSetSummary(*workload), eventKind: "StatefulSet"}, nil
 	case "daemonset":
 		workload, err := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to get daemonset: %w", err)
+			return workloadInfo{}, fmt.Errorf("failed to get daemonset: %w", err)
 		}
-		summary := daemonSetSummary(*workload)
-		return resultWithEvidence(summary, objectEvidence("workload", "apps", "v1", "DaemonSet", namespace, name, workload.ResourceVersion, summary, workload, false)), nil
+		return workloadInfo{object: workload, meta: workload, selector: workload.Spec.Selector, summary: daemonSetSummary(*workload), eventKind: "DaemonSet"}, nil
 	default:
-		return domain.ToolCallResult{}, fmt.Errorf("unsupported workload kind %s", kind)
+		return workloadInfo{}, fmt.Errorf("unsupported workload kind %s", kind)
 	}
 }
 
@@ -409,8 +459,7 @@ func (e *ToolExecutor) listWorkloads(ctx context.Context, clientset *kubernetes.
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个工作负载。", len(items))
-	observation := observationFromItems(fmt.Sprintf("读取到 %d 个工作负载，明细：", len(items)), items, DEFAULT_LIST_LIMIT)
-	return resultWithObservation(summary, observation, listEvidence("workload", "apps", "v1", "Workload", scope.Namespace, "workload-list", summary, items, false)), nil
+	return listResult(summary, items, "workload", "apps", "v1", "Workload", scope.Namespace, "workload-list"), nil
 }
 
 func (e *ToolExecutor) listWorkloadPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
@@ -460,31 +509,12 @@ func (e *ToolExecutor) workloadSelector(ctx context.Context, clientset *kubernet
 		return labels.Everything(), namespaceOrAll(scope.Namespace), nil
 	}
 
-	switch kind {
-	case "deployment":
-		workload, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to get deployment selector: %w", err)
-		}
-		selector, err := selectorFromLabelSelector(workload.Spec.Selector)
-		return selector, namespace, err
-	case "statefulset":
-		workload, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to get statefulset selector: %w", err)
-		}
-		selector, err := selectorFromLabelSelector(workload.Spec.Selector)
-		return selector, namespace, err
-	case "daemonset":
-		workload, err := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to get daemonset selector: %w", err)
-		}
-		selector, err := selectorFromLabelSelector(workload.Spec.Selector)
-		return selector, namespace, err
-	default:
-		return nil, "", fmt.Errorf("unsupported workload kind %s", kind)
+	info, err := fetchWorkload(ctx, clientset, kind, namespace, name)
+	if err != nil {
+		return nil, "", err
 	}
+	selector, err := selectorFromLabelSelector(info.selector)
+	return selector, namespace, err
 }
 
 func selectorFromLabelSelector(labelSelector *metav1.LabelSelector) (labels.Selector, error) {
@@ -516,6 +546,14 @@ func resultWithObservation(summary string, observation string, evidence domain.E
 		Observation: strings.TrimSpace(observation),
 		Evidence:    []domain.Evidence{evidence},
 	}
+}
+
+// listResult 封装资源列表工具的统一三件套:以调用方算好的 summary 为基准生成逐行
+// observation 头,并组装为列表证据。消除各 list 实现中重复的"summary + 观察头 +
+// listEvidence"样板;summary 由调用方决定(允许追加异常计数等定制信息)。
+func listResult(summary string, items []evidenceSummary, sourceKind, apiGroup, apiVersion, resourceKind, namespace, evidenceName string) domain.ToolCallResult {
+	observation := observationFromItems(summary+"明细：", items, DEFAULT_LIST_LIMIT)
+	return resultWithObservation(summary, observation, listEvidence(sourceKind, apiGroup, apiVersion, resourceKind, namespace, evidenceName, summary, items, false))
 }
 
 // observationFromItems 把资源摘要列表渲染成逐行的结构化观察文本(供模型阅读),
@@ -580,15 +618,6 @@ func listEvidence(sourceKind string, apiGroup string, apiVersion string, resourc
 }
 
 func newEvidence(sourceKind string, apiGroup string, apiVersion string, resourceKind string, namespace string, name string, resourceVersion string, summary string, rawJSON []byte, redacted bool) domain.Evidence {
-	if len(rawJSON) > MAX_EVIDENCE_RAW_SIZE {
-		fullHash := sha256.Sum256(rawJSON)
-		rawJSON, _ = json.Marshal(map[string]any{
-			"truncated":     true,
-			"original_sha":  hex.EncodeToString(fullHash[:]),
-			"original_size": len(rawJSON),
-		})
-	}
-	sum := sha256.Sum256(rawJSON)
 	return domain.Evidence{
 		SourceKind:      sourceKind,
 		APIGroup:        apiGroup,
@@ -598,11 +627,8 @@ func newEvidence(sourceKind string, apiGroup string, apiVersion string, resource
 		Name:            strings.TrimSpace(name),
 		ResourceVersion: resourceVersion,
 		Summary:         strings.TrimSpace(summary),
-		RawJSON:         rawJSON,
-		Hash:            hex.EncodeToString(sum[:]),
 		Redacted:        redacted,
-		CollectedAt:     time.Now().UTC(),
-	}
+	}.WithRawJSON(rawJSON)
 }
 
 func namespaceOrAll(namespace string) string {

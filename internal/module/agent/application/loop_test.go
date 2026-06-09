@@ -162,8 +162,9 @@ func TestRunLoopHappyPath(t *testing.T) {
 	if len(executor.calls) != 1 || executor.calls[0].ToolID != domain.TOOL_ID_POD_GET {
 		t.Fatalf("expected 1 pod.get call, got %+v", executor.calls)
 	}
-	if executor.calls[0].Scope.ResourceName != "p1" {
-		t.Errorf("scope resource_name = %q, want p1", executor.calls[0].Scope.ResourceName)
+	// loop 不再把参数解析进 Scope,而是透传原始 Arguments(由各执行器自行解析)。
+	if executor.calls[0].Arguments != `{"resource_name":"p1","namespace":"default"}` {
+		t.Errorf("arguments = %q, want passthrough of raw tool arguments", executor.calls[0].Arguments)
 	}
 	assertHasEvent(t, evts, STREAM_EVENT_AGENT_THINKING)
 	assertHasEvent(t, evts, STREAM_EVENT_AGENT_TOOL_STARTED)

@@ -23,7 +23,7 @@ func (h *Handler) List(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": clusters})
+	response.OKList(c, clusters)
 }
 
 func (h *Handler) Get(c *gin.Context) {

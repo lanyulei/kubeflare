@@ -10,7 +10,6 @@ import (
 	"time"
 
 	validation "github.com/go-playground/validator/v10"
-	"gorm.io/gorm"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
@@ -665,18 +664,10 @@ func (s *Service) assistantGenerator() AssistantGenerator {
 }
 
 func mapRepositoryError(err error, notFoundMessage string) error {
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "not found") || errors.Is(err, gorm.ErrRecordNotFound) {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeNotFound,
-			Message: notFoundMessage,
-			Status:  http.StatusNotFound,
-			Err:     err,
-		}
-	}
-	return err
+	return sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
+		NotFoundCode:    sharedErrors.CodeNotFound,
+		NotFoundMessage: notFoundMessage,
+	})
 }
 
 func mapAssistantError(err error) error {

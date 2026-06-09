@@ -598,28 +598,12 @@ func (s *Service) DisableMFA(ctx context.Context, subject string, req DisableMFA
 }
 
 func mapRepositoryError(err error, notFoundMessage string) error {
-	if err == nil {
-		return nil
-	}
-
-	if err == gorm.ErrRecordNotFound || strings.Contains(strings.ToLower(err.Error()), "not found") {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeUserNotFound,
-			Message: notFoundMessage,
-			Status:  404,
-			Err:     err,
-		}
-	}
-	if err == gorm.ErrDuplicatedKey {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeUserAlreadyExists,
-			Message: "username or email already exists",
-			Status:  409,
-			Err:     err,
-		}
-	}
-
-	return err
+	return sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
+		NotFoundCode:    sharedErrors.CodeUserNotFound,
+		NotFoundMessage: notFoundMessage,
+		ConflictCode:    sharedErrors.CodeUserAlreadyExists,
+		ConflictMessage: "username or email already exists",
+	})
 }
 
 func parseUserID(value string) (int64, error) {

@@ -1,6 +1,8 @@
 package http
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -21,23 +23,54 @@ func NewHandler(service *application.Service) *Handler {
 }
 
 func (h *Handler) ListAgent(c *gin.Context) {
-	if _, err := currentUserID(c); err != nil {
+	if _, err := middleware.RequireSubject(c); err != nil {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": h.service.ListAgents(c.Request.Context())})
+	response.OKList(c, h.service.ListAgents(c.Request.Context()))
 }
 
 func (h *Handler) ListTool(c *gin.Context) {
-	if _, err := currentUserID(c); err != nil {
+	if _, err := middleware.RequireSubject(c); err != nil {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": h.service.ListTools(c.Request.Context())})
+	response.OKList(c, h.service.ListTools(c.Request.Context()))
+}
+
+func (h *Handler) ListSkill(c *gin.Context) {
+	if _, err := middleware.RequireSubject(c); err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OKList(c, h.service.ListSkills(c.Request.Context()))
+}
+
+// Reload 在运行时热重载工具覆盖与技能。空请求体表示回滚到启动配置,因此容忍
+// EOF(空 body);仅在 body 非空但非法时报错。
+func (h *Handler) Reload(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	var req application.ReloadToolsRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.ReloadTools(c.Request.Context(), userID, req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
 }
 
 func (h *Handler) Route(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -59,7 +92,7 @@ func (h *Handler) Route(c *gin.Context) {
 }
 
 func (h *Handler) StreamRun(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -84,7 +117,7 @@ func (h *Handler) StreamRun(c *gin.Context) {
 }
 
 func (h *Handler) CancelRun(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -99,7 +132,7 @@ func (h *Handler) CancelRun(c *gin.Context) {
 }
 
 func (h *Handler) ListEvidence(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -110,11 +143,7 @@ func (h *Handler) ListEvidence(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": items})
-}
-
-func currentUserID(c *gin.Context) (string, error) {
-	return middleware.RequireSubject(c)
+	response.OKList(c, items)
 }
 
 func clusterIDFromRequest(c *gin.Context, value string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	aidomain "github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
+	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
 )
@@ -147,6 +149,11 @@ type Options struct {
 	ToolExecutors []SourceToolExecutor
 	Generator     aiapplication.AssistantGenerator
 	Loop          LoopConfig
+	// ToolOverrides 是按工具 ID 的配置级覆盖(启停/超时/描述),由 bootstrap 从
+	// 配置解析后注入。为空表示不覆盖,全部沿用内置定义。
+	ToolOverrides map[string]domain.ToolOverride
+	// Skills 是关键字触发的被动技能定义,由 bootstrap 从配置解析后注入。
+	Skills []domain.SkillDefinition
 	// SystemPrompts 是 agentType -> system prompt 的覆盖(已由 bootstrap 解析
 	// 内联与文件来源),为空的项保留代码内置默认。
 	SystemPrompts map[string]string
@@ -159,9 +166,14 @@ type Service struct {
 	validator     *validation.Validate
 	agentRegistry *AgentRegistry
 	toolRegistry  *ToolRegistry
+	skillRegistry *SkillRegistry
 	toolExecutor  ToolExecutor
 	generator     aiapplication.AssistantGenerator
 	opts          LoopConfig
+	// startupOverrides / startupSkills 是 NewService 时捕获的启动配置快照(深拷贝),
+	// 供 ReloadTools 在收到空请求时回滚到启动态。与调用方及后续 SetXxx 相互独立。
+	startupOverrides map[string]domain.ToolOverride
+	startupSkills    []domain.SkillDefinition
 	// runLimiter 限制并发执行中的 run 数(per-user + 全局),防止瞬时大量 run
 	// 打爆 LLM 配额与集群 apiserver。
 	runLimiter *runLimiter
@@ -180,6 +192,9 @@ func NewService(options Options) *Service {
 		agentRegistry.SetSystemPrompt(agentType, prompt)
 	}
 	toolRegistry := NewToolRegistry()
+	toolRegistry.SetOverrides(options.ToolOverrides)
+	skillRegistry := NewSkillRegistry()
+	skillRegistry.SetSkills(options.Skills)
 
 	toolExecutor := options.ToolExecutor
 	if len(options.ToolExecutors) > 0 {
@@ -187,16 +202,19 @@ func NewService(options Options) *Service {
 	}
 
 	return &Service{
-		repo:          options.Repo,
-		chatRepo:      options.ChatRepo,
-		assistant:     options.AssistantStreamer,
-		validator:     validator,
-		agentRegistry: agentRegistry,
-		toolRegistry:  toolRegistry,
-		toolExecutor:  toolExecutor,
-		generator:     options.Generator,
-		opts:          options.Loop.withDefaults(),
-		runLimiter:    newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
+		repo:             options.Repo,
+		chatRepo:         options.ChatRepo,
+		assistant:        options.AssistantStreamer,
+		validator:        validator,
+		agentRegistry:    agentRegistry,
+		toolRegistry:     toolRegistry,
+		skillRegistry:    skillRegistry,
+		toolExecutor:     toolExecutor,
+		generator:        options.Generator,
+		opts:             options.Loop.withDefaults(),
+		startupOverrides: cloneOverrides(options.ToolOverrides),
+		startupSkills:    cloneSkills(options.Skills),
+		runLimiter:       newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
 	}
 }
 
@@ -206,6 +224,96 @@ func (s *Service) ListAgents(_ context.Context) []domain.AgentDefinition {
 
 func (s *Service) ListTools(_ context.Context) []domain.ToolDefinition {
 	return s.toolRegistry.List()
+}
+
+// ListSkills 返回当前生效的技能定义。
+func (s *Service) ListSkills(_ context.Context) []domain.SkillDefinition {
+	return s.skillRegistry.List()
+}
+
+// ReloadTools 在运行时热重载工具覆盖与技能(纯内存、无文件 IO)。空请求或
+// Reset=true 时回滚到启动快照;否则以请求内容整组原子替换。两个注册表均为
+// RWMutex + 整表替换,执行中的 run 在 loop 起始已读取工具/技能快照,本次重载
+// 不会中途换工具,因此与并发运行的 run 安全共存。
+func (s *Service) ReloadTools(ctx context.Context, userID string, req ReloadToolsRequest) (ReloadToolsResult, error) {
+	if _, err := normalizeUserID(userID); err != nil {
+		return ReloadToolsResult{}, err
+	}
+
+	// 空请求体或显式 Reset:回滚到启动快照(深拷贝,避免后续 Set 影响快照)。
+	if req.Reset || (len(req.Overrides) == 0 && len(req.Skills) == 0) {
+		s.toolRegistry.SetOverrides(cloneOverrides(s.startupOverrides))
+		s.skillRegistry.SetSkills(cloneSkills(s.startupSkills))
+		return s.reloadResult(true), nil
+	}
+
+	skills := make([]domain.SkillDefinition, 0, len(req.Skills))
+	for _, skill := range req.Skills {
+		skills = append(skills, skill.toDomain())
+	}
+	if err := validateReloadSkills(skills); err != nil {
+		return ReloadToolsResult{}, &sharedErrors.AppError{
+			Code:    sharedErrors.CodeBadRequest,
+			Message: err.Error(),
+			Status:  http.StatusBadRequest,
+		}
+	}
+
+	overrides := make(map[string]domain.ToolOverride, len(req.Overrides))
+	for id, override := range req.Overrides {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		overrides[id] = domain.ToolOverride{
+			Enabled:     override.Enabled,
+			Description: override.Description,
+			TimeoutMS:   override.TimeoutMS,
+			ReadOnly:    override.ReadOnly,
+		}
+	}
+
+	s.toolRegistry.SetOverrides(overrides)
+	s.skillRegistry.SetSkills(skills)
+	return s.reloadResult(false), nil
+}
+
+// reloadResult 读回重载后的对外视图,统计工具启停与生效技能数。
+func (s *Service) reloadResult(reverted bool) ReloadToolsResult {
+	result := ReloadToolsResult{Reverted: reverted}
+	for _, tool := range s.toolRegistry.List() {
+		if tool.Enabled {
+			result.ToolsEnabled++
+		} else {
+			result.ToolsDisabled++
+		}
+	}
+	for _, skill := range s.skillRegistry.List() {
+		if skill.Enabled {
+			result.SkillsActive++
+		}
+	}
+	return result
+}
+
+// validateReloadSkills 校验技能合法性,规则与 config 层 validateAgentConfig 一致:
+// ID 非空且不重复、触发词与系统提示不同时为空(否则该技能既不会触发也无提示效果)。
+func validateReloadSkills(skills []domain.SkillDefinition) error {
+	seen := make(map[string]struct{}, len(skills))
+	for index, skill := range skills {
+		id := strings.TrimSpace(skill.ID)
+		if id == "" {
+			return fmt.Errorf("skills[%d].id must not be empty", index)
+		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("skills[%d].id %q is duplicated", index, id)
+		}
+		seen[id] = struct{}{}
+		if len(skill.Triggers) == 0 && strings.TrimSpace(skill.SystemPrompt) == "" {
+			return fmt.Errorf("skills[%d] (%s) must declare triggers or system_prompt", index, id)
+		}
+	}
+	return nil
 }
 
 func (s *Service) Route(ctx context.Context, userID string, req RouteAgentRequest) (domain.AgentRouteResult, error) {
@@ -865,11 +973,7 @@ func (s *Service) executeTool(ctx context.Context, tool domain.ToolDefinition, r
 	if s == nil || s.toolExecutor == nil {
 		return domain.ToolCallResult{}, errors.New("agent tool executor is unavailable")
 	}
-	queryCtx := ctx
-	cancel := func() {}
-	if tool.TimeoutMS > 0 {
-		queryCtx, cancel = context.WithTimeout(ctx, time.Duration(tool.TimeoutMS)*time.Millisecond)
-	}
+	queryCtx, cancel := ctxutil.WithOptionalTimeout(ctx, time.Duration(tool.TimeoutMS)*time.Millisecond)
 	defer cancel()
 	return s.toolExecutor.Execute(queryCtx, req)
 }
@@ -1044,6 +1148,32 @@ func containsAny(value string, keywords []string) bool {
 	return false
 }
 
+// cloneOverrides 深拷贝工具覆盖表,使启动快照独立于调用方与后续 SetOverrides。
+// ToolOverride 的指针字段指向调用方创建的不可变值,拷贝条目即足够(不经指针写回)。
+func cloneOverrides(overrides map[string]domain.ToolOverride) map[string]domain.ToolOverride {
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := make(map[string]domain.ToolOverride, len(overrides))
+	for id, override := range overrides {
+		out[id] = override
+	}
+	return out
+}
+
+// cloneSkills 深拷贝技能列表(含其 slice 字段),使启动快照独立于调用方与后续
+// SetSkills,避免共享底层数组被篡改。
+func cloneSkills(skills []domain.SkillDefinition) []domain.SkillDefinition {
+	if len(skills) == 0 {
+		return nil
+	}
+	out := make([]domain.SkillDefinition, 0, len(skills))
+	for _, skill := range skills {
+		out = append(out, cloneSkill(skill))
+	}
+	return out
+}
+
 func titleForAgentMessage(title string, content string) string {
 	trimmedTitle := strings.TrimSpace(title)
 	if trimmedTitle != "" && trimmedTitle != aiapplication.DEFAULT_SESSION_TITLE {
@@ -1074,18 +1204,10 @@ func summaryForAgentMessage(message aidomain.ChatMessage) string {
 }
 
 func mapChatRepositoryError(err error, notFoundMessage string) error {
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "not found") {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeNotFound,
-			Message: notFoundMessage,
-			Status:  http.StatusNotFound,
-			Err:     err,
-		}
-	}
-	return err
+	return sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
+		NotFoundCode:    sharedErrors.CodeNotFound,
+		NotFoundMessage: notFoundMessage,
+	})
 }
 
 func userFacingError(err error) string {

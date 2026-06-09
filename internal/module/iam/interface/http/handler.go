@@ -164,7 +164,7 @@ func (h *Handler) List(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": users})
+	response.OKList(c, users)
 }
 
 func (h *Handler) Get(c *gin.Context) {

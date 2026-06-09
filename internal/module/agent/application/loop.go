@@ -9,6 +9,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -55,9 +56,23 @@ func (s *Service) runLoop(
 	req RunAgentRequest,
 ) (answer string, alive bool, err error) {
 	tools := s.toolRegistry.ToolsForAgent(agent.Type)
-	specs, nameToID := s.buildToolSpecs(tools)
-
 	systemHistory := s.systemHistory(agent)
+
+	// 关键词触发的被动技能:命中则收窄工具集(交集)并追加专家提示词。未命中时
+	// allowedIDs 为 nil,后续校验与工具集均与无技能时逐字节一致(零回归)。
+	var allowedIDs map[string]struct{}
+	if skill, ok := s.skillRegistry.MatchForAgent(agent.Type, req.Message); ok {
+		tools = filterToolsByAllowed(tools, skill.AllowedTools)
+		systemHistory = appendSkillPrompt(systemHistory, skill)
+		// 仅在声明了白名单时设置 allowedIDs,使其成为 validateInvocation 的权威约束。
+		// 注意:若白名单工具全部无效(拼错/被禁用),交集为空,allowedIDs 为空集合,
+		// 模型将无可用工具——这是 fail-closed 的有意取舍:技能作为护栏可被用于把工具
+		// 收窄到安全子集,故宁可空集也不回退全量工具(否则会击穿护栏语义)。
+		if len(skill.AllowedTools) > 0 {
+			allowedIDs = toolIDSet(tools)
+		}
+	}
+	specs, nameToID := s.buildToolSpecs(tools)
 
 	var priorTurns []aiapplication.ToolCallTurn
 	tokenUsed := 0
@@ -102,7 +117,7 @@ func (s *Service) runLoop(
 		turn := aiapplication.ToolCallTurn{AssistantContent: reply.Content, ToolCalls: invocations}
 		planned := make([]plannedToolCall, 0, len(invocations))
 		for _, inv := range invocations {
-			result, ok := s.validateInvocation(run, agent, req, inv, nameToID, seen)
+			result, ok := s.validateInvocation(run, agent, req, inv, nameToID, seen, allowedIDs)
 			if !ok.valid {
 				turn.Results = append(turn.Results, errToolResult(inv, ok.reason))
 				continue
@@ -145,11 +160,7 @@ func (s *Service) think(
 	priorTurns []aiapplication.ToolCallTurn,
 	specs []aiapplication.ToolSpec,
 ) (aiapplication.AssistantReply, []aiapplication.ToolInvocation, bool, error) {
-	stepCtx := ctx
-	cancel := func() {}
-	if s.opts.StepTimeout > 0 {
-		stepCtx, cancel = context.WithTimeout(ctx, s.opts.StepTimeout)
-	}
+	stepCtx, cancel := ctxutil.WithOptionalTimeout(ctx, s.opts.StepTimeout)
 	defer cancel()
 
 	if s.streamThinkEnabled() {
@@ -208,11 +219,7 @@ func (s *Service) forceConclude(
 	content string,
 	priorTurns []aiapplication.ToolCallTurn,
 ) (string, bool, error) {
-	stepCtx := ctx
-	cancel := func() {}
-	if s.opts.StepTimeout > 0 {
-		stepCtx, cancel = context.WithTimeout(ctx, s.opts.StepTimeout)
-	}
+	stepCtx, cancel := ctxutil.WithOptionalTimeout(ctx, s.opts.StepTimeout)
 	defer cancel()
 
 	reply, _, err := s.generator.GenerateWithTools(stepCtx, history, content, priorTurns, nil, "none")
@@ -236,7 +243,9 @@ type validationResult struct {
 }
 
 // validateInvocation 校验模型请求的一次工具调用:工具存在、参数合法、只读且
-// 属于该 Agent、未重复。校验通过返回可执行的 plannedToolCall。
+// 属于该 Agent、未重复、且在当前技能允许范围内。校验通过返回可执行的
+// plannedToolCall。allowedIDs 非 nil 时,工具必须在该集合内(命中技能收窄);
+// 为 nil 表示未命中技能,不施加该约束(零行为变化)。
 func (s *Service) validateInvocation(
 	run domain.AgentRun,
 	agent domain.AgentDefinition,
@@ -244,36 +253,43 @@ func (s *Service) validateInvocation(
 	inv aiapplication.ToolInvocation,
 	nameToID map[string]string,
 	seen map[string]bool,
+	allowedIDs map[string]struct{},
 ) (plannedToolCall, validationResult) {
 	toolID, ok := resolveToolID(inv.Name, nameToID, s.toolRegistry)
 	if !ok {
 		return plannedToolCall{}, validationResult{reason: fmt.Sprintf("未知工具 %q", inv.Name)}
 	}
 	tool, ok := s.toolRegistry.Get(toolID)
-	if !ok || !tool.ReadOnly || !toolAllowedForAgent(tool, agent.Type) {
+	if !ok || !tool.Enabled || !tool.ReadOnly || !toolAllowedForAgent(tool, agent.Type) {
 		return plannedToolCall{}, validationResult{reason: fmt.Sprintf("工具 %q 不可用", toolID)}
+	}
+	// 技能收窄是权威约束:即使 resolveToolID 回退命中全表工具,也必须落在白名单内,
+	// 防止模型调用被技能过滤掉的工具。
+	if allowedIDs != nil {
+		if _, allowed := allowedIDs[toolID]; !allowed {
+			return plannedToolCall{}, validationResult{reason: fmt.Sprintf("工具 %q 不在当前技能允许范围内", toolID)}
+		}
 	}
 	if err := validateAgainstSchema(tool.Parameters, inv.Arguments); err != nil {
 		return plannedToolCall{}, validationResult{reason: fmt.Sprintf("参数非法: %s", err.Error())}
 	}
-	scope, err := argsToScope(req.Scope, inv.Arguments)
-	if err != nil {
-		return plannedToolCall{}, validationResult{reason: fmt.Sprintf("参数解析失败: %s", err.Error())}
-	}
 
-	key := dedupKey(toolID, scope, inv.Arguments)
+	key := dedupKey(toolID, req.Scope, inv.Arguments)
 	if seen[key] {
 		return plannedToolCall{}, validationResult{reason: "该工具与参数已调用过,请基于已有证据继续分析或给出结论"}
 	}
 	seen[key] = true
 
+	// loop 不替工具解析参数:K8s 专属的 Scope 合并由集群执行器在 Execute 内自行
+	// 完成(与监控类工具自解析 Arguments 对称),loop 仅透传预设 Scope 与原始
+	// Arguments,从而对工具的参数形状无知,任意数据源的工具都能接入。
 	toolReq := domain.ToolCallRequest{
 		RunID:     run.ID,
 		ToolID:    toolID,
 		AgentType: agent.Type,
 		ClusterID: req.ClusterID,
 		Message:   req.Message,
-		Scope:     scope,
+		Scope:     req.Scope,
 		Arguments: inv.Arguments,
 	}
 	return plannedToolCall{tool: tool, request: toolReq, inv: inv}, validationResult{valid: true}
@@ -406,6 +422,67 @@ func (s *Service) systemHistory(agent domain.AgentDefinition) []aiapplication.Me
 		return nil
 	}
 	return []aiapplication.MessageContext{{Role: "system", Content: prompt}}
+}
+
+// filterToolsByAllowed 仅保留 ID 在 allowed 白名单内的工具(技能收窄)。allowed
+// 为空表示技能不收窄,原样返回。这是纯后置过滤:只读/启用/归属等闸已在上游
+// ToolsForAgent 内先行,技能永远只能收窄、不能放宽工具集。
+func filterToolsByAllowed(tools []domain.ToolDefinition, allowed []string) []domain.ToolDefinition {
+	if len(allowed) == 0 {
+		return tools
+	}
+	set := make(map[string]struct{}, len(allowed))
+	for _, id := range allowed {
+		if id = strings.TrimSpace(id); id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	out := make([]domain.ToolDefinition, 0, len(tools))
+	for _, tool := range tools {
+		if _, ok := set[tool.ID]; ok {
+			out = append(out, tool)
+		}
+	}
+	return out
+}
+
+// appendSkillPrompt 把技能的 SystemPrompt 与 Hints 合并进系统提示。为兼容只认
+// 首条 system 消息的非标准 provider,优先把技能指引并入历史尾部已有的 system
+// 消息(而非新增第二条 system 消息);无既有 system 消息时才追加一条。无可追加
+// 内容时原样返回。
+func appendSkillPrompt(history []aiapplication.MessageContext, skill domain.SkillDefinition) []aiapplication.MessageContext {
+	lines := make([]string, 0, len(skill.Hints)+1)
+	if prompt := strings.TrimSpace(skill.SystemPrompt); prompt != "" {
+		lines = append(lines, prompt)
+	}
+	for _, hint := range skill.Hints {
+		if hint = strings.TrimSpace(hint); hint != "" {
+			lines = append(lines, hint)
+		}
+	}
+	if len(lines) == 0 {
+		return history
+	}
+	addition := strings.Join(lines, "\n\n")
+
+	// 并入尾部已有的 system 消息,保证只产生单条 system,避免多 system 在部分
+	// provider 上被丢弃。
+	if n := len(history); n > 0 && history[n-1].Role == "system" {
+		merged := make([]aiapplication.MessageContext, n)
+		copy(merged, history)
+		merged[n-1].Content = strings.TrimSpace(merged[n-1].Content + "\n\n" + addition)
+		return merged
+	}
+	return append(history, aiapplication.MessageContext{Role: "system", Content: addition})
+}
+
+// toolIDSet 收集工具 ID 集合,供 validateInvocation 做技能白名单权威校验。
+func toolIDSet(tools []domain.ToolDefinition) map[string]struct{} {
+	set := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		set[tool.ID] = struct{}{}
+	}
+	return set
 }
 
 func (s *Service) toolChoice() string {

@@ -2,10 +2,8 @@ package postgres
 
 import (
 	"context"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,8 +18,6 @@ type ChatRepository struct {
 	timeout time.Duration
 }
 
-type jsonbValue []byte
-
 type chatSessionRecord struct {
 	ID        string         `gorm:"primaryKey;size:48"`
 	UserID    string         `gorm:"size:128;not null;index"`
@@ -34,21 +30,21 @@ type chatSessionRecord struct {
 }
 
 type chatMessageRecord struct {
-	ID               string     `gorm:"primaryKey;size:56"`
-	SessionID        string     `gorm:"size:48;not null;index"`
-	Role             string     `gorm:"size:32;not null"`
-	Content          string     `gorm:"type:text;not null"`
-	ContentType      string     `gorm:"size:32;not null;default:'markdown'"`
-	Status           string     `gorm:"size:32;not null;default:'completed'"`
-	Sequence         int        `gorm:"not null"`
-	Provider         string     `gorm:"size:64;not null;default:''"`
-	Model            string     `gorm:"size:128;not null;default:''"`
-	Metadata         jsonbValue `gorm:"type:jsonb;not null;default:'{}'"`
-	PromptTokens     int        `gorm:"not null;default:0"`
-	CompletionTokens int        `gorm:"not null;default:0"`
-	TotalTokens      int        `gorm:"not null;default:0"`
-	ErrorMessage     string     `gorm:"type:text;not null;default:''"`
-	CreatedAt        time.Time  `gorm:"not null"`
+	ID               string           `gorm:"primaryKey;size:56"`
+	SessionID        string           `gorm:"size:48;not null;index"`
+	Role             string           `gorm:"size:32;not null"`
+	Content          string           `gorm:"type:text;not null"`
+	ContentType      string           `gorm:"size:32;not null;default:'markdown'"`
+	Status           string           `gorm:"size:32;not null;default:'completed'"`
+	Sequence         int              `gorm:"not null"`
+	Provider         string           `gorm:"size:64;not null;default:''"`
+	Model            string           `gorm:"size:128;not null;default:''"`
+	Metadata         dbplatform.JSONB `gorm:"type:jsonb;not null;default:'{}'"`
+	PromptTokens     int              `gorm:"not null;default:0"`
+	CompletionTokens int              `gorm:"not null;default:0"`
+	TotalTokens      int              `gorm:"not null;default:0"`
+	ErrorMessage     string           `gorm:"type:text;not null;default:''"`
+	CreatedAt        time.Time        `gorm:"not null"`
 	CompletedAt      *time.Time
 	DeletedAt        gorm.DeletedAt `gorm:"index"`
 }
@@ -63,30 +59,6 @@ func (chatMessageRecord) TableName() string {
 
 func NewChatRepository(db *gorm.DB, timeout time.Duration) *ChatRepository {
 	return &ChatRepository{db: db, timeout: timeout}
-}
-
-func (v jsonbValue) Value() (driver.Value, error) {
-	if len(v) == 0 {
-		return "{}", nil
-	}
-	if !json.Valid(v) {
-		return nil, fmt.Errorf("invalid jsonb value")
-	}
-	return string(v), nil
-}
-
-func (v *jsonbValue) Scan(value any) error {
-	switch data := value.(type) {
-	case nil:
-		*v = jsonbValue("{}")
-	case []byte:
-		*v = append((*v)[:0], data...)
-	case string:
-		*v = append((*v)[:0], data...)
-	default:
-		return fmt.Errorf("unsupported jsonb scan value %T", value)
-	}
-	return nil
 }
 
 func (r *ChatRepository) ListSessions(ctx context.Context, userID string) ([]domain.ChatSession, error) {
@@ -178,7 +150,7 @@ func (r *ChatRepository) DeleteSession(ctx context.Context, userID string, sessi
 	result := r.db.WithContext(queryCtx).
 		Where("id = ? AND user_id = ?", sessionID, userID).
 		Delete(&chatSessionRecord{})
-	return deleteResultError(result.Error, result.RowsAffected)
+	return dbplatform.DeleteResult(result.Error, result.RowsAffected)
 }
 
 func (r *ChatRepository) ListMessages(ctx context.Context, userID string, sessionID string) ([]domain.ChatMessage, error) {
@@ -304,7 +276,7 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 	record.Content = message.Content
 	record.Provider = message.Provider
 	record.Model = message.Model
-	record.Metadata = newJSONBValue(message.Metadata)
+	record.Metadata = dbplatform.NewJSONB(message.Metadata)
 	record.PromptTokens = message.PromptTokens
 	record.CompletionTokens = message.CompletionTokens
 	record.TotalTokens = message.TotalTokens
@@ -358,10 +330,7 @@ func toDomainSession(record chatSessionRecord) domain.ChatSession {
 		CreatedAt: record.CreatedAt,
 		UpdatedAt: record.UpdatedAt,
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		session.DeletedAt = &deletedAt
-	}
+	session.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return session
 }
 
@@ -398,10 +367,7 @@ func toDomainMessage(record chatMessageRecord) domain.ChatMessage {
 	if !isEmptyJSONObject(record.Metadata) {
 		message.Metadata = json.RawMessage(record.Metadata)
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		message.DeletedAt = &deletedAt
-	}
+	message.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return message
 }
 
@@ -416,7 +382,7 @@ func fromDomainMessage(message domain.ChatMessage) chatMessageRecord {
 		Sequence:         message.Sequence,
 		Provider:         message.Provider,
 		Model:            message.Model,
-		Metadata:         newJSONBValue(message.Metadata),
+		Metadata:         dbplatform.NewJSONB(message.Metadata),
 		PromptTokens:     message.PromptTokens,
 		CompletionTokens: message.CompletionTokens,
 		TotalTokens:      message.TotalTokens,
@@ -424,13 +390,6 @@ func fromDomainMessage(message domain.ChatMessage) chatMessageRecord {
 		CreatedAt:        message.CreatedAt,
 		CompletedAt:      message.CompletedAt,
 	}
-}
-
-func newJSONBValue(data []byte) jsonbValue {
-	if len(data) == 0 || !json.Valid(data) {
-		return jsonbValue("{}")
-	}
-	return append(jsonbValue(nil), data...)
 }
 
 func isEmptyJSONObject(data []byte) bool {
@@ -442,14 +401,4 @@ func isEmptyJSONObject(data []byte) bool {
 		return true
 	}
 	return len(value) == 0
-}
-
-func deleteResultError(err error, rowsAffected int64) error {
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }

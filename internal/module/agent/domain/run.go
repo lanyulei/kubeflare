@@ -1,11 +1,17 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"time"
 
 	aidomain "github.com/lanyulei/kubeflare/internal/module/ai/domain"
 )
+
+// MaxEvidenceRawSize 是单条证据 RawJSON 的上限。超限时只保留摘要 digest,
+// 避免把超大对象灌入存储与模型上下文。各执行器统一引用此常量。
+const MaxEvidenceRawSize = 65536
 
 const (
 	RUN_STATUS_PENDING   = "pending"
@@ -67,6 +73,25 @@ type Evidence struct {
 	Redacted        bool            `json:"redacted"`
 	CollectedAt     time.Time       `json:"collected_at"`
 	DeletedAt       *time.Time      `json:"deleted_at,omitempty"`
+}
+
+// WithRawJSON 把原始 JSON 落入证据并完成终态化:超过 MaxEvidenceRawSize 时替换为
+// 仅含 sha256/原始大小的摘要(避免灌入超大对象),据最终落库的 RawJSON 计算 Hash,
+// 并盖上采集时间戳。各执行器构造证据时统一调用此方法,保证截断/哈希/时间戳语义一致。
+func (e Evidence) WithRawJSON(rawJSON []byte) Evidence {
+	if len(rawJSON) > MaxEvidenceRawSize {
+		fullHash := sha256.Sum256(rawJSON)
+		rawJSON, _ = json.Marshal(map[string]any{
+			"truncated":     true,
+			"original_sha":  hex.EncodeToString(fullHash[:]),
+			"original_size": len(rawJSON),
+		})
+	}
+	sum := sha256.Sum256(rawJSON)
+	e.RawJSON = rawJSON
+	e.Hash = hex.EncodeToString(sum[:])
+	e.CollectedAt = time.Now().UTC()
+	return e
 }
 
 type AgentRunEvent struct {

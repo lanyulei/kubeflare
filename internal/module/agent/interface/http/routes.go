@@ -14,6 +14,8 @@ func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	agent.Use(middleware.RequireRolesGin("admin"))
 	agent.GET("", handler.ListAgent)
 	agent.GET("/tool", handler.ListTool)
+	agent.POST("/tool/reload", handler.Reload)
+	agent.GET("/skill", handler.ListSkill)
 	agent.POST("/route", handler.Route)
 	agent.POST("/:agentType/run/stream", handler.StreamRun)
 	agent.POST("/run/:runID/cancel", handler.CancelRun)

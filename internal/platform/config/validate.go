@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -161,6 +162,21 @@ func validateAgentConfig(cfg AgentConfig) error {
 	}
 	if cfg.Prometheus.QueryTimeout < 0 {
 		return errors.New("agent.prometheus.query_timeout must not be negative")
+	}
+	seenSkill := make(map[string]struct{}, len(cfg.Skills))
+	for index, skill := range cfg.Skills {
+		id := strings.TrimSpace(skill.ID)
+		if id == "" {
+			return fmt.Errorf("agent.skills[%d].id must not be empty", index)
+		}
+		if _, dup := seenSkill[id]; dup {
+			return fmt.Errorf("agent.skills[%d].id %q is duplicated", index, id)
+		}
+		seenSkill[id] = struct{}{}
+		// 触发词与系统提示同时为空的技能既不会被触发、也无提示效果,视为配置错误。
+		if len(skill.Triggers) == 0 && strings.TrimSpace(skill.SystemPrompt) == "" {
+			return fmt.Errorf("agent.skills[%d] (%s) must declare triggers or system_prompt", index, id)
+		}
 	}
 	return nil
 }

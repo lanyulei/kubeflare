@@ -2,8 +2,6 @@ package prometheus
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +16,6 @@ import (
 )
 
 const (
-	maxEvidenceRawSize = 65536
 	maxResultSeries    = 20
 	defaultRangeWindow = 30 * time.Minute
 )
@@ -207,22 +204,10 @@ func resultWithEvidence(summary string, evidence domain.Evidence) domain.ToolCal
 }
 
 func newEvidence(summary string, rawJSON []byte) domain.Evidence {
-	if len(rawJSON) > maxEvidenceRawSize {
-		fullHash := sha256.Sum256(rawJSON)
-		rawJSON, _ = json.Marshal(map[string]any{
-			"truncated":     true,
-			"original_sha":  hex.EncodeToString(fullHash[:]),
-			"original_size": len(rawJSON),
-		})
-	}
-	sum := sha256.Sum256(rawJSON)
 	return domain.Evidence{
-		SourceKind:  "metric",
-		APIGroup:    "monitoring",
-		APIVersion:  "v1",
-		Summary:     strings.TrimSpace(summary),
-		RawJSON:     rawJSON,
-		Hash:        hex.EncodeToString(sum[:]),
-		CollectedAt: time.Now().UTC(),
-	}
+		SourceKind: "metric",
+		APIGroup:   "monitoring",
+		APIVersion: "v1",
+		Summary:    strings.TrimSpace(summary),
+	}.WithRawJSON(rawJSON)
 }

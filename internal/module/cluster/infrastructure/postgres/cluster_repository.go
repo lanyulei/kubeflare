@@ -125,7 +125,7 @@ func (r *ClusterRepository) Delete(ctx context.Context, id int64) error {
 	defer cancel()
 
 	result := r.db.WithContext(queryCtx).Delete(&clusterInfoRecord{}, "id = ?", id)
-	return deleteResultError(result.Error, result.RowsAffected)
+	return dbplatform.DeleteResult(result.Error, result.RowsAffected)
 }
 
 func toDomainCluster(record clusterInfoRecord) domain.Cluster {
@@ -141,10 +141,7 @@ func toDomainCluster(record clusterInfoRecord) domain.Cluster {
 		CreatedAt:      record.CreateTime,
 		UpdatedAt:      record.UpdateTime,
 	}
-	if record.DeleteTime.Valid {
-		deletedAt := record.DeleteTime.Time
-		cluster.DeletedAt = &deletedAt
-	}
+	cluster.DeletedAt = dbplatform.DeletedAtPtr(record.DeleteTime)
 	return cluster
 }
 
@@ -161,14 +158,4 @@ func fromDomainCluster(cluster domain.Cluster) clusterInfoRecord {
 		CreateTime:     cluster.CreatedAt,
 		UpdateTime:     cluster.UpdatedAt,
 	}
-}
-
-func deleteResultError(err error, rowsAffected int64) error {
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }

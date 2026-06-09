@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
-	"gorm.io/gorm"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/lanyulei/kubeflare/internal/module/cluster/domain"
@@ -342,28 +341,12 @@ func (s *Service) decryptYaml(value string) (string, error) {
 }
 
 func mapRepositoryError(err error, notFoundMessage string) error {
-	if err == nil {
-		return nil
-	}
-
-	if err == gorm.ErrRecordNotFound || strings.Contains(strings.ToLower(err.Error()), "not found") {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeNotFound,
-			Message: notFoundMessage,
-			Status:  404,
-			Err:     err,
-		}
-	}
-	if err == gorm.ErrDuplicatedKey {
-		return &sharedErrors.AppError{
-			Code:    sharedErrors.CodeConflict,
-			Message: "cluster name already exists",
-			Status:  409,
-			Err:     err,
-		}
-	}
-
-	return err
+	return sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
+		NotFoundCode:    sharedErrors.CodeNotFound,
+		NotFoundMessage: notFoundMessage,
+		ConflictCode:    sharedErrors.CodeConflict,
+		ConflictMessage: "cluster name already exists",
+	})
 }
 
 func parseClusterID(value string) (int64, error) {

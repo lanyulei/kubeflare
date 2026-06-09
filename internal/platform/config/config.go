@@ -113,8 +113,46 @@ type AgentConfig struct {
 	Prompts map[string]string `koanf:"prompts"`
 	// PromptFiles 是 agentType -> system prompt 文件路径(次优先级)。
 	PromptFiles map[string]string `koanf:"prompt_files"`
+	// Tools 控制内置工具的治理(启停 / 元数据覆盖),不改代码即可裁剪暴露给
+	// LLM 的工具集。
+	Tools AgentToolsConfig `koanf:"tools"`
+	// Skills 是关键字触发的被动技能(命中后收窄工具集 + 追加系统提示),不引入
+	// 额外 LLM 调用。
+	Skills []AgentSkillConfig `koanf:"skills"`
 	// Prometheus 配置 Agent 如何经 K8s API Server 代理访问集群内 Prometheus。
 	Prometheus AgentPrometheusConfig `koanf:"prometheus"`
+}
+
+// AgentSkillConfig 声明一个被动技能。
+type AgentSkillConfig struct {
+	ID          string `koanf:"id"`
+	Name        string `koanf:"name"`
+	Description string `koanf:"description"`
+	// Enabled 启停该技能。nil 表示默认启用。
+	Enabled      *bool    `koanf:"enabled"`
+	AgentTypes   []string `koanf:"agent_types"`
+	Triggers     []string `koanf:"triggers"`
+	SystemPrompt string   `koanf:"system_prompt"`
+	AllowedTools []string `koanf:"allowed_tools"`
+	Hints        []string `koanf:"hints"`
+}
+
+// AgentToolsConfig 聚合工具治理配置。
+type AgentToolsConfig struct {
+	// Overrides 是工具 ID -> 覆盖补丁。仅覆盖显式提供的字段,未列出的工具与
+	// 字段保持内置默认。
+	Overrides map[string]AgentToolOverride `koanf:"overrides"`
+}
+
+// AgentToolOverride 是单个工具的配置覆盖。指针字段区分"未设置"与"设为零值",
+// 仅非 nil 的字段参与覆盖。
+type AgentToolOverride struct {
+	// Enabled 启停该工具。nil 表示不改动(保持启用)。
+	Enabled *bool `koanf:"enabled"`
+	// Description 覆盖工具描述(影响 LLM 选择)。nil 表示不改动。
+	Description *string `koanf:"description"`
+	// TimeoutMS 覆盖单次执行超时(毫秒)。nil 或 <=0 表示不改动。
+	TimeoutMS *int `koanf:"timeout_ms"`
 }
 
 // AgentPrometheusConfig 定位集群内 Prometheus 服务(经 API Server 代理访问)。

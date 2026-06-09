@@ -176,7 +176,7 @@ func (r *UserRepository) Delete(ctx context.Context, id int64) error {
 	defer cancel()
 
 	result := r.db.WithContext(queryCtx).Delete(&userRecord{}, "id = ?", id)
-	return deleteResultError(result.Error, result.RowsAffected)
+	return dbplatform.DeleteResult(result.Error, result.RowsAffected)
 }
 
 func (r *UserRepository) GetExternalIdentity(ctx context.Context, provider string, subject string) (domain.ExternalIdentity, error) {
@@ -248,10 +248,7 @@ func toDomainUser(record userRecord) domain.User {
 		CreatedAt:  record.CreatedAt,
 		UpdatedAt:  record.UpdatedAt,
 	}
-	if record.DeletedAt.Valid {
-		deletedAt := record.DeletedAt.Time
-		user.DeletedAt = &deletedAt
-	}
+	user.DeletedAt = dbplatform.DeletedAtPtr(record.DeletedAt)
 	return user
 }
 
@@ -300,14 +297,4 @@ func fromDomainExternalIdentity(identity domain.ExternalIdentity) externalIdenti
 		CreatedAt: identity.CreatedAt,
 		UpdatedAt: identity.UpdatedAt,
 	}
-}
-
-func deleteResultError(err error, rowsAffected int64) error {
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }

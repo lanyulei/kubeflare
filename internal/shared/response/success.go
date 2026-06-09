@@ -1,6 +1,8 @@
 package response
 
 import (
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
@@ -20,4 +22,10 @@ func OK(c *gin.Context, status int, data any) {
 		Data:      data,
 		RequestID: c.GetString("request_id"),
 	})
+}
+
+// OKList 返回 200 + {"items": items} 的列表响应。统一各列表接口的包裹形态,
+// 避免在多个 handler 重复 gin.H{"items": ...} 字面量。
+func OKList(c *gin.Context, items any) {
+	OK(c, http.StatusOK, gin.H{"items": items})
 }

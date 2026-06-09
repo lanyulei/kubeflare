@@ -21,7 +21,7 @@ func NewHandler(service *application.Service) *Handler {
 }
 
 func (h *Handler) GetStatus(c *gin.Context) {
-	if _, err := currentUserID(c); err != nil {
+	if _, err := middleware.RequireSubject(c); err != nil {
 		response.Error(c, err)
 		return
 	}
@@ -31,7 +31,7 @@ func (h *Handler) GetStatus(c *gin.Context) {
 }
 
 func (h *Handler) ListSession(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -42,11 +42,11 @@ func (h *Handler) ListSession(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": sessions})
+	response.OKList(c, sessions)
 }
 
 func (h *Handler) CreateSession(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -67,7 +67,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 }
 
 func (h *Handler) GetSession(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -82,7 +82,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 }
 
 func (h *Handler) UpdateSession(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -103,7 +103,7 @@ func (h *Handler) UpdateSession(c *gin.Context) {
 }
 
 func (h *Handler) DeleteSession(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -117,7 +117,7 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 }
 
 func (h *Handler) ListMessage(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -128,11 +128,11 @@ func (h *Handler) ListMessage(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.OK(c, http.StatusOK, gin.H{"items": messages})
+	response.OKList(c, messages)
 }
 
 func (h *Handler) CreateMessage(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -153,7 +153,7 @@ func (h *Handler) CreateMessage(c *gin.Context) {
 }
 
 func (h *Handler) StreamMessage(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -177,7 +177,7 @@ func (h *Handler) StreamMessage(c *gin.Context) {
 }
 
 func (h *Handler) CancelMessage(c *gin.Context) {
-	userID, err := currentUserID(c)
+	userID, err := middleware.RequireSubject(c)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -189,8 +189,4 @@ func (h *Handler) CancelMessage(c *gin.Context) {
 		return
 	}
 	response.OK(c, http.StatusOK, message)
-}
-
-func currentUserID(c *gin.Context) (string, error) {
-	return middleware.RequireSubject(c)
 }
