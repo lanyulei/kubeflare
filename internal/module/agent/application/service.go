@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -164,6 +163,7 @@ type Service struct {
 	chatRepo      chatMessageStore
 	assistant     assistantMessageStreamer
 	validator     *validation.Validate
+	runtimeRepo   domain.RuntimeConfigRepository
 	agentRegistry *AgentRegistry
 	toolRegistry  *ToolRegistry
 	skillRegistry *SkillRegistry
@@ -201,11 +201,12 @@ func NewService(options Options) *Service {
 		toolExecutor = NewToolDispatcher(toolRegistry, options.ToolExecutors...)
 	}
 
-	return &Service{
+	service := &Service{
 		repo:             options.Repo,
 		chatRepo:         options.ChatRepo,
 		assistant:        options.AssistantStreamer,
 		validator:        validator,
+		runtimeRepo:      runtimeConfigRepositoryFrom(options.Repo),
 		agentRegistry:    agentRegistry,
 		toolRegistry:     toolRegistry,
 		skillRegistry:    skillRegistry,
@@ -216,6 +217,8 @@ func NewService(options Options) *Service {
 		startupSkills:    cloneSkills(options.Skills),
 		runLimiter:       newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
 	}
+	service.loadPersistedRuntimeConfig(context.Background())
+	return service
 }
 
 func (s *Service) ListAgents(_ context.Context) []domain.AgentDefinition {
@@ -229,91 +232,6 @@ func (s *Service) ListTools(_ context.Context) []domain.ToolDefinition {
 // ListSkills 返回当前生效的技能定义。
 func (s *Service) ListSkills(_ context.Context) []domain.SkillDefinition {
 	return s.skillRegistry.List()
-}
-
-// ReloadTools 在运行时热重载工具覆盖与技能(纯内存、无文件 IO)。空请求或
-// Reset=true 时回滚到启动快照;否则以请求内容整组原子替换。两个注册表均为
-// RWMutex + 整表替换,执行中的 run 在 loop 起始已读取工具/技能快照,本次重载
-// 不会中途换工具,因此与并发运行的 run 安全共存。
-func (s *Service) ReloadTools(ctx context.Context, userID string, req ReloadToolsRequest) (ReloadToolsResult, error) {
-	if _, err := normalizeUserID(userID); err != nil {
-		return ReloadToolsResult{}, err
-	}
-
-	// 空请求体或显式 Reset:回滚到启动快照(深拷贝,避免后续 Set 影响快照)。
-	if req.Reset || (len(req.Overrides) == 0 && len(req.Skills) == 0) {
-		s.toolRegistry.SetOverrides(cloneOverrides(s.startupOverrides))
-		s.skillRegistry.SetSkills(cloneSkills(s.startupSkills))
-		return s.reloadResult(true), nil
-	}
-
-	skills := make([]domain.SkillDefinition, 0, len(req.Skills))
-	for _, skill := range req.Skills {
-		skills = append(skills, skill.toDomain())
-	}
-	if err := validateReloadSkills(skills); err != nil {
-		return ReloadToolsResult{}, &sharedErrors.AppError{
-			Code:    sharedErrors.CodeBadRequest,
-			Message: err.Error(),
-			Status:  http.StatusBadRequest,
-		}
-	}
-
-	overrides := make(map[string]domain.ToolOverride, len(req.Overrides))
-	for id, override := range req.Overrides {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		overrides[id] = domain.ToolOverride{
-			Enabled:     override.Enabled,
-			Description: override.Description,
-			TimeoutMS:   override.TimeoutMS,
-			ReadOnly:    override.ReadOnly,
-		}
-	}
-
-	s.toolRegistry.SetOverrides(overrides)
-	s.skillRegistry.SetSkills(skills)
-	return s.reloadResult(false), nil
-}
-
-// reloadResult 读回重载后的对外视图,统计工具启停与生效技能数。
-func (s *Service) reloadResult(reverted bool) ReloadToolsResult {
-	result := ReloadToolsResult{Reverted: reverted}
-	for _, tool := range s.toolRegistry.List() {
-		if tool.Enabled {
-			result.ToolsEnabled++
-		} else {
-			result.ToolsDisabled++
-		}
-	}
-	for _, skill := range s.skillRegistry.List() {
-		if skill.Enabled {
-			result.SkillsActive++
-		}
-	}
-	return result
-}
-
-// validateReloadSkills 校验技能合法性,规则与 config 层 validateAgentConfig 一致:
-// ID 非空且不重复、触发词与系统提示不同时为空(否则该技能既不会触发也无提示效果)。
-func validateReloadSkills(skills []domain.SkillDefinition) error {
-	seen := make(map[string]struct{}, len(skills))
-	for index, skill := range skills {
-		id := strings.TrimSpace(skill.ID)
-		if id == "" {
-			return fmt.Errorf("skills[%d].id must not be empty", index)
-		}
-		if _, dup := seen[id]; dup {
-			return fmt.Errorf("skills[%d].id %q is duplicated", index, id)
-		}
-		seen[id] = struct{}{}
-		if len(skill.Triggers) == 0 && strings.TrimSpace(skill.SystemPrompt) == "" {
-			return fmt.Errorf("skills[%d] (%s) must declare triggers or system_prompt", index, id)
-		}
-	}
-	return nil
 }
 
 func (s *Service) Route(ctx context.Context, userID string, req RouteAgentRequest) (domain.AgentRouteResult, error) {

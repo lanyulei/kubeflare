@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,8 +14,10 @@ import (
 )
 
 type AgentRepository struct {
-	db      *gorm.DB
-	timeout time.Duration
+	db                       *gorm.DB
+	timeout                  time.Duration
+	runtimeConfigSchemaMu    sync.Mutex
+	runtimeConfigSchemaReady bool
 }
 
 type agentRunRecord struct {

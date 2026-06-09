@@ -271,6 +271,7 @@ func (r *ToolRegistry) rebuildLocked() {
 	for id, tool := range r.base {
 		if override, ok := r.overrides[id]; ok {
 			tool = override.ApplyTo(tool)
+			tool.Overridden = true
 		}
 		next[id] = tool
 	}
@@ -301,6 +302,17 @@ func (r *ToolRegistry) List() []domain.ToolDefinition {
 		return tools[first].ID < tools[second].ID
 	})
 	return tools
+}
+
+// Overrides 返回当前工具覆盖补丁快照。调用方可用于审计、持久化或增量修改,
+// 返回值与 Registry 内部 map 相互独立。
+func (r *ToolRegistry) Overrides() map[string]domain.ToolOverride {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneOverrides(r.overrides)
 }
 
 // ToolsForAgent 返回某 Agent 可用的只读工具子集(按 ID 稳定排序),

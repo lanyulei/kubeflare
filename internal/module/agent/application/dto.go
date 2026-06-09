@@ -21,13 +21,16 @@ type RunAgentRequest struct {
 	Scope         domain.AgentScope `json:"scope"`
 }
 
-// ReloadToolsRequest 是 POST /agent/tool/reload 的请求体。整体为空(零值)或
-// Reset=true 时回滚到启动快照;否则以请求内容整组替换工具覆盖与技能(纯内存)。
+// ReloadToolsRequest 是 POST /agent/tool/reload 的请求体。工具 overrides 使用
+// 补丁语义:仅提交用户本次修改的差异;remove_overrides 用于把指定工具恢复到
+// 系统默认。Skills 字段出现时整组替换技能集合,nil 表示不改动技能。
 type ReloadToolsRequest struct {
 	// Reset 显式要求回滚到启动配置(与空请求体等价),便于调用方表达意图。
-	Reset     bool                          `json:"reset"`
-	Overrides map[string]ReloadToolOverride `json:"overrides"`
-	Skills    []ReloadSkill                 `json:"skills"`
+	Reset           bool                          `json:"reset"`
+	Reason          string                        `json:"reason" validate:"omitempty,max=512"`
+	RemoveOverrides []string                      `json:"remove_overrides"`
+	Overrides       map[string]ReloadToolOverride `json:"overrides"`
+	Skills          []ReloadSkill                 `json:"skills"`
 }
 
 // ReloadSkill 是 reload 请求中的技能(应用层 DTO,独立于 domain 类型)。Enabled
@@ -75,8 +78,17 @@ type ReloadToolOverride struct {
 
 // ReloadToolsResult 汇总一次重载后的对外视图。
 type ReloadToolsResult struct {
-	Reverted      bool `json:"reverted"`
-	ToolsEnabled  int  `json:"tools_enabled"`
-	ToolsDisabled int  `json:"tools_disabled"`
-	SkillsActive  int  `json:"skills_active"`
+	Reverted              bool   `json:"reverted"`
+	Changed               bool   `json:"changed"`
+	VersionID             string `json:"version_id,omitempty"`
+	Version               int64  `json:"version,omitempty"`
+	AuditID               string `json:"audit_id,omitempty"`
+	RolledBackFromVersion string `json:"rolled_back_from_version,omitempty"`
+	ToolsEnabled          int    `json:"tools_enabled"`
+	ToolsDisabled         int    `json:"tools_disabled"`
+	SkillsActive          int    `json:"skills_active"`
+}
+
+type RollbackRuntimeConfigRequest struct {
+	Reason string `json:"reason" validate:"omitempty,max=512"`
 }

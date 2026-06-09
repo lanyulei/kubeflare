@@ -18,3 +18,11 @@ type Repository interface {
 	// 标记为 failed,用于进程重启后回收无法继续的孤儿运行。返回受影响数量。
 	FailStaleRuns(ctx context.Context, before time.Time, errorMessage string) (int64, error)
 }
+
+type RuntimeConfigRepository interface {
+	GetLatestRuntimeConfigVersion(ctx context.Context) (RuntimeConfigVersion, error)
+	GetRuntimeConfigVersion(ctx context.Context, id string) (RuntimeConfigVersion, error)
+	CreateRuntimeConfigVersion(ctx context.Context, version RuntimeConfigVersion, audit RuntimeConfigAudit) (RuntimeConfigVersion, RuntimeConfigAudit, error)
+	ListRuntimeConfigVersions(ctx context.Context, limit int) ([]RuntimeConfigVersion, error)
+	ListRuntimeConfigAudits(ctx context.Context, versionID string, limit int) ([]RuntimeConfigAudit, error)
+}

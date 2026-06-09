@@ -65,6 +65,9 @@ type ToolDefinition struct {
 	// Enabled 表示该工具是否对 Agent 可用。为 false 时不进入 LLM 工具清单,
 	// 也不允许被调用。内置工具默认启用;可经配置(ToolOverride)关闭。
 	Enabled bool `json:"enabled"`
+	// Overridden 标识当前对外视图是否已叠加用户运行时覆盖,便于前端把
+	// 系统默认值与用户差异区分展示。未覆盖时省略以兼容旧响应。
+	Overridden bool `json:"overridden,omitempty"`
 	// Parameters 是该工具入参的 JSON Schema(object),供 LLM function calling
 	// 使用。omitempty 保证不影响既有 GET /agent/tool 响应结构。
 	Parameters json.RawMessage `json:"parameters,omitempty"`
@@ -75,14 +78,14 @@ type ToolDefinition struct {
 // 是工具治理的统一载体;后续 MCP 工具的可信只读白名单亦复用同一机制。
 type ToolOverride struct {
 	// Enabled 控制工具启停。nil 表示不改动。
-	Enabled *bool
+	Enabled *bool `json:"enabled,omitempty"`
 	// Description 覆盖工具描述(影响 LLM 选择)。nil/空表示不改动。
-	Description *string
+	Description *string `json:"description,omitempty"`
 	// TimeoutMS 覆盖单次执行超时。nil 或 <=0 表示不改动。
-	TimeoutMS *int
+	TimeoutMS *int `json:"timeout_ms,omitempty"`
 	// ReadOnly 覆盖只读标记。nil 表示不改动。仅用于外部来源工具的可信声明,
 	// 收紧(true→false)始终安全;放宽(false→true)由调用方自行担保可信。
-	ReadOnly *bool
+	ReadOnly *bool `json:"read_only,omitempty"`
 }
 
 // ApplyTo 把覆盖补丁施加到工具定义副本上并返回结果,不修改入参。仅覆盖显式

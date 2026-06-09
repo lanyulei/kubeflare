@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -62,6 +63,57 @@ func (h *Handler) Reload(c *gin.Context) {
 	}
 
 	result, err := h.service.ReloadTools(c.Request.Context(), userID, req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
+func (h *Handler) ListRuntimeConfigVersion(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	items, err := h.service.ListRuntimeConfigVersions(c.Request.Context(), userID, runtimeConfigLimit(c))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OKList(c, items)
+}
+
+func (h *Handler) ListRuntimeConfigAudit(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	items, err := h.service.ListRuntimeConfigAudits(c.Request.Context(), userID, c.Query("version_id"), runtimeConfigLimit(c))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OKList(c, items)
+}
+
+func (h *Handler) RollbackRuntimeConfigVersion(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	var req application.RollbackRuntimeConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.RollbackRuntimeConfigVersion(c.Request.Context(), userID, c.Param("versionID"), req)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -152,4 +204,9 @@ func clusterIDFromRequest(c *gin.Context, value string) string {
 		return value
 	}
 	return strings.TrimSpace(c.GetHeader("X-Cluster-ID"))
+}
+
+func runtimeConfigLimit(c *gin.Context) int {
+	limit, _ := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
+	return limit
 }
