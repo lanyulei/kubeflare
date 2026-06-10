@@ -760,7 +760,11 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 
 	// LLM 驱动的多步诊断循环:由模型自主决定调用哪些只读工具、如何下钻,
 	// 直到给出结论。规则规划已下线。
-	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req, chatContext.history)
+	answerMessageID := ""
+	if chatContext.enabled {
+		answerMessageID = chatContext.assistantMessage.ID
+	}
+	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req, chatContext.history, answerMessageID)
 	if !alive {
 		// 客户端断连,由上方 defer 兜底落 cancelled。
 		return

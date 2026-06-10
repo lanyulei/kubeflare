@@ -152,7 +152,7 @@ func TestRunLoopHappyPath(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		answer, alive, err = s.runLoop(context.Background(), context.Background(), events, run, diagnosticAgent(s), RunAgentRequest{Message: "why pod failing", ClusterID: "c1"}, nil)
+		answer, alive, err = s.runLoop(context.Background(), context.Background(), events, run, diagnosticAgent(s), RunAgentRequest{Message: "why pod failing", ClusterID: "c1"}, nil, "")
 	}()
 	evts := drain(events)
 
@@ -192,7 +192,7 @@ func TestRunLoopRejectsUnknownTool(t *testing.T) {
 	events := make(chan domain.AgentRunEvent, 64)
 	go func() {
 		defer close(events)
-		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil, "")
 	}()
 	drain(events)
 
@@ -218,7 +218,7 @@ func TestRunLoopDedup(t *testing.T) {
 	events := make(chan domain.AgentRunEvent, 64)
 	go func() {
 		defer close(events)
-		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil, "")
 	}()
 	drain(events)
 
@@ -248,7 +248,7 @@ func TestRunLoopMaxStepsForceConclude(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		answer, _, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
+		answer, _, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil, "")
 	}()
 	drain(events)
 
@@ -274,7 +274,7 @@ func TestRunLoopGeneratorError(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		_, alive, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
+		_, alive, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil, "")
 	}()
 	drain(events)
 
@@ -360,7 +360,7 @@ func TestRunLoopCarriesChatHistory(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "那怎么修复", ClusterID: "c"}, chatHistory)
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "那怎么修复", ClusterID: "c"}, chatHistory, "")
 		close(events)
 	}()
 	drain(events)

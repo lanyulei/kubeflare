@@ -67,6 +67,7 @@ func (s *Service) runLoop(
 	agent domain.AgentDefinition,
 	req RunAgentRequest,
 	chatHistory []aiapplication.MessageContext,
+	answerMessageID string,
 ) (answer string, alive bool, err error) {
 	tools := s.toolRegistry.ToolsForAgent(agent.Type)
 	systemHistory := s.systemHistory(agent)
@@ -185,7 +186,7 @@ func (s *Service) runLoop(
 					continue
 				}
 				answer = fallbackDiagnosticAnswer(req.Message, priorTurns)
-				if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer) {
+				if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer, answerMessageID) {
 					return "", false, nil
 				}
 				return answer, true, nil
@@ -199,7 +200,7 @@ func (s *Service) runLoop(
 						return "", false, nil
 					}
 					s.logAgentWarn("reflect answer", reflectErr, "run_id", run.ID)
-					return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer)
+					return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer, answerMessageID)
 				}
 				if verdict.level() != REFLECTION_VERDICT_SUPPORTED {
 					if guidance := reflectionGuidance(verdict); guidance != "" {
@@ -214,7 +215,7 @@ func (s *Service) runLoop(
 					}
 				}
 			}
-			return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer)
+			return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer, answerMessageID)
 		}
 
 		// 兜底补全空 tool_call ID:部分 provider 在非流式 function-calling 下省略 ID,
@@ -224,7 +225,7 @@ func (s *Service) runLoop(
 
 		// token 预算超限 → 强制收尾(预算判定包含计划/反思等旁路调用的消耗)。
 		if s.opts.MaxTokenBudget > 0 && tokenUsed+extraTokens > s.opts.MaxTokenBudget {
-			return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
+			return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns, answerMessageID)
 		}
 
 		turn := aiapplication.ToolCallTurn{AssistantContent: reply.Content, ToolCalls: invocations}
@@ -243,7 +244,7 @@ func (s *Service) runLoop(
 			errStreak++
 			priorTurns = append(priorTurns, turn)
 			if errStreak >= s.opts.MaxToolErrorsPerStep {
-				return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
+				return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns, answerMessageID)
 			}
 			continue
 		}
@@ -270,7 +271,7 @@ func (s *Service) runLoop(
 	}
 
 	// 达到 MaxSteps,强制收尾。
-	return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
+	return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns, answerMessageID)
 }
 
 // resolveRunSkill 选定本次 run 的技能:优先采纳路由阶段 LLM 给出的技能提示
@@ -356,13 +357,14 @@ func (s *Service) forceConcludeWithAnswerStream(
 	history []aiapplication.MessageContext,
 	content string,
 	priorTurns []aiapplication.ToolCallTurn,
+	answerMessageID string,
 ) (string, bool, error) {
-	return s.streamFinalAnswer(ctx, events, history, content, priorTurns, "")
+	return s.streamFinalAnswer(ctx, events, history, content, priorTurns, "", answerMessageID)
 }
 
 // streamFinalAnswer 是最终诊断正文的唯一出口:使用 tool_choice=none 重新请求模型,
-// 并把 provider 返回的每个 delta 原样转发为 agent.answer.delta。仅在 provider
-// 没有返回 delta、只给出完整 Content 时,才使用小片段兜底补发。
+// 并把 provider 返回的 delta 规范成小片段 agent.answer.delta。若 provider 没有
+// 返回 delta、只给出完整 Content,也按同一小片段节奏补发。
 func (s *Service) streamFinalAnswer(
 	ctx context.Context,
 	events chan<- domain.AgentRunEvent,
@@ -370,6 +372,7 @@ func (s *Service) streamFinalAnswer(
 	content string,
 	priorTurns []aiapplication.ToolCallTurn,
 	draft string,
+	answerMessageID string,
 ) (string, bool, error) {
 	stepCtx, cancel := ctxutil.WithOptionalTimeout(ctx, s.opts.StepTimeout)
 	defer cancel()
@@ -401,7 +404,7 @@ func (s *Service) streamFinalAnswer(
 		}
 		if event.Delta != "" {
 			answerBuilder.WriteString(event.Delta)
-			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: event.Delta}) {
+			if !sendSyntheticAnswerDeltas(ctx, events, event.Delta, answerMessageID) {
 				return "", false, nil
 			}
 		}
@@ -421,7 +424,7 @@ func (s *Service) streamFinalAnswer(
 	answer := strings.TrimSpace(answerBuilder.String())
 	if answer == "" {
 		answer = strings.TrimSpace(reply.Content)
-		if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer) {
+		if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer, answerMessageID) {
 			return "", false, nil
 		}
 	}
@@ -431,12 +434,12 @@ func (s *Service) streamFinalAnswer(
 	return answer, true, nil
 }
 
-func sendSyntheticAnswerDeltas(ctx context.Context, events chan<- domain.AgentRunEvent, answer string) bool {
+func sendSyntheticAnswerDeltas(ctx context.Context, events chan<- domain.AgentRunEvent, answer string, messageID string) bool {
 	for _, chunk := range chunkStringByRunes(answer, ANSWER_DELTA_CHUNK_RUNES) {
-		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: chunk}) {
+		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: chunk, MessageID: messageID}) {
 			return false
 		}
-		if len(chunk) >= ANSWER_DELTA_CHUNK_RUNES {
+		if len([]rune(chunk)) >= ANSWER_DELTA_CHUNK_RUNES {
 			select {
 			case <-ctx.Done():
 				return false
