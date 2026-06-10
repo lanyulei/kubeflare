@@ -9,6 +9,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
@@ -30,7 +31,7 @@ const (
 )
 
 // caseExtractSystemPrompt 指示 LLM 把一次成功诊断归档为可检索的结构化案例。
-const caseExtractSystemPrompt = `你是 Kubernetes 诊断案例归档员。给你用户问题与诊断结论,提取一条可供日后检索的结构化案例。
+const caseExtractSystemPrompt = `当前角色: Kubernetes 诊断案例归档员。给你用户问题与诊断结论,提取一条可供日后检索的结构化案例。
 只输出一个 JSON 对象,不要任何额外文字或代码块标记,格式:
 {"symptom":"<一句话症状描述>","root_cause":"<一句话根因>","tags":["<检索关键词>"]}
 要求:symptom 与 root_cause 各不超过 80 字;tags 不超过 6 个,使用小写英文术语或中文短词(如 "crashloopbackoff"、"oom"、"镜像拉取失败"),应是用户描述同类问题时可能用到的词;若结论未定位到明确根因,root_cause 填 "未定位到明确根因"。`
@@ -157,7 +158,7 @@ func (s *Service) recordDiagnosisCase(run domain.AgentRun) {
 
 		content := "用户问题:\n" + truncate(question, domain.MAX_DIAGNOSIS_CASE_TEXT_CHARS) +
 			"\n\n诊断结论:\n" + truncate(answer, MAX_CASE_EXTRACT_ANSWER_CHARS)
-		history := []aiapplication.MessageContext{{Role: "system", Content: caseExtractSystemPrompt}}
+		history := []aiapplication.MessageContext{{Role: "system", Content: llmprompt.WithIdentity(caseExtractSystemPrompt)}}
 
 		var extracted extractedCase
 		if _, err := s.generateJSON(extractCtx, history, content, &extracted); err != nil {

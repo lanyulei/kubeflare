@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 )
 
 const (
@@ -28,7 +29,7 @@ const (
 )
 
 // criticSystemPrompt 指示 LLM 以审查员视角分级校验候选结论被证据支持的程度。
-const criticSystemPrompt = `你是 Kubernetes 诊断结论的严格审查员。给你用户问题、已采集的证据摘要和候选结论,判断结论被证据支持的程度。
+const criticSystemPrompt = `当前角色: Kubernetes 诊断结论的严格审查员。给你用户问题、已采集的证据摘要和候选结论,判断结论被证据支持的程度。
 只输出一个 JSON 对象,不要任何额外文字或代码块标记,格式:
 {"verdict":"<supported|partially|unsupported>","gaps":["<证据缺口>"],"follow_up":"<建议补充采集的方向,一句中文>"}
 判定标准:结论的关键断言全部有证据支撑时为 supported;结论主体成立但个别断言缺少证据时为 partially;关键断言缺少证据支撑或与证据矛盾时为 unsupported。
@@ -88,7 +89,7 @@ func (s *Service) reflectAnswer(
 	content := "用户问题:\n" + strings.TrimSpace(question) +
 		"\n\n证据摘要:\n" + evidenceDigest(priorTurns) +
 		"\n\n候选结论:\n" + truncate(answer, MAX_REFLECT_ANSWER_CHARS)
-	history := []aiapplication.MessageContext{{Role: "system", Content: criticSystemPrompt}}
+	history := []aiapplication.MessageContext{{Role: "system", Content: llmprompt.WithIdentity(criticSystemPrompt)}}
 
 	var verdict reflectionVerdict
 	tokens, err := s.generateJSON(ctx, history, content, &verdict)

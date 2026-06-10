@@ -10,6 +10,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -546,7 +547,7 @@ func (s *Service) systemHistory(agent domain.AgentDefinition) []aiapplication.Me
 	if prompt == "" {
 		return nil
 	}
-	return []aiapplication.MessageContext{{Role: "system", Content: prompt}}
+	return []aiapplication.MessageContext{{Role: "system", Content: llmprompt.WithIdentity(prompt)}}
 }
 
 // filterToolsByAllowed 仅保留 ID 在 allowed 白名单内的工具(技能收窄)。allowed

@@ -9,6 +9,7 @@ import (
 
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -26,7 +27,7 @@ const (
 
 // observeCompressSystemPrompt 指示 LLM 面向当前用户问题压缩工具输出,只摘录
 // 事实、不做推断,确保压缩结果仍是"证据"而非"结论"。
-const observeCompressSystemPrompt = `你是 Kubernetes 诊断证据压缩器。给你用户问题和一段工具输出,请提取与问题最相关的关键信息,压缩为不超过指定字数的摘要。
+const observeCompressSystemPrompt = `当前角色: Kubernetes 诊断证据压缩器。给你用户问题和一段工具输出,请提取与问题最相关的关键信息,压缩为不超过指定字数的摘要。
 要求:保留错误信息、异常状态、关键数值、时间点与资源名等原文事实,尽量按原文措辞摘录;不要添加任何推断、解释或建议;直接输出摘要正文,不要任何前后缀。`
 
 // observeCompressionEnabled 判定是否启用观察智能压缩(配置开启且 generator 可用)。
@@ -96,7 +97,7 @@ func (s *Service) compressObservation(ctx context.Context, question string, obse
 
 	content := fmt.Sprintf("用户问题:\n%s\n\n字数上限:%d 字\n\n工具输出:\n%s",
 		strings.TrimSpace(question), budget, truncate(observation, OBSERVE_COMPRESS_INPUT_MAX_CHARS))
-	history := []aiapplication.MessageContext{{Role: "system", Content: observeCompressSystemPrompt}}
+	history := []aiapplication.MessageContext{{Role: "system", Content: llmprompt.WithIdentity(observeCompressSystemPrompt)}}
 	reply, err := s.generator.Generate(compressCtx, history, content)
 	if err != nil {
 		return "", 0, err

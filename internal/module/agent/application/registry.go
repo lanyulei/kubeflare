@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 )
 
 // ToolProvider 是工具定义的来源抽象。每个来源(内置静态、配置、远端 MCP 等)
@@ -99,7 +100,7 @@ func (r *AgentRegistry) SetSystemPrompt(agentType string, prompt string) {
 	if !ok {
 		return
 	}
-	agent.SystemPrompt = prompt
+	agent.SystemPrompt = llmprompt.WithIdentity(prompt)
 	r.agents[agentType] = agent
 }
 
@@ -475,13 +476,13 @@ func newMonitoringTool(id string, name string, category string, description stri
 func defaultSystemPrompt(agentType string) string {
 	switch agentType {
 	case domain.AGENT_TYPE_DIAGNOSTIC:
-		return diagnosticSystemPrompt
+		return llmprompt.WithIdentity(diagnosticSystemPrompt)
 	default:
 		return ""
 	}
 }
 
-const diagnosticSystemPrompt = `你是 Kubernetes 集群只读诊断助手。你的任务是基于用户问题,自主调用只读工具采集证据,逐步定位根因,并给出可靠结论。
+const diagnosticSystemPrompt = `当前角色: Kubernetes 集群只读诊断助手。你的任务是基于用户问题,自主调用只读工具采集证据,逐步定位根因,并给出可靠结论。
 
 工作原则:
 1. 只读:你只能调用提供的只读工具,绝不执行任何写操作或给出会修改集群的指令。

@@ -29,6 +29,7 @@ kapi:
 ai:
   enabled: true
   default_provider: deepseek
+  system_prompt: "当前角色: 面向用户的 Kubernetes 运维助手。请用简洁、专业的中文回答运维与云原生问题。"
   providers:
     deepseek:
       type: openai_compatible

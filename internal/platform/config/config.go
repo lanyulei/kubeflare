@@ -61,7 +61,8 @@ type KAPIConfig struct {
 type AIConfig struct {
 	Enabled         bool   `koanf:"enabled"`
 	DefaultProvider string `koanf:"default_provider"`
-	// SystemPrompt 是对话助手(非 Agent)的系统提示词,留空表示不注入。
+	// SystemPrompt 是对话助手(非 Agent)的系统提示词,留空表示使用
+	// Kubeflare 智能助手默认自我认知提示词。
 	SystemPrompt string                      `koanf:"system_prompt"`
 	Providers    map[string]AIProviderConfig `koanf:"providers"`
 }

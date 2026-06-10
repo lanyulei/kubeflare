@@ -7,11 +7,12 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 )
 
 // routeSystemPrompt 指示 LLM 在可用 Agent 或普通助手中选择最合适的路由,
 // 并以严格 JSON 返回。
-const routeSystemPrompt = `你是 Kubernetes 运维助手的路由分类器。根据用户问题和分析范围,从下列可用 Agent 或普通助手中选择最合适的路由。
+const routeSystemPrompt = `当前角色: Agent 路由分类器。根据用户问题和分析范围,从下列可用 Agent 或普通助手中选择最合适的路由。
 
 只输出一个 JSON 对象,不要任何额外文字或代码块标记,格式:
 {"agent_type":"<类型>","confidence":<0到1的小数>,"reason":"<中文简要理由>"}
@@ -54,7 +55,7 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 
 	// 路由学习启用时附加历史确认样例(few-shot,仅读内存缓存,空缓存时提示与
 	// 未启用学习时逐字节一致)。技能候选段同理:无已启用技能时为空串,零回归。
-	systemContent := fmt.Sprintf(routeSystemPrompt, agentCatalog(available))
+	systemContent := llmprompt.WithIdentity(fmt.Sprintf(routeSystemPrompt, agentCatalog(available)))
 	if s.routeLearningEnabled() {
 		systemContent += s.routeFewShotPromptSection()
 	}

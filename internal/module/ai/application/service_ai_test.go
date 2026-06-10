@@ -2,11 +2,13 @@ package application
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/domain"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 )
 
 // memRepo 是 domain.Repository 的最小内存实现,够 CreateMessage 路径使用。
@@ -159,8 +161,36 @@ func TestCreateMessageInjectsSystemPrompt(t *testing.T) {
 	if len(history) == 0 || history[0].Role != domain.MESSAGE_ROLE_SYSTEM {
 		t.Fatalf("expected system prompt at history[0], got %+v", history)
 	}
-	if history[0].Content != "你是测试助手" {
-		t.Errorf("system content = %q, want 你是测试助手", history[0].Content)
+	if history[0].Content != llmprompt.WithIdentity("你是测试助手") {
+		t.Errorf("system content = %q, want configured prompt with Kubeflare identity", history[0].Content)
+	}
+}
+
+func TestCreateMessageWrapsConfiguredSystemPromptWithIdentity(t *testing.T) {
+	repo := newMemRepo()
+	gen := &recordingGenerator{replies: []string{"答复内容"}}
+	configuredPrompt := "你是 Kubeflare 智能助手,请简洁回答"
+	svc := NewService(repo, nil, gen, configuredPrompt, nil)
+
+	now := time.Now().UTC()
+	repo.sessions["s1"] = domain.ChatSession{ID: "s1", UserID: "u1", Title: DEFAULT_SESSION_TITLE, CreatedAt: now, UpdatedAt: now}
+
+	if _, err := svc.CreateMessage(context.Background(), "u1", "s1", CreateMessageRequest{Content: "怎么排查 pod"}); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+
+	history := gen.firstHistory()
+	if len(history) == 0 || history[0].Role != domain.MESSAGE_ROLE_SYSTEM {
+		t.Fatalf("expected system prompt at history[0], got %+v", history)
+	}
+	if !strings.Contains(history[0].Content, llmprompt.AssistantName) {
+		t.Errorf("system content = %q, want Kubeflare identity", history[0].Content)
+	}
+	if !strings.Contains(history[0].Content, "DeepSeek") {
+		t.Errorf("system content = %q, want strong provider-identity boundary", history[0].Content)
+	}
+	if !strings.Contains(history[0].Content, configuredPrompt) {
+		t.Errorf("system content = %q, want configured prompt", history[0].Content)
 	}
 }
 

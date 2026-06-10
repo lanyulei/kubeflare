@@ -16,6 +16,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
+	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
 	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
@@ -52,7 +53,8 @@ type Service struct {
 	repo      domain.Repository
 	validator *validation.Validate
 	generator AssistantGenerator
-	// systemPrompt 是注入到每次对话最前的系统提示词,为空则不注入。
+	// systemPrompt 是注入到每次对话最前的系统提示词。配置为空时使用
+	// Kubeflare 智能助手的默认自我认知提示词。
 	systemPrompt string
 	logger       *slog.Logger
 	// activeStreams 记录正在进行流式生成的 assistantMessageID -> 取消函数,
@@ -81,11 +83,16 @@ func NewService(repo domain.Repository, validator *validation.Validate, generato
 	if logger == nil {
 		logger = slog.Default()
 	}
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	if systemPrompt == "" {
+		systemPrompt = llmprompt.DefaultAssistantSystemPrompt
+	}
+	systemPrompt = llmprompt.WithIdentity(systemPrompt)
 	return &Service{
 		repo:         repo,
 		validator:    validator,
 		generator:    generator,
-		systemPrompt: strings.TrimSpace(systemPrompt),
+		systemPrompt: systemPrompt,
 		logger:       logger,
 	}
 }
@@ -822,8 +829,8 @@ func summaryForMessage(message domain.ChatMessage) string {
 	return string(runes[:MAX_SUMMARY_LENGTH-3]) + "..."
 }
 
-// buildHistory 在历史对话上下文最前注入系统提示词(若已配置且历史中尚无
-// system 消息),作为每次对话的统一角色与边界设定。
+// buildHistory 在历史对话上下文最前注入系统提示词(若历史中尚无 system 消息),
+// 作为每次对话的统一角色与边界设定。
 func (s *Service) buildHistory(messages []domain.ChatMessage) []MessageContext {
 	history := toMessageContext(messages)
 	prompt := strings.TrimSpace(s.systemPrompt)
@@ -866,7 +873,7 @@ func (s *Service) generateTitle(ctx context.Context, userID string, session doma
 	if err != nil {
 		return
 	}
-	prompt := []MessageContext{{Role: domain.MESSAGE_ROLE_SYSTEM, Content: titleSystemPrompt}}
+	prompt := []MessageContext{{Role: domain.MESSAGE_ROLE_SYSTEM, Content: llmprompt.WithIdentity(titleSystemPrompt)}}
 	reply, err := s.assistantGenerator().Generate(ctx, prompt, truncateRunes(userContent, MAX_TITLE_SOURCE_CHARS))
 	if err != nil {
 		s.logger.Warn("generate chat title failed", "session", session.ID, "error", err)
