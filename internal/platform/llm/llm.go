@@ -138,7 +138,7 @@ type StreamEvent struct {
 }
 
 // ErrStreamingDisabled 表示 provider 关闭了流式输出。包装进 ProviderError.Err,
-// 调用方用 errors.Is 结构化判定后回退到非流式 Generate,避免脆弱的错误字符串匹配。
+// 调用方用 errors.Is 结构化判定后决定是否失败或显式走非流式 Generate。
 var ErrStreamingDisabled = errors.New("llm provider streaming is disabled")
 
 type ProviderError struct {

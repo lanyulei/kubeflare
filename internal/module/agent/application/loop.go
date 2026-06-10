@@ -20,8 +20,6 @@ const (
 	MAX_OBSERVE_CHARS = 2000
 	// MAX_OBSERVE_SUMMARY_CHARS 限制单条证据摘要回喂长度。
 	MAX_OBSERVE_SUMMARY_CHARS = 512
-	// ANSWER_DELTA_CHUNK_RUNES 控制非流式兜底正文按小片段补发。
-	ANSWER_DELTA_CHUNK_RUNES = 48
 	// MIN_DIAGNOSTIC_ANSWER_RUNES 是有工具证据时最终诊断的最低实质长度。
 	MIN_DIAGNOSTIC_ANSWER_RUNES = 80
 	// MAX_ANSWER_REWRITE_ATTEMPTS 限制模型输出空泛答案后的改写次数。
@@ -186,9 +184,6 @@ func (s *Service) runLoop(
 					continue
 				}
 				answer = fallbackDiagnosticAnswer(req.Message, priorTurns)
-				if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer, answerMessageID) {
-					return "", false, nil
-				}
 				return answer, true, nil
 			}
 			if reflections < s.opts.MaxReflections && answer != "" && s.reflectionEnabled() && s.reflectionBudgetLeft(tokenUsed+extraTokens) {
@@ -362,9 +357,9 @@ func (s *Service) forceConcludeWithAnswerStream(
 	return s.streamFinalAnswer(ctx, events, history, content, priorTurns, "", answerMessageID)
 }
 
-// streamFinalAnswer 是最终诊断正文的唯一出口:使用 tool_choice=none 重新请求模型,
-// 并把 provider 返回的 delta 规范成小片段 agent.answer.delta。若 provider 没有
-// 返回 delta、只给出完整 Content,也按同一小片段节奏补发。
+// streamFinalAnswer 是最终诊断正文的唯一流式出口:使用 tool_choice=none 重新请求模型,
+// 并把 provider 返回的 delta 原样转发为 agent.answer.delta。若 provider 没有返回
+// delta、只在完成事件给出完整 Content,则仅作为最终结果返回,不伪装成流式增量。
 func (s *Service) streamFinalAnswer(
 	ctx context.Context,
 	events chan<- domain.AgentRunEvent,
@@ -404,7 +399,7 @@ func (s *Service) streamFinalAnswer(
 		}
 		if event.Delta != "" {
 			answerBuilder.WriteString(event.Delta)
-			if !sendSyntheticAnswerDeltas(ctx, events, event.Delta, answerMessageID) {
+			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: event.Delta, MessageID: answerMessageID}) {
 				return "", false, nil
 			}
 		}
@@ -424,46 +419,11 @@ func (s *Service) streamFinalAnswer(
 	answer := strings.TrimSpace(answerBuilder.String())
 	if answer == "" {
 		answer = strings.TrimSpace(reply.Content)
-		if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer, answerMessageID) {
-			return "", false, nil
-		}
 	}
 	if answer == "" {
 		return "", true, fmt.Errorf("AI 未能基于已采集证据形成结论")
 	}
 	return answer, true, nil
-}
-
-func sendSyntheticAnswerDeltas(ctx context.Context, events chan<- domain.AgentRunEvent, answer string, messageID string) bool {
-	for _, chunk := range chunkStringByRunes(answer, ANSWER_DELTA_CHUNK_RUNES) {
-		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: chunk, MessageID: messageID}) {
-			return false
-		}
-		if len([]rune(chunk)) >= ANSWER_DELTA_CHUNK_RUNES {
-			select {
-			case <-ctx.Done():
-				return false
-			case <-time.After(20 * time.Millisecond):
-			}
-		}
-	}
-	return true
-}
-
-func chunkStringByRunes(value string, chunkSize int) []string {
-	if value == "" {
-		return nil
-	}
-	if chunkSize <= 0 {
-		return []string{value}
-	}
-	runes := []rune(value)
-	chunks := make([]string, 0, (len(runes)+chunkSize-1)/chunkSize)
-	for start := 0; start < len(runes); start += chunkSize {
-		end := min(start+chunkSize, len(runes))
-		chunks = append(chunks, string(runes[start:end]))
-	}
-	return chunks
 }
 
 func isSubstantiveDiagnosticAnswer(answer string, priorTurns []aiapplication.ToolCallTurn) bool {

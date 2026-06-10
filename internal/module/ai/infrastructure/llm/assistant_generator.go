@@ -2,17 +2,10 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"strings"
-	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/ai/application"
 	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
-)
-
-const (
-	syntheticStreamChunkRunes = 48
-	syntheticStreamChunkDelay = 20 * time.Millisecond
 )
 
 type AssistantGenerator struct {
@@ -56,13 +49,6 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 
 	stream, err := client.Stream(ctx, toChatRequest(history, content))
 	if err != nil {
-		if isStreamingDisabledError(err) {
-			reply, generateErr := generator.Generate(ctx, history, content)
-			if generateErr != nil {
-				return nil, generateErr
-			}
-			return singleReplyStream(ctx, reply), nil
-		}
 		return nil, err
 	}
 
@@ -131,8 +117,7 @@ func (generator *AssistantGenerator) GenerateWithTools(
 }
 
 // StreamWithTools 流式执行一步带工具的生成:文本增量实时转发,流结束时随 Done
-// 事件给出完整 Reply 与本步请求的工具调用。当 provider 关闭流式时,回退到
-// 一次性 GenerateWithTools 并合成单帧流。
+// 事件给出完整 Reply 与本步请求的工具调用。
 func (generator *AssistantGenerator) StreamWithTools(
 	ctx context.Context,
 	history []application.MessageContext,
@@ -153,13 +138,6 @@ func (generator *AssistantGenerator) StreamWithTools(
 	}
 	stream, err := client.Stream(ctx, request)
 	if err != nil {
-		if isStreamingDisabledError(err) {
-			reply, invocations, generateErr := generator.GenerateWithTools(ctx, history, content, priorTurns, tools, toolChoice)
-			if generateErr != nil {
-				return nil, generateErr
-			}
-			return singleToolReplyStream(ctx, reply, invocations), nil
-		}
 		return nil, err
 	}
 
@@ -234,32 +212,6 @@ func (generator *AssistantGenerator) client() (platformllm.Client, error) {
 	return generator.registry.DefaultClient()
 }
 
-func isStreamingDisabledError(err error) bool {
-	// 优先结构化判定:本项目 client 在禁用流式时包装 ErrStreamingDisabled。
-	if errors.Is(err, platformllm.ErrStreamingDisabled) {
-		return true
-	}
-	// 兼容回退:个别非标准 provider 可能以不同措辞返回禁用流式的错误。
-	var providerErr *platformllm.ProviderError
-	return errors.As(err, &providerErr) &&
-		providerErr.StatusCode == 0 &&
-		strings.Contains(strings.ToLower(providerErr.Message), "streaming is disabled")
-}
-
-func singleReplyStream(ctx context.Context, reply application.AssistantReply) <-chan application.AssistantStreamEvent {
-	events := make(chan application.AssistantStreamEvent, 8)
-	go func() {
-		defer close(events)
-		if strings.TrimSpace(reply.Content) != "" {
-			if !sendAssistantContentChunks(ctx, events, reply.Content) {
-				return
-			}
-		}
-		_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Done: true, Reply: reply})
-	}()
-	return events
-}
-
 func sendAssistantStreamEvent(ctx context.Context, events chan<- application.AssistantStreamEvent, event application.AssistantStreamEvent) bool {
 	select {
 	case <-ctx.Done():
@@ -276,73 +228,6 @@ func sendToolStreamEvent(ctx context.Context, events chan<- application.Assistan
 	case events <- event:
 		return true
 	}
-}
-
-// singleToolReplyStream 在 provider 关闭流式时,把一次性结果合成为小片段流。
-func singleToolReplyStream(ctx context.Context, reply application.AssistantReply, invocations []application.ToolInvocation) <-chan application.AssistantToolStreamEvent {
-	events := make(chan application.AssistantToolStreamEvent, 8)
-	go func() {
-		defer close(events)
-		if strings.TrimSpace(reply.Content) != "" {
-			if !sendToolContentChunks(ctx, events, reply.Content) {
-				return
-			}
-		}
-		_ = sendToolStreamEvent(ctx, events, application.AssistantToolStreamEvent{Done: true, Reply: reply, ToolCalls: invocations})
-	}()
-	return events
-}
-
-func sendAssistantContentChunks(ctx context.Context, events chan<- application.AssistantStreamEvent, content string) bool {
-	for _, chunk := range chunkStringByRunes(content, syntheticStreamChunkRunes) {
-		if !sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Delta: chunk}) {
-			return false
-		}
-		if !waitSyntheticStreamDelay(ctx, chunk) {
-			return false
-		}
-	}
-	return true
-}
-
-func sendToolContentChunks(ctx context.Context, events chan<- application.AssistantToolStreamEvent, content string) bool {
-	for _, chunk := range chunkStringByRunes(content, syntheticStreamChunkRunes) {
-		if !sendToolStreamEvent(ctx, events, application.AssistantToolStreamEvent{Delta: chunk}) {
-			return false
-		}
-		if !waitSyntheticStreamDelay(ctx, chunk) {
-			return false
-		}
-	}
-	return true
-}
-
-func waitSyntheticStreamDelay(ctx context.Context, chunk string) bool {
-	if len([]rune(chunk)) < syntheticStreamChunkRunes {
-		return true
-	}
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(syntheticStreamChunkDelay):
-		return true
-	}
-}
-
-func chunkStringByRunes(value string, chunkSize int) []string {
-	if value == "" {
-		return nil
-	}
-	if chunkSize <= 0 {
-		return []string{value}
-	}
-	runes := []rune(value)
-	chunks := make([]string, 0, (len(runes)+chunkSize-1)/chunkSize)
-	for start := 0; start < len(runes); start += chunkSize {
-		end := min(start+chunkSize, len(runes))
-		chunks = append(chunks, string(runes[start:end]))
-	}
-	return chunks
 }
 
 func toChatRequest(history []application.MessageContext, content string) platformllm.ChatRequest {

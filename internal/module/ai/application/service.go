@@ -727,6 +727,14 @@ func mapAssistantError(err error) error {
 			Err:     err,
 		}
 	}
+	if errors.Is(err, platformllm.ErrStreamingDisabled) {
+		return &sharedErrors.AppError{
+			Code:    sharedErrors.CodeInternal,
+			Message: platformllm.ErrStreamingDisabled.Error(),
+			Status:  http.StatusBadGateway,
+			Err:     err,
+		}
+	}
 
 	var providerErr *platformllm.ProviderError
 	if errors.As(err, &providerErr) {
