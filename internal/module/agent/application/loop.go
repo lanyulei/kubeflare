@@ -152,8 +152,10 @@ func (s *Service) runLoop(
 			}
 		}
 
-		// 非流式路径下整段补发一次 thinking;流式路径已逐 token 发送,不再重复。
-		if !streamed && strings.TrimSpace(reply.Content) != "" {
+		// 非流式路径下仅把"即将调用工具的中间说明"作为 thinking 发送。
+		// 无工具调用时 reply.Content 是最终答案,由上层以 answer.delta 统一发送,
+		// 避免最终正文同时出现在 thinking 和 answer 两条语义不同的事件里。
+		if !streamed && len(invocations) > 0 && strings.TrimSpace(reply.Content) != "" {
 			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_THINKING, Delta: reply.Content}) {
 				return "", false, nil
 			}
@@ -261,8 +263,9 @@ func (s *Service) resolveRunSkill(agentType string, req RunAgentRequest) (domain
 	return s.skillRegistry.MatchForAgent(agentType, req.Message)
 }
 
-// think 执行一步带工具的 LLM 生成,带单步超时保护。streamThink 开启时逐 token
-// 发送 thinking 事件并返回 streamed=true;否则一次性生成,由调用方补发 thinking。
+// think 执行一步带工具的 LLM 生成,带单步超时保护。streamThink 开启时使用流式
+// provider 获取结果,但仅在确认本步包含工具调用后发送 thinking;否则最终答案交由
+// 上层以 answer.delta 发送。非流式路径由调用方按同一规则补发 thinking。
 func (s *Service) think(
 	ctx context.Context,
 	events chan<- domain.AgentRunEvent,
@@ -282,7 +285,9 @@ func (s *Service) think(
 	return reply, invocations, false, err
 }
 
-// streamThink 以流式方式执行一步带工具生成,逐 token 发送 thinking 事件。
+// streamThink 以流式方式执行一步带工具生成。由于流结束前无法可靠判断本步是
+// "中间思考+工具调用"还是"最终答案",因此先缓冲文本;只有本步确实包含工具调用时
+// 才作为 thinking 发送。最终答案由上层统一通过 answer.delta 发送。
 // stepCtx 控制单步超时;eventCtx 用于事件发送(随客户端断连取消)。
 func (s *Service) streamThink(
 	stepCtx context.Context,
@@ -304,15 +309,15 @@ func (s *Service) streamThink(
 		if event.Err != nil {
 			return aiapplication.AssistantReply{}, nil, event.Err
 		}
-		if event.Delta != "" {
-			if !sendRunEvent(eventCtx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_THINKING, Delta: event.Delta}) {
-				// 客户端断连:返回错误让上层走断连分支(loop 会因 ctx.Err 收尾)。
-				return aiapplication.AssistantReply{}, nil, eventCtx.Err()
-			}
-		}
 		if event.Done {
 			reply = event.Reply
 			invocations = event.ToolCalls
+		}
+	}
+	if len(invocations) > 0 && strings.TrimSpace(reply.Content) != "" {
+		if !sendRunEvent(eventCtx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_THINKING, Delta: reply.Content}) {
+			// 客户端断连:返回错误让上层走断连分支(loop 会因 ctx.Err 收尾)。
+			return aiapplication.AssistantReply{}, nil, eventCtx.Err()
 		}
 	}
 	return reply, invocations, nil
@@ -477,7 +482,7 @@ func (s *Service) executeToolBatch(
 			call.ErrorMessage = userFacingError(execution.err)
 			call = s.updateToolCall(persistCtx, call)
 			outcomes[index] = execOutcome{toolID: call.ToolID, err: execution.err, executed: true}
-			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_TOOL_FAILED, ToolCall: &call, ErrorMessage: call.ErrorMessage}) {
+			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_TOOL_FAILED, ToolCall: &call}) {
 				return outcomes, false
 			}
 			continue
