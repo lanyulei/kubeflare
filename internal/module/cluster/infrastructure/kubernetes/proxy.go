@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +32,10 @@ import (
 var osReadFile = os.ReadFile
 
 const CLUSTER_ID_HEADER = "X-Cluster-ID"
+
+// maxWrappedResponseBytes 限制需读入内存重新封装的(非流式)apiserver 响应体大小,
+// 防止超大 list 全量物化导致 OOM。流式/二进制响应走 passthrough,不受此限制。
+const maxWrappedResponseBytes = 32 << 20 // 32 MiB
 
 type KubeconfigProvider interface {
 	KubeconfigForProxy(ctx context.Context, id string) (string, error)
@@ -60,6 +66,12 @@ type ProxyHandler struct {
 	allowAnyOrigin    bool
 	blockedNamespaces map[string]struct{}
 	limiter           *sessionLimiter
+	// transportCache 按 kubeconfig 内容哈希缓存 rest.Transport。此前每个请求都重新
+	// 解析 kubeconfig 并 rest.TransportFor(每次新建 http.Transport),使到 apiserver
+	// 的连接池/ TLS 握手完全无法复用,高并发下产生大量 TCP/FD 开销。缓存后同一
+	// 集群的请求共享连接池;kubeconfig 变化(哈希变化)自然失效旧条目。
+	transportMu    sync.Mutex
+	transportCache map[string]http.RoundTripper
 }
 
 type upstreamStatus struct {
@@ -85,6 +97,7 @@ func NewProxyHandlerWithSecurity(provider KubeconfigProvider, timeout time.Durat
 		allowedOrigins:    make(map[string]struct{}),
 		blockedNamespaces: make(map[string]struct{}),
 		limiter:           newSessionLimiter(opts.MaxConcurrentSessionsPerUser),
+		transportCache:    make(map[string]http.RoundTripper),
 	}
 	for _, raw := range opts.AllowedOrigins {
 		origin := strings.TrimSpace(raw)
@@ -188,17 +201,23 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// default; operators must explicitly remove a namespace from the
 		// blocklist to allow access.
 		ns, _, _, isExec := parseExecTarget(upstreamPath, r.URL.Query())
-		if isExec && h.isNamespaceBlocked(ns) {
+		if isExec && (strings.TrimSpace(ns) == "" || h.isNamespaceBlocked(ns)) {
+			// fail-closed:exec/attach/portforward 必须能解析出命名空间才能比对黑名单。
+			// 解析不出(非规范路径/路径构造)时拒绝,而非放行——否则黑名单可被绕过。
+			blockedNS := ns
+			if strings.TrimSpace(blockedNS) == "" {
+				blockedNS = "(unresolved)"
+			}
 			slog.Default().Warn("kapi upgrade namespace blocked",
 				"request_id", requestID,
 				"cluster_id", clusterID,
-				"namespace", ns,
+				"namespace", blockedNS,
 			)
 			response.HTTPError(w, requestID, &sharedErrors.AppError{
 				Code:    sharedErrors.CodeForbidden,
-				Message: fmt.Sprintf("namespace %q is protected against exec/attach/portforward", ns),
+				Message: fmt.Sprintf("namespace %q is protected against exec/attach/portforward", blockedNS),
 				Status:  http.StatusForbidden,
-				Err:     fmt.Errorf("namespace %q is on blocklist", ns),
+				Err:     fmt.Errorf("namespace %q is blocked or unresolved", blockedNS),
 			})
 			return
 		}
@@ -210,7 +229,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		restConfig.Timeout = h.timeout
 	}
 
-	target, transport, err := proxyTarget(restConfig)
+	target, transport, err := h.proxyTargetCached(kubeconfig, restConfig)
 	if err != nil {
 		response.HTTPError(w, requestID, &sharedErrors.AppError{
 			Code:    sharedErrors.CodeInternal,
@@ -222,6 +241,10 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := &httputil.ReverseProxy{
+		// passthrough(watch / follow-logs / SSE / 二进制流)需立即下发,不能缓冲;
+		// FlushInterval=-1 让 ReverseProxy 每次写入即 flush。非流式响应会被
+		// ModifyResponse 替换为一次性 body,该设置对其无副作用。
+		FlushInterval: -1,
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
@@ -233,7 +256,9 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// upstream Kubernetes API server or its access logs.
 			query.Del("clusterId")
 			query.Del("access_token")
-			if nodeKeyword != "" {
+			// 仅在实际执行节点关键字过滤(非 passthrough)时才剥离 keyword。watch 等
+			// passthrough 请求不做过滤,若仍剥离会让前端"以为在过滤实则无效"。
+			if nodeKeyword != "" && !passThrough {
 				query.Del("keyword")
 			}
 			req.URL.RawQuery = query.Encode()
@@ -507,9 +532,9 @@ func (h *ProxyHandler) serveUpgrade(
 
 	go func() {
 		defer wg.Done()
+		defer recoverCopyPanic(logger, requestID, clusterID, "client->upstream")
 		clientReader := combineReaders(clientBuf.Reader, clientConn)
-		var dst io.Writer = upstreamConn
-		_, _ = io.Copy(dst, clientReader)
+		copyWithIdleTimeout(upstreamConn, clientReader, clientConn, upstreamConn)
 		if cw, ok := upstreamConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -517,8 +542,9 @@ func (h *ProxyHandler) serveUpgrade(
 	}()
 	go func() {
 		defer wg.Done()
+		defer recoverCopyPanic(logger, requestID, clusterID, "upstream->client")
 		upstreamReaderCombined := combineReaders(upstreamReader, upstreamConn)
-		_, _ = io.Copy(clientConn, upstreamReaderCombined)
+		copyWithIdleTimeout(clientConn, upstreamReaderCombined, clientConn, upstreamConn)
 		if cw, ok := clientConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -533,6 +559,52 @@ func (h *ProxyHandler) serveUpgrade(
 
 type closeWriter interface {
 	CloseWrite() error
+}
+
+// upgradeIdleTimeout 是 exec/attach 等长连接的空闲超时。半开连接(客户端无 FIN
+// 消失)会让 io.Copy 永久阻塞,导致 goroutine + FD + 上游连接泄露;每次成功读写
+// 后把双端读截止时间向后推,持续空闲超过该时长则强制断开回收。
+const upgradeIdleTimeout = 10 * time.Minute
+
+type deadlineConn interface {
+	SetReadDeadline(t time.Time) error
+}
+
+// copyWithIdleTimeout 在 src→dst 拷贝的同时维护空闲超时:每读到数据就把两端的读
+// 截止时间向后推。持续空闲超过 upgradeIdleTimeout,底层读会超时返回,从而解除
+// io.Copy 阻塞并触发连接回收。clientConn/upstreamConn 用于刷新各自的读截止时间。
+func copyWithIdleTimeout(dst io.Writer, src io.Reader, clientConn, upstreamConn net.Conn) {
+	buf := make([]byte, 32*1024)
+	refresh := func() {
+		deadline := time.Now().Add(upgradeIdleTimeout)
+		if c, ok := clientConn.(deadlineConn); ok {
+			_ = c.SetReadDeadline(deadline)
+		}
+		if c, ok := upstreamConn.(deadlineConn); ok {
+			_ = c.SetReadDeadline(deadline)
+		}
+	}
+	for {
+		refresh()
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+// recoverCopyPanic 兜底 hijack 后拷贝 goroutine 的 panic。此时 ResponseWriter 已
+// 失效,panic 会逃逸到无 recover 的裸 goroutine 直接 crash 进程,这里就地恢复。
+func recoverCopyPanic(logger *slog.Logger, requestID, clusterID, direction string) {
+	if r := recover(); r != nil {
+		logger.Error("kapi upgrade copy panic recovered",
+			"request_id", requestID, "cluster_id", clusterID, "direction", direction, "panic", r)
+	}
 }
 
 // combineReaders concatenates a bufio.Reader (whose buffered bytes must be
@@ -658,6 +730,12 @@ func dialUpstream(ctx context.Context, config *rest.Config, target *url.URL) (ne
 	}
 
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	// 复用 restConfig.Dial(若配置),与非升级路径(rest.TransportFor 会使用它)
+	// 行为一致,支持需自定义拨号/ egress 的环境;未配置则用默认 TCP 拨号。
+	dialContext := dialer.DialContext
+	if config.Dial != nil {
+		dialContext = config.Dial
+	}
 	switch target.Scheme {
 	case "https":
 		tlsConfig, err := rest.TLSConfigFor(config)
@@ -676,9 +754,18 @@ func dialUpstream(ctx context.Context, config *rest.Config, target *url.URL) (ne
 				tlsConfig.ServerName = hostOnly
 			}
 		}
-		return tls.DialWithDialer(dialer, "tcp", host, tlsConfig)
+		rawConn, err := dialContext(ctx, "tcp", host)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
 	case "http":
-		return dialer.DialContext(ctx, "tcp", host)
+		return dialContext(ctx, "tcp", host)
 	default:
 		return nil, fmt.Errorf("unsupported scheme %q", target.Scheme)
 	}
@@ -721,17 +808,50 @@ func flattenHeaders(h http.Header) string {
 	return b.String()
 }
 
-func proxyTarget(config *rest.Config) (*url.URL, http.RoundTripper, error) {
+// proxyTargetCached 复用按 kubeconfig 哈希缓存的 transport,避免每个请求都新建
+// http.Transport 而打穿到 apiserver 的连接池。rest.TransportFor 返回的 RoundTripper
+// 不含 client 级超时,故对 passthrough/非 passthrough 请求复用同一 transport 是安全的。
+func (h *ProxyHandler) proxyTargetCached(kubeconfig string, config *rest.Config) (*url.URL, http.RoundTripper, error) {
 	target, err := url.Parse(config.Host)
 	if err != nil || target.Scheme == "" || target.Host == "" {
 		return nil, nil, fmt.Errorf("invalid kubernetes host")
 	}
 
-	transport, err := rest.TransportFor(config)
+	key := hashKubeconfig(kubeconfig)
+	h.transportMu.Lock()
+	transport, ok := h.transportCache[key]
+	h.transportMu.Unlock()
+	if ok {
+		return target, transport, nil
+	}
+
+	transport, err = rest.TransportFor(config)
 	if err != nil {
 		return nil, nil, err
 	}
+	h.transportMu.Lock()
+	h.transportCache[key] = transport
+	h.transportMu.Unlock()
 	return target, transport, nil
+}
+
+// hashKubeconfig 计算 kubeconfig 的 SHA-256 哈希作为 transport 缓存键。kubeconfig
+// 变化即键变化,旧 transport 自然不再命中(后续可由 Invalidate 主动清理)。
+func hashKubeconfig(kubeconfig string) string {
+	sum := sha256.Sum256([]byte(kubeconfig))
+	return hex.EncodeToString(sum[:])
+}
+
+// Invalidate 清理与某集群相关的缓存。由于 transport 按 kubeconfig 内容寻址而非
+// clusterID,这里直接清空整个缓存(集群变更频率低,代价可忽略),确保更新/删除
+// 后不再复用旧端点的连接池。
+func (h *ProxyHandler) Invalidate(string) {
+	if h == nil {
+		return
+	}
+	h.transportMu.Lock()
+	h.transportCache = make(map[string]http.RoundTripper)
+	h.transportMu.Unlock()
 }
 
 func rewriteKubernetesPath(path string) (string, bool) {
@@ -807,11 +927,21 @@ func shouldPassThroughResponse(resp *http.Response) bool {
 }
 
 func wrapKubernetesResponse(resp *http.Response, requestID string, nodeKeyword string) error {
-	body, err := io.ReadAll(resp.Body)
+	// 限制读入内存的响应体大小,防止超大 list(或恶意/异常的巨大对象)被全量
+	// 物化并重新编码造成 OOM。流式/二进制响应走 passthrough,不经此函数。
+	limited := io.LimitReader(resp.Body, maxWrappedResponseBytes+1)
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		return err
 	}
 	_ = resp.Body.Close()
+	if int64(len(body)) > maxWrappedResponseBytes {
+		return replaceResponseBody(resp, http.StatusBadGateway, proxyEnvelope{
+			Code:      errorCodeForStatus(http.StatusBadGateway),
+			Message:   "kubernetes response too large to process; refine the query (e.g. add a label selector or limit)",
+			RequestID: requestID,
+		})
+	}
 
 	data, isJSON := decodeResponseData(body, resp.Header.Get("Content-Type"))
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
@@ -846,8 +976,13 @@ func decodeResponseData(body []byte, contentType string) (any, bool) {
 		mediaType = contentType
 	}
 	if strings.Contains(strings.ToLower(mediaType), "json") {
+		// 用 UseNumber 保留 json.Number,避免默认把数字解析为 float64 后再 Marshal
+		// 时把超过 2^53 的大整型(如 resourceVersion / 大 int64 字段)改成科学计数
+		// 法或丢精度。普通数字 json.Number 原样回写,字节兼容。
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.UseNumber()
 		var value any
-		if err := json.Unmarshal(body, &value); err == nil {
+		if err := decoder.Decode(&value); err == nil {
 			return value, true
 		}
 	}

@@ -104,6 +104,32 @@ type AgentConfig struct {
 	// StreamThink 控制 Agent think 阶段是否流式输出(token 级 thinking 事件),
 	// nil 表示默认开启。
 	StreamThink *bool `koanf:"stream_think"`
+	// Planning 控制循环开始前的显式计划生成(一次额外 LLM 调用,产出假设与验证
+	// 步骤并注入上下文),nil 表示默认开启。失败自动降级为无计划运行。
+	Planning *bool `koanf:"planning"`
+	// Reflection 控制结论产出前的反思自检(一次 critic LLM 调用,证据不足时注入
+	// 缺口指引并允许补充取证),nil 表示默认开启。失败自动保留原结论。
+	Reflection *bool `koanf:"reflection"`
+	// MaxReflectionSteps 反思触发后允许追加的最大 think 步数,0 表示禁用追加
+	// (反思仅提示不补证)。
+	MaxReflectionSteps int `koanf:"max_reflection_steps"`
+	// MaxReflections 每次运行允许的最大反思轮数(1-3,每轮一次 critic 调用,
+	// 未通过则补证)。0 表示沿用默认 1;禁用反思请置 reflection: false。
+	MaxReflections int `koanf:"max_reflections"`
+	// ObserveCompression 控制超长工具观察的智能压缩:超出回喂预算时用一次 LLM
+	// 调用按当前问题压缩关键信息(失败回退硬截断)。提升日志/事件类证据的信息
+	// 密度,但每条超长观察多一次 LLM 调用,默认关闭。
+	ObserveCompression bool `koanf:"observe_compression"`
+	// CaseLibrary 控制诊断案例库:run 成功后异步提取"症状→根因"结构化案例,
+	// 相似问题以 few-shot 回灌系统提示,形成跨 run 经验记忆。nil 表示默认开启。
+	CaseLibrary *bool `koanf:"case_library"`
+	// CaseFewShotLimit 注入系统提示的相似案例条数上限(0-8),0 表示只归档不注入。
+	CaseFewShotLimit int `koanf:"case_few_shot_limit"`
+	// RouteLearning 控制路由置信度学习(记录用户显式选择 Agent 的反馈,并以
+	// few-shot 样例回灌 LLM 路由提示),nil 表示默认开启。
+	RouteLearning *bool `koanf:"route_learning"`
+	// RouteFewShotLimit 路由提示中携带的历史确认样例条数上限。
+	RouteFewShotLimit int `koanf:"route_few_shot_limit"`
 	// MaxConcurrentRunsPerUser 限制单个用户同时执行的 Agent run 数量,防止单个
 	// 用户瞬间发起大量 run 打爆 LLM 配额与集群 apiserver。0 表示不限(不推荐)。
 	MaxConcurrentRunsPerUser int `koanf:"max_concurrent_runs_per_user"`
@@ -153,6 +179,9 @@ type AgentToolOverride struct {
 	Description *string `koanf:"description"`
 	// TimeoutMS 覆盖单次执行超时(毫秒)。nil 或 <=0 表示不改动。
 	TimeoutMS *int `koanf:"timeout_ms"`
+	// ObserveMaxChars 覆盖该工具单步回喂给 LLM 的观察文本上限(字符)。
+	// nil 或 <=0 表示不改动(沿用工具内置值或全局默认)。
+	ObserveMaxChars *int `koanf:"observe_max_chars"`
 }
 
 // AgentPrometheusConfig 定位集群内 Prometheus 服务(经 API Server 代理访问)。
@@ -271,11 +300,15 @@ func Default() Config {
 			Providers: map[string]AIProviderConfig{},
 		},
 		Agent: AgentConfig{
-			MaxSteps:                 6,
-			MaxTokenBudget:           60000,
+			MaxSteps:                 10,
+			MaxTokenBudget:           120000,
 			MaxToolErrorsPerStep:     3,
 			StepTimeout:              60 * time.Second,
 			ToolChoice:               "auto",
+			MaxReflectionSteps:       2,
+			MaxReflections:           1,
+			CaseFewShotLimit:         3,
+			RouteFewShotLimit:        8,
 			MaxConcurrentRunsPerUser: 3,
 			MaxConcurrentRuns:        50,
 			Prometheus: AgentPrometheusConfig{

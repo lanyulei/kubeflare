@@ -26,9 +26,15 @@ type AgentDefinition struct {
 }
 
 type AgentRouteResult struct {
-	AgentType    string           `json:"agent_type"`
-	Confidence   float64          `json:"confidence"`
-	Reason       string           `json:"reason"`
+	AgentType  string  `json:"agent_type"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+	// Source 标识本次路由结论的来源(llm/keyword/user),见 ROUTE_SOURCE_*。
+	// omitempty 兼容既有消费方。
+	Source string `json:"source,omitempty"`
+	// SkillID 是路由 LLM 顺带给出的技能命中提示(已校验存在/启用/适用),为空
+	// 表示未命中;loop 据此选定技能,失败回退关键词匹配。omitempty 兼容既有消费方。
+	SkillID      string           `json:"skill_id,omitempty"`
 	NeedConfirm  bool             `json:"need_confirm"`
 	Candidates   []AgentCandidate `json:"candidates,omitempty"`
 	Alternatives []string         `json:"alternatives,omitempty"`

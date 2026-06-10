@@ -78,6 +78,21 @@ func (r *SkillRegistry) List() []domain.SkillDefinition {
 	return skills
 }
 
+// Get 按 ID 返回技能定义的深拷贝,供路由技能提示的合法性校验与 loop 的技能
+// 选定使用。
+func (r *SkillRegistry) Get(id string) (domain.SkillDefinition, bool) {
+	if r == nil {
+		return domain.SkillDefinition{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	skill, ok := r.skills[strings.TrimSpace(id)]
+	if !ok {
+		return domain.SkillDefinition{}, false
+	}
+	return cloneSkill(skill), true
+}
+
 // MatchForAgent 为给定 Agent 与用户消息选出最匹配的已启用技能:命中关键词最多者
 // 胜出,同分时取声明顺序最先者(确定性)。无命中返回 ok=false。返回值为深拷贝,
 // 调用方无法影响注册表状态。

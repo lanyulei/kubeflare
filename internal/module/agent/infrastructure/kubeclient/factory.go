@@ -98,8 +98,32 @@ func (f *Factory) cached(clusterID string) *kubernetes.Clientset {
 func (f *Factory) store(clusterID string, clientset *kubernetes.Clientset) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// 顺带回收已过期条目,避免一次性访问的集群永久驻留(每条持有一个 HTTP
+	// transport / 连接池),造成内存与空闲连接的无界增长。
+	now := f.now()
+	for id, entry := range f.cache {
+		if !now.Before(entry.expiresAt) {
+			delete(f.cache, id)
+		}
+	}
 	f.cache[clusterID] = cacheEntry{
 		clientset: clientset,
-		expiresAt: f.now().Add(f.ttl),
+		expiresAt: now.Add(f.ttl),
 	}
+}
+
+// Invalidate 立即移除指定集群的缓存条目。集群 kubeconfig 更新或删除后调用,确保
+// 不会在 TTL 窗口内继续使用旧凭证/旧端点。clusterID 为空时清空整个缓存。
+func (f *Factory) Invalidate(clusterID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		f.cache = map[string]cacheEntry{}
+		return
+	}
+	delete(f.cache, clusterID)
 }

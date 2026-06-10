@@ -465,6 +465,30 @@ func (r *AuthStateRepository) ConsumeOIDCState(ctx context.Context, state string
 	return result.RowsAffected == 1, nil
 }
 
+// ClaimOnce 复用一次性状态表实现原子占用:依赖主键唯一约束 + ON CONFLICT DO
+// NOTHING,首次插入 RowsAffected==1 返回 true,重复占用为 0 返回 false。键加
+// "once:" 前缀与 OIDC state 命名空间隔离。过期行由 CleanupExpired 统一回收。
+func (r *AuthStateRepository) ClaimOnce(ctx context.Context, key string, expiresAt time.Time) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("security state store is unavailable")
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	result := r.db.WithContext(queryCtx).
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&oidcStateRecord{
+			State:     "once:" + key,
+			ExpiresAt: expiresAt,
+			CreatedAt: time.Now().UTC(),
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
 func toDomainLoginFailure(record loginFailureRecord) domain.LoginFailure {
 	return domain.LoginFailure{
 		Key:         record.Key,

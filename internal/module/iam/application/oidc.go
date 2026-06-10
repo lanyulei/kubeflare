@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"strings"
 	"time"
@@ -39,6 +40,15 @@ type oidcClaims struct {
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
 	Name          string `json:"name"`
+	Nonce         string `json:"nonce"`
+}
+
+// OIDCLoginChallenge 携带需写入浏览器 Cookie 的一次性绑定值。state 绑定浏览器可
+// 防 login-CSRF;nonce 写入授权请求并在 id_token 中回验,防 id_token 重放。
+type OIDCLoginChallenge struct {
+	AuthURL string
+	State   string
+	Nonce   string
 }
 
 func NewOIDCService(ctx context.Context, cfg OIDCConfig, repo domain.Repository, tokenIssuer TokenIssuer, stateStore domain.SecurityStateStore) (*OIDCService, error) {
@@ -68,18 +78,30 @@ func NewOIDCService(ctx context.Context, cfg OIDCConfig, repo domain.Repository,
 	}, nil
 }
 
-func (s *OIDCService) LoginURL(ctx context.Context) (string, error) {
-	state := newOpaqueValue()
+func (s *OIDCService) LoginURL(ctx context.Context) (OIDCLoginChallenge, error) {
 	if s.stateStore == nil {
-		return "", unauthorized("oidc state store is unavailable", nil)
+		return OIDCLoginChallenge{}, unauthorized("oidc state store is unavailable", nil)
 	}
+	state := newOpaqueValue()
+	nonce := newOpaqueValue()
 	if err := s.stateStore.SaveOIDCState(ctx, state, time.Now().UTC().Add(10*time.Minute)); err != nil {
-		return "", err
+		return OIDCLoginChallenge{}, err
 	}
-	return s.oauthConfig.AuthCodeURL(state), nil
+	return OIDCLoginChallenge{
+		AuthURL: s.oauthConfig.AuthCodeURL(state, oidc.Nonce(nonce)),
+		State:   state,
+		Nonce:   nonce,
+	}, nil
 }
 
-func (s *OIDCService) Callback(ctx context.Context, state string, code string) (LoginResponse, error) {
+// Callback 校验回调。expectedState/expectedNonce 来自浏览器 Cookie:state 必须与
+// 发起登录的浏览器一致(防 login-CSRF),nonce 必须与 id_token 内声明一致(防重放)。
+func (s *OIDCService) Callback(ctx context.Context, state string, code string, expectedState string, expectedNonce string) (LoginResponse, error) {
+	state = strings.TrimSpace(state)
+	// 先比对浏览器绑定的 state,再查服务端存储,任一不符即拒绝。
+	if expectedState == "" || subtle.ConstantTimeCompare([]byte(state), []byte(strings.TrimSpace(expectedState))) != 1 {
+		return LoginResponse{}, unauthorized("invalid oidc state", nil)
+	}
 	stateOK, err := s.hasState(ctx, state)
 	if err != nil {
 		return LoginResponse{}, err
@@ -102,6 +124,11 @@ func (s *OIDCService) Callback(ctx context.Context, state string, code string) (
 	var claims oidcClaims
 	if err := idToken.Claims(&claims); err != nil {
 		return LoginResponse{}, err
+	}
+	// 校验 nonce:必须存在且与浏览器 Cookie 一致,抵御 id_token 重放。
+	if strings.TrimSpace(expectedNonce) == "" ||
+		subtle.ConstantTimeCompare([]byte(strings.TrimSpace(claims.Nonce)), []byte(strings.TrimSpace(expectedNonce))) != 1 {
+		return LoginResponse{}, unauthorized("invalid oidc nonce", nil)
 	}
 	stateOK, err = s.consumeState(ctx, state)
 	if err != nil {

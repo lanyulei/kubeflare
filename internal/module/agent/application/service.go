@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -19,12 +20,14 @@ import (
 	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
+	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
 const (
 	STREAM_EVENT_AGENT_ROUTE_COMPLETED  = "agent.route.completed"
 	STREAM_EVENT_AGENT_RUN_CREATED      = "agent.run.created"
 	STREAM_EVENT_AGENT_PLAN_CREATED     = "agent.plan.created"
+	STREAM_EVENT_AGENT_PLAN_GENERATED   = "agent.plan.generated"
 	STREAM_EVENT_AGENT_THINKING         = "agent.thinking"
 	STREAM_EVENT_AGENT_TOOL_STARTED     = "agent.tool.started"
 	STREAM_EVENT_AGENT_TOOL_COMPLETED   = "agent.tool.completed"
@@ -41,8 +44,8 @@ const (
 	// 在加速诊断的同时避免对单个集群 apiserver 形成过大瞬时压力。
 	MAX_TOOL_CONCURRENCY = 4
 
-	// loop 引擎默认参数(可被配置覆盖)。
-	DEFAULT_MAX_STEPS                = 6
+	// loop 引擎默认参数(可被配置覆盖,与 config.Default() 保持一致)。
+	DEFAULT_MAX_STEPS                = 10
 	DEFAULT_MAX_TOOL_ERRORS_PER_STEP = 3
 	DEFAULT_STEP_TIMEOUT             = 60 * time.Second
 
@@ -57,6 +60,7 @@ type ToolExecutor interface {
 
 type chatMessageStore interface {
 	GetSession(ctx context.Context, userID string, sessionID string) (aidomain.ChatSession, error)
+	ListMessages(ctx context.Context, userID string, sessionID string) ([]aidomain.ChatMessage, error)
 	AppendMessages(ctx context.Context, userID string, sessionID string, messages []aidomain.ChatMessage, session aidomain.ChatSession) (aidomain.ChatSession, []aidomain.ChatMessage, error)
 	UpdateSession(ctx context.Context, session aidomain.ChatSession) (aidomain.ChatSession, error)
 	UpdateMessage(ctx context.Context, userID string, message aidomain.ChatMessage) (aidomain.ChatMessage, error)
@@ -71,6 +75,9 @@ type runChatContext struct {
 	session          aidomain.ChatSession
 	userMessage      aidomain.ChatMessage
 	assistantMessage aidomain.ChatMessage
+	// history 是本次 run 之前同会话内已完成的对话上下文(含既往 Agent 运行写回
+	// 的诊断结论),随 loop 一并发送给 LLM,使追问类问题具备跨 run 的诊断记忆。
+	history []aiapplication.MessageContext
 }
 
 type chatMessageAgentMetadata struct {
@@ -98,6 +105,28 @@ type LoopConfig struct {
 	LLMRouting *bool
 	// StreamThink 控制 think 阶段是否流式输出。nil 默认开。
 	StreamThink *bool
+	// Planning 控制循环开始前的显式计划生成。nil 默认开;失败降级为无计划运行。
+	Planning *bool
+	// Reflection 控制结论产出前的反思自检。nil 默认开;失败保留原结论。
+	Reflection *bool
+	// MaxReflectionSteps 反思触发后允许追加的最大 think 步数。
+	MaxReflectionSteps int
+	// MaxReflections 每 run 允许的最大反思轮数(每轮一次 critic 调用,未通过则
+	// 注入缺口指引补证)。<=0 回退默认 1(保持既有"每 run 至多一次"语义);
+	// 禁用反思请置 Reflection=false 或 MaxReflectionSteps=0。
+	MaxReflections int
+	// ObserveCompression 控制超长工具观察的智能压缩(超出回喂预算时按当前问题
+	// 用 LLM 压缩关键信息,失败回退硬截断)。默认关闭。
+	ObserveCompression bool
+	// CaseLibrary 控制诊断案例库(run 成功后异步提取"症状→根因"案例,相似问题
+	// 以 few-shot 回灌系统提示)。nil 默认开;仓储不支持时静默关闭。
+	CaseLibrary *bool
+	// CaseFewShotLimit 注入系统提示的相似案例条数上限。
+	CaseFewShotLimit int
+	// RouteLearning 控制路由置信度学习(反馈记录 + few-shot 回灌)。nil 默认开。
+	RouteLearning *bool
+	// RouteFewShotLimit 路由提示中携带的历史确认样例条数上限。
+	RouteFewShotLimit int
 	// MaxConcurrentRunsPerUser 限制单个用户同时执行的 run 数,<=0 表示不限。
 	MaxConcurrentRunsPerUser int
 	// MaxConcurrentRuns 限制全实例同时执行的 run 总数,<=0 表示不限。
@@ -128,6 +157,39 @@ func (c LoopConfig) withDefaults() LoopConfig {
 		enabled := true
 		c.StreamThink = &enabled
 	}
+	if c.Planning == nil {
+		enabled := true
+		c.Planning = &enabled
+	}
+	if c.Reflection == nil {
+		enabled := true
+		c.Reflection = &enabled
+	}
+	// 显式 0 是合法值(禁用反思补证/不携带 few-shot 样例),仅钳负值;
+	// 生效默认值(2/8)由 config.Default() 提供。
+	if c.MaxReflectionSteps < 0 {
+		c.MaxReflectionSteps = 0
+	}
+	// 反思轮数 <=0 回退 1,保持既有"每 run 至多一次 critic"的行为;禁用反思走
+	// Reflection / MaxReflectionSteps。
+	if c.MaxReflections <= 0 {
+		c.MaxReflections = 1
+	}
+	if c.CaseLibrary == nil {
+		enabled := true
+		c.CaseLibrary = &enabled
+	}
+	// 显式 0 合法(只归档不注入);生效默认值(3)由 config.Default() 提供。
+	if c.CaseFewShotLimit < 0 {
+		c.CaseFewShotLimit = 0
+	}
+	if c.RouteLearning == nil {
+		enabled := true
+		c.RouteLearning = &enabled
+	}
+	if c.RouteFewShotLimit < 0 {
+		c.RouteFewShotLimit = 0
+	}
 	return c
 }
 
@@ -156,6 +218,8 @@ type Options struct {
 	// SystemPrompts 是 agentType -> system prompt 的覆盖(已由 bootstrap 解析
 	// 内联与文件来源),为空的项保留代码内置默认。
 	SystemPrompts map[string]string
+	// Logger 可选。用于记录持久化失败等旁路错误,为 nil 时不记录。
+	Logger *slog.Logger
 }
 
 type Service struct {
@@ -170,6 +234,14 @@ type Service struct {
 	toolExecutor  ToolExecutor
 	generator     aiapplication.AssistantGenerator
 	opts          LoopConfig
+	// feedbackRepo / feedbackStore 是路由置信度学习的可选仓储(类型断言获取,
+	// 缺失即关闭)与内存样例缓存(路由热路径只读内存,不查库)。
+	feedbackRepo  domain.RouteFeedbackRepository
+	feedbackStore *routeFeedbackStore
+	// caseRepo / caseStore 是诊断案例库的可选仓储(类型断言获取,缺失即关闭)与
+	// 内存案例缓存(注入热路径只读内存,不查库)。
+	caseRepo  domain.DiagnosisCaseRepository
+	caseStore *diagnosisCaseStore
 	// startupOverrides / startupSkills 是 NewService 时捕获的启动配置快照(深拷贝),
 	// 供 ReloadTools 在收到空请求时回滚到启动态。与调用方及后续 SetXxx 相互独立。
 	startupOverrides map[string]domain.ToolOverride
@@ -180,6 +252,9 @@ type Service struct {
 	// activeRuns 记录正在执行的 runID -> 取消函数,供 CancelRun 主动中断后台
 	// goroutine,停止继续消耗 token 与发起集群查询。
 	activeRuns sync.Map
+	// logger 用于记录持久化失败等"运行可继续但需可观测"的旁路错误。为 nil 时
+	// 退化为不记录,不影响主流程。
+	logger *slog.Logger
 }
 
 func NewService(options Options) *Service {
@@ -213,11 +288,34 @@ func NewService(options Options) *Service {
 		toolExecutor:     toolExecutor,
 		generator:        options.Generator,
 		opts:             options.Loop.withDefaults(),
+		feedbackRepo:     routeFeedbackRepositoryFrom(options.Repo),
+		feedbackStore:    newRouteFeedbackStore(MAX_ROUTE_FEEDBACK_CACHE),
+		caseRepo:         diagnosisCaseRepositoryFrom(options.Repo),
+		caseStore:        newDiagnosisCaseStore(MAX_DIAGNOSIS_CASE_CACHE),
 		startupOverrides: cloneOverrides(options.ToolOverrides),
 		startupSkills:    cloneSkills(options.Skills),
 		runLimiter:       newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
+		logger:           options.Logger,
 	}
 	service.loadPersistedRuntimeConfig(context.Background())
+	// 异步预热路由反馈样例缓存:不阻塞启动,失败仅告警(缓存为空时路由行为与
+	// 未启用学习时一致)。
+	if service.routeLearningEnabled() {
+		safego.Go(service.logger, "agent route feedback warmup", func() {
+			warmupCtx, cancel := context.WithTimeout(context.Background(), ROUTE_FEEDBACK_WARMUP_TIMEOUT)
+			defer cancel()
+			service.loadRouteFeedback(warmupCtx)
+		})
+	}
+	// 异步预热诊断案例缓存:同路由反馈,不阻塞启动,失败仅告警(缓存为空时
+	// 注入行为与未启用案例库时一致)。
+	if service.caseLibraryEnabled() {
+		safego.Go(service.logger, "agent diagnosis case warmup", func() {
+			warmupCtx, cancel := context.WithTimeout(context.Background(), CASE_WARMUP_TIMEOUT)
+			defer cancel()
+			service.loadDiagnosisCases(warmupCtx)
+		})
+	}
 	return service
 }
 
@@ -302,6 +400,16 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 	if route.AgentType != agent.Type {
 		route.AgentType = agent.Type
 	}
+	// 把路由阶段的技能提示带入 run(loop 内仍会按选定 Agent 校验其合法性,
+	// 非法回退关键词匹配,fail-closed)。
+	req.routedSkillID = route.SkillID
+
+	// 路由学习:用户显式选择 Agent(route.Source=user)即一条人工确认样本。
+	// 放在可用性校验之后,无效选择不污染样本集;缓存同步更新、落库异步,任何
+	// 失败都不影响本次 run。
+	if s.routeLearningEnabled() && route.Source == domain.ROUTE_SOURCE_USER {
+		s.recordRouteFeedback(normalizedUserID, req, agent.Type)
+	}
 
 	// 并发准入:超过 per-user 或全局上限时拒绝,避免瞬时大量 run 打爆 LLM
 	// 配额与集群 apiserver。必须在创建 run 记录、启动后台 goroutine 之前判定。
@@ -326,6 +434,9 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 	runCtx, cancelRun := context.WithCancel(ctx)
 	s.activeRuns.Store(runID, cancelRun)
 	go func() {
+		// Recover 注册为最先入栈的 defer,确保即使 run 内部 panic,release/Delete/
+		// cancelRun 与 run 的 defer close(events) 仍会执行,消费方不会永久阻塞。
+		defer safego.Recover(s.logger, "agent run")
 		defer release()
 		defer s.activeRuns.Delete(runID)
 		defer cancelRun()
@@ -477,13 +588,16 @@ func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.Agent
 	selectedAgent := normalizeAgentType(req.SelectedAgent)
 	if selectedAgent != "" && selectedAgent != domain.AGENT_TYPE_AUTO {
 		if selectedAgent == domain.AGENT_TYPE_ASSISTANT || selectedAgent == domain.AGENT_TYPE_NONE {
-			return assistantRouteResult("用户显式选择普通对话助手。", agentDefinitionCandidates(availableAgents(s.agentRegistry.List())))
+			result := assistantRouteResult("用户显式选择普通对话助手。", agentDefinitionCandidates(availableAgents(s.agentRegistry.List())))
+			result.Source = domain.ROUTE_SOURCE_USER
+			return result
 		}
 		if agent, ok := s.agentRegistry.Get(selectedAgent); ok {
 			return domain.AgentRouteResult{
 				AgentType:   agent.Type,
 				Confidence:  1,
 				Reason:      "用户显式选择该 Agent。",
+				Source:      domain.ROUTE_SOURCE_USER,
 				NeedConfirm: false,
 				Candidates: []domain.AgentCandidate{
 					toCandidate(agent, 1, "用户显式选择。"),
@@ -506,7 +620,9 @@ func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.Agent
 	}
 	best := candidates[0]
 	if best.Confidence < MIN_AGENT_ROUTE_CONFIDENCE {
-		return assistantRouteResult("用户问题不匹配可执行 Agent,使用普通对话助手。", candidates)
+		result := assistantRouteResult("用户问题不匹配可执行 Agent,使用普通对话助手。", candidates)
+		result.Source = domain.ROUTE_SOURCE_KEYWORD
+		return result
 	}
 	needConfirm := best.Confidence < 0.7 && len(availableCandidates(candidates)) > 1
 	reason := best.Reason
@@ -517,6 +633,7 @@ func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.Agent
 		AgentType:    best.AgentType,
 		Confidence:   best.Confidence,
 		Reason:       reason,
+		Source:       domain.ROUTE_SOURCE_KEYWORD,
 		NeedConfirm:  needConfirm,
 		Candidates:   candidates,
 		Alternatives: candidateAgentTypes(candidates[1:]),
@@ -609,6 +726,7 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 		Status:      domain.RUN_STATUS_RUNNING,
 		Confidence:  route.Confidence,
 		RouteReason: route.Reason,
+		RouteSource: route.Source,
 		CreatedAt:   now,
 	}
 	run = s.createRun(persistCtx, run)
@@ -642,7 +760,7 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 
 	// LLM 驱动的多步诊断循环:由模型自主决定调用哪些只读工具、如何下钻,
 	// 直到给出结论。规则规划已下线。
-	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req)
+	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req, chatContext.history)
 	if !alive {
 		// 客户端断连,由上方 defer 兜底落 cancelled。
 		return
@@ -665,6 +783,12 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 	run = s.updateRun(persistCtx, run)
 	chatContext = s.finalizeRunChatContext(persistCtx, userID, chatContext, answer, run)
 	finalized = true
+
+	// 诊断案例库:run 成功结束后异步提取结构化案例(独立超时,任何失败仅告警),
+	// 不增加本次请求的任何时延。
+	if run.Status == domain.RUN_STATUS_COMPLETED {
+		s.recordDiagnosisCase(run)
+	}
 
 	eventName := STREAM_EVENT_AGENT_RUN_COMPLETED
 	if run.Status == domain.RUN_STATUS_FAILED {
@@ -689,6 +813,15 @@ func (s *Service) prepareRunChatContext(ctx context.Context, userID string, req 
 	session, err := s.chatRepo.GetSession(ctx, userID, sessionID)
 	if err != nil {
 		return runChatContext{}, mapChatRepositoryError(err, "chat session not found")
+	}
+
+	// 在写入本次消息对之前读取既往消息,作为 loop 的对话记忆回喂。读取失败仅
+	// 降级为无记忆运行(不阻断本次诊断),但记录日志保证可观测。
+	var history []aiapplication.MessageContext
+	if existingMessages, listErr := s.chatRepo.ListMessages(ctx, userID, sessionID); listErr != nil {
+		s.logPersistError("list chat history", listErr, "session_id", sessionID)
+	} else {
+		history = chatHistoryForAgent(existingMessages)
 	}
 
 	now := time.Now().UTC()
@@ -731,6 +864,7 @@ func (s *Service) prepareRunChatContext(ctx context.Context, userID string, req 
 		session:          updatedSession,
 		userMessage:      userMessage,
 		assistantMessage: assistantMessage,
+		history:          history,
 	}, nil
 }
 
@@ -761,6 +895,7 @@ func (s *Service) streamAssistantMessage(ctx context.Context, userID string, req
 
 	events := make(chan domain.AgentRunEvent, 16)
 	go func() {
+		defer safego.Recover(s.logger, "agent assistant stream")
 		defer close(events)
 		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ROUTE_COMPLETED, Route: &route}) {
 			return
@@ -902,6 +1037,7 @@ func (s *Service) createRun(ctx context.Context, run domain.AgentRun) domain.Age
 	}
 	created, err := s.repo.CreateRun(ctx, run)
 	if err != nil {
+		s.logPersistError("create run", err, "run_id", run.ID)
 		return run
 	}
 	return created
@@ -913,6 +1049,7 @@ func (s *Service) updateRun(ctx context.Context, run domain.AgentRun) domain.Age
 	}
 	updated, err := s.repo.UpdateRun(ctx, run)
 	if err != nil {
+		s.logPersistError("update run", err, "run_id", run.ID, "status", run.Status)
 		return run
 	}
 	return updated
@@ -924,6 +1061,7 @@ func (s *Service) createToolCall(ctx context.Context, call domain.AgentToolCall)
 	}
 	created, err := s.repo.CreateToolCall(ctx, call)
 	if err != nil {
+		s.logPersistError("create tool call", err, "run_id", call.RunID, "tool_id", call.ToolID)
 		return call
 	}
 	return created
@@ -935,6 +1073,7 @@ func (s *Service) updateToolCall(ctx context.Context, call domain.AgentToolCall)
 	}
 	updated, err := s.repo.UpdateToolCall(ctx, call)
 	if err != nil {
+		s.logPersistError("update tool call", err, "tool_call_id", call.ID)
 		return call
 	}
 	return updated
@@ -946,9 +1085,48 @@ func (s *Service) createEvidence(ctx context.Context, evidence domain.Evidence) 
 	}
 	created, err := s.repo.CreateEvidence(ctx, evidence)
 	if err != nil {
+		s.logPersistError("create evidence", err, "tool_call_id", evidence.ToolCallID)
 		return evidence
 	}
 	return created
+}
+
+// completeToolCallWithEvidence 原子落库工具调用终态及其证据;事务失败时退化为逐条
+// 尽力落库(updateToolCall + createEvidence),保证主流程不被阻断,并记录错误。
+func (s *Service) completeToolCallWithEvidence(ctx context.Context, call domain.AgentToolCall, evidence []domain.Evidence) (domain.AgentToolCall, []domain.Evidence) {
+	if s == nil || s.repo == nil {
+		return call, evidence
+	}
+	savedCall, savedEvidence, err := s.repo.CompleteToolCallWithEvidence(ctx, call, evidence)
+	if err != nil {
+		s.logPersistError("complete tool call with evidence", err, "tool_call_id", call.ID)
+		// 事务失败回退到尽力而为的逐条写入,避免整批证据丢失。
+		fallbackCall := s.updateToolCall(ctx, call)
+		fallbackEvidence := make([]domain.Evidence, 0, len(evidence))
+		for _, item := range evidence {
+			fallbackEvidence = append(fallbackEvidence, s.createEvidence(ctx, item))
+		}
+		return fallbackCall, fallbackEvidence
+	}
+	return savedCall, savedEvidence
+}
+
+// logPersistError 记录持久化旁路错误。持久化失败不应中断 run(用户仍能拿到流式
+// 答案),但必须可观测,否则生产环境完全无法察觉证据/记录丢失。
+func (s *Service) logPersistError(action string, err error, attrs ...any) {
+	if s == nil || s.logger == nil || err == nil {
+		return
+	}
+	s.logger.Error("agent persistence failed: "+action, append([]any{"error", err}, attrs...)...)
+}
+
+// logAgentWarn 记录可降级的旁路告警(计划/反思 LLM 调用失败、路由学习落库失败
+// 等):主流程不受影响,但需可观测,否则增强功能静默失效无法察觉。
+func (s *Service) logAgentWarn(action string, err error, attrs ...any) {
+	if s == nil || s.logger == nil || err == nil {
+		return
+	}
+	s.logger.Warn("agent degraded: "+action, append([]any{"error", err}, attrs...)...)
 }
 
 func (s *Service) validateRequest(req any) error {
@@ -1119,6 +1297,22 @@ func summaryForAgentMessage(message aidomain.ChatMessage) string {
 		return normalizedContent
 	}
 	return string(runes[:aiapplication.MAX_SUMMARY_LENGTH-3]) + "..."
+}
+
+// chatHistoryForAgent 把会话既往消息转换为 Agent loop 可携带的对话记忆:复用
+// ai 模块的成对筛选与滑动窗口,但剔除 system 消息——Agent 的系统提示由
+// AgentDefinition 提供且技能提示词依赖"历史尾部唯一 system 消息"的合并语义,
+// 历史中的 system 内容不应混入。
+func chatHistoryForAgent(messages []aidomain.ChatMessage) []aiapplication.MessageContext {
+	history := aiapplication.ChatHistoryContext(messages)
+	filtered := make([]aiapplication.MessageContext, 0, len(history))
+	for _, message := range history {
+		if message.Role == aidomain.MESSAGE_ROLE_SYSTEM {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
 }
 
 func mapChatRepositoryError(err error, notFoundMessage string) error {

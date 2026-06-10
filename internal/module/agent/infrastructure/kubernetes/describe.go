@@ -24,9 +24,14 @@ func (e *ToolExecutor) describe(ctx context.Context, clientset *kubernetes.Clien
 		return domain.ToolCallResult{}, err
 	}
 
-	// Node 是集群级资源,事件无命名空间;其余按 namespace + 资源种类/名称过滤。
+	// Node 是集群级资源,事件无命名空间;若仍带 namespace 过滤会把节点事件全部
+	// 误删导致"无关联事件"。对集群级资源清空 namespace,改为全命名空间检索。
+	eventNamespace := scope.Namespace
+	if eventKind == "Node" {
+		eventNamespace = ""
+	}
 	eventScope := domain.AgentScope{
-		Namespace:    scope.Namespace,
+		Namespace:    eventNamespace,
 		ResourceKind: eventKind,
 		ResourceName: strings.TrimSpace(scope.ResourceName),
 	}
@@ -85,14 +90,14 @@ func (e *ToolExecutor) describeBase(ctx context.Context, clientset *kubernetes.C
 // 提示文本、不返回证据,绝不阻断 describe 主流程(详情已经成功取得)。事件的读取与
 // 过滤复用 collectEventSummaries,与 cluster.event.list 工具保持一致。
 func (e *ToolExecutor) relatedEvents(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (string, []domain.Evidence) {
-	items, err := collectEventSummaries(ctx, clientset, scope)
+	items, truncated, err := collectEventSummaries(ctx, clientset, scope)
 	if err != nil {
 		return "(无法读取关联事件)", nil
 	}
 	if len(items) == 0 {
 		return "(无关联事件)", nil
 	}
-	observation := observationFromItems(fmt.Sprintf("共 %d 条:", len(items)), items, DEFAULT_LIST_LIMIT)
+	observation := observationFromItems(fmt.Sprintf("共 %d 条:", len(items)), items, DEFAULT_LIST_LIMIT) + truncationNote(truncated)
 	evidence := listEvidence("event", "events.k8s.io", "v1", "Event", scope.Namespace, "describe-events", fmt.Sprintf("关联事件 %d 条", len(items)), items, false)
 	return observation, []domain.Evidence{evidence}
 }

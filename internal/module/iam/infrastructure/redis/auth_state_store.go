@@ -311,6 +311,14 @@ func (s *AuthStateStore) ConsumeOIDCState(ctx context.Context, state string) (bo
 	return value == 1, err
 }
 
+// ClaimOnce 用 SetNX 实现一次性占用:首次写入成功返回 true,键已存在返回 false。
+func (s *AuthStateStore) ClaimOnce(ctx context.Context, key string, expiresAt time.Time) (bool, error) {
+	if s.client == nil {
+		return false, errors.New("security state store is unavailable")
+	}
+	return s.client.SetNX(ctx, onceKey(key), "1", ttlUntil(expiresAt)).Result()
+}
+
 func sessionKey(sessionID string) string {
 	return "iam:session:" + sessionID
 }
@@ -345,6 +353,10 @@ func loginLockKey(key string) string {
 
 func oidcStateKey(state string) string {
 	return "iam:oidc_state:" + state
+}
+
+func onceKey(key string) string {
+	return "iam:once:" + key
 }
 
 func ttlUntil(expiresAt time.Time) time.Duration {

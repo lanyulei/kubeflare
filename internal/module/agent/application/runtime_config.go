@@ -480,12 +480,20 @@ func normalizeSkill(skill domain.SkillDefinition) domain.SkillDefinition {
 
 func normalizeReloadToolOverride(override ReloadToolOverride) domain.ToolOverride {
 	return normalizeToolOverride(domain.ToolOverride{
-		Enabled:     override.Enabled,
-		Description: override.Description,
-		TimeoutMS:   override.TimeoutMS,
-		ReadOnly:    override.ReadOnly,
+		Enabled:         override.Enabled,
+		Description:     override.Description,
+		TimeoutMS:       override.TimeoutMS,
+		ObserveMaxChars: override.ObserveMaxChars,
+		ReadOnly:        override.ReadOnly,
 	})
 }
+
+// 运行时 API 提交的观察预算上限钳制区间,与 config 校验区间一致;运行时来源
+// 取钳制而非拒绝,保证 reload 永不因单字段越界整体失败。
+const (
+	MIN_OBSERVE_OVERRIDE_CHARS = 256
+	MAX_OBSERVE_OVERRIDE_CHARS = 16000
+)
 
 func normalizeToolOverride(override domain.ToolOverride) domain.ToolOverride {
 	out := domain.ToolOverride{}
@@ -503,11 +511,25 @@ func normalizeToolOverride(override domain.ToolOverride) domain.ToolOverride {
 		value := *override.TimeoutMS
 		out.TimeoutMS = &value
 	}
+	if override.ObserveMaxChars != nil && *override.ObserveMaxChars > 0 {
+		value := clampInt(*override.ObserveMaxChars, MIN_OBSERVE_OVERRIDE_CHARS, MAX_OBSERVE_OVERRIDE_CHARS)
+		out.ObserveMaxChars = &value
+	}
 	if override.ReadOnly != nil {
 		value := *override.ReadOnly
 		out.ReadOnly = &value
 	}
 	return out
+}
+
+func clampInt(value int, min int, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func normalizeStringSlice(values []string) []string {
@@ -558,13 +580,15 @@ func mapRuntimeConfigRepositoryError(err error, notFoundMessage string) error {
 }
 
 func toolOverrideEmpty(override domain.ToolOverride) bool {
-	return override.Enabled == nil && override.Description == nil && override.TimeoutMS == nil && override.ReadOnly == nil
+	return override.Enabled == nil && override.Description == nil && override.TimeoutMS == nil &&
+		override.ObserveMaxChars == nil && override.ReadOnly == nil
 }
 
 func sameToolOverride(first domain.ToolOverride, second domain.ToolOverride) bool {
 	return sameBoolPtr(first.Enabled, second.Enabled) &&
 		sameStringPtr(first.Description, second.Description) &&
 		sameIntPtr(first.TimeoutMS, second.TimeoutMS) &&
+		sameIntPtr(first.ObserveMaxChars, second.ObserveMaxChars) &&
 		sameBoolPtr(first.ReadOnly, second.ReadOnly)
 }
 

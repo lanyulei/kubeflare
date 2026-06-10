@@ -44,7 +44,33 @@ func (e *ToolExecutor) getConfigMap(ctx context.Context, clientset *kubernetes.C
 	keys := configMapKeys(*configMap)
 	summary := fmt.Sprintf("ConfigMap %s/%s 含 %d 个键。", configMap.Namespace, configMap.Name, len(keys))
 	observation := buildConfigMapObservation(summary, keys)
-	return resultWithObservation(summary, observation, objectEvidence("configmap", "", "v1", "ConfigMap", configMap.Namespace, configMap.Name, configMap.ResourceVersion, summary, configMap, true)), nil
+	// 落库前对取值正文脱敏:仅保留键名,value 一律掩码。此前 redacted=true 只是
+	// 标志位,原始 value 仍会随对象序列化进 agent_evidence,造成静态数据泄露
+	// (ConfigMap 常含连接串/Token)。这里改为存脱敏副本,与"绝不回喂取值"一致。
+	redacted := redactConfigMap(configMap)
+	return resultWithObservation(summary, observation, objectEvidence("configmap", "", "v1", "ConfigMap", configMap.Namespace, configMap.Name, configMap.ResourceVersion, summary, redacted, true)), nil
+}
+
+// redactConfigMap 返回一个仅保留键名、取值掩码的 ConfigMap 副本,用于安全落库。
+// 不修改入参对象,避免影响调用方其余逻辑。
+func redactConfigMap(configMap *corev1.ConfigMap) *corev1.ConfigMap {
+	const mask = "<redacted>"
+	clone := configMap.DeepCopy()
+	if len(clone.Data) > 0 {
+		masked := make(map[string]string, len(clone.Data))
+		for key := range clone.Data {
+			masked[key] = mask
+		}
+		clone.Data = masked
+	}
+	if len(clone.BinaryData) > 0 {
+		masked := make(map[string][]byte, len(clone.BinaryData))
+		for key := range clone.BinaryData {
+			masked[key] = []byte(mask)
+		}
+		clone.BinaryData = masked
+	}
+	return clone
 }
 
 // buildConfigMapObservation 在 summary 之上附加键名清单。出于安全绝不回喂取值,
@@ -58,23 +84,29 @@ func buildConfigMapObservation(summary string, keys []string) string {
 
 func (e *ToolExecutor) listConfigMaps(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	namespace := namespaceOrAll(scope.Namespace)
-	configMaps, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+	items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+	truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+		configMaps, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, opts)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to list configmaps: %w", err)
+		}
+		for i := range configMaps.Items {
+			configMap := configMaps.Items[i]
+			items = append(items, evidenceSummary{
+				Kind:      "ConfigMap",
+				Namespace: configMap.Namespace,
+				Name:      configMap.Name,
+				Status:    fmt.Sprintf("%d keys", len(configMap.Data)+len(configMap.BinaryData)),
+			})
+		}
+		return len(configMaps.Items), configMaps.Continue, nil
+	})
 	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list configmaps: %w", err)
-	}
-
-	items := make([]evidenceSummary, 0, len(configMaps.Items))
-	for _, configMap := range configMaps.Items {
-		items = append(items, evidenceSummary{
-			Kind:      "ConfigMap",
-			Namespace: configMap.Namespace,
-			Name:      configMap.Name,
-			Status:    fmt.Sprintf("%d keys", len(configMap.Data)+len(configMap.BinaryData)),
-		})
+		return domain.ToolCallResult{}, err
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 ConfigMap。", len(items))
-	return listResult(summary, items, "configmap", "", "v1", "ConfigMap", scope.Namespace, "configmap-list"), nil
+	return listResultTruncated(summary, items, truncated, "configmap", "", "v1", "ConfigMap", scope.Namespace, "configmap-list"), nil
 }
 
 func configMapKeys(configMap corev1.ConfigMap) []string {
@@ -108,25 +140,31 @@ func (e *ToolExecutor) getService(ctx context.Context, clientset *kubernetes.Cli
 
 func (e *ToolExecutor) listServices(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	namespace := namespaceOrAll(scope.Namespace)
-	services, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+	items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+	truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+		services, err := clientset.CoreV1().Services(namespace).List(ctx, opts)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to list services: %w", err)
+		}
+		for i := range services.Items {
+			service := services.Items[i]
+			items = append(items, evidenceSummary{
+				Kind:      "Service",
+				Namespace: service.Namespace,
+				Name:      service.Name,
+				Status:    string(service.Spec.Type),
+				Message:   servicePortsText(service),
+				Extra:     map[string]any{"cluster_ip": service.Spec.ClusterIP},
+			})
+		}
+		return len(services.Items), services.Continue, nil
+	})
 	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list services: %w", err)
-	}
-
-	items := make([]evidenceSummary, 0, len(services.Items))
-	for _, service := range services.Items {
-		items = append(items, evidenceSummary{
-			Kind:      "Service",
-			Namespace: service.Namespace,
-			Name:      service.Name,
-			Status:    string(service.Spec.Type),
-			Message:   servicePortsText(service),
-			Extra:     map[string]any{"cluster_ip": service.Spec.ClusterIP},
-		})
+		return domain.ToolCallResult{}, err
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 Service。", len(items))
-	return listResult(summary, items, "service", "", "v1", "Service", scope.Namespace, "service-list"), nil
+	return listResultTruncated(summary, items, truncated, "service", "", "v1", "Service", scope.Namespace, "service-list"), nil
 }
 
 func serviceSummary(service corev1.Service) string {
@@ -207,24 +245,30 @@ func (e *ToolExecutor) getIngress(ctx context.Context, clientset *kubernetes.Cli
 
 func (e *ToolExecutor) listIngresses(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	namespace := namespaceOrAll(scope.Namespace)
-	ingresses, err := clientset.NetworkingV1().Ingresses(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+	items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+	truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+		ingresses, err := clientset.NetworkingV1().Ingresses(namespace).List(ctx, opts)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to list ingresses: %w", err)
+		}
+		for i := range ingresses.Items {
+			ingress := ingresses.Items[i]
+			items = append(items, evidenceSummary{
+				Kind:      "Ingress",
+				Namespace: ingress.Namespace,
+				Name:      ingress.Name,
+				Status:    ingressAddress(ingress),
+				Message:   ingressHostsText(ingress),
+			})
+		}
+		return len(ingresses.Items), ingresses.Continue, nil
+	})
 	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list ingresses: %w", err)
-	}
-
-	items := make([]evidenceSummary, 0, len(ingresses.Items))
-	for _, ingress := range ingresses.Items {
-		items = append(items, evidenceSummary{
-			Kind:      "Ingress",
-			Namespace: ingress.Namespace,
-			Name:      ingress.Name,
-			Status:    ingressAddress(ingress),
-			Message:   ingressHostsText(ingress),
-		})
+		return domain.ToolCallResult{}, err
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 Ingress。", len(items))
-	return listResult(summary, items, "ingress", apiGroupNetworking, "v1", "Ingress", scope.Namespace, "ingress-list"), nil
+	return listResultTruncated(summary, items, truncated, "ingress", apiGroupNetworking, "v1", "Ingress", scope.Namespace, "ingress-list"), nil
 }
 
 func ingressSummary(ingress networkingv1.Ingress) string {
@@ -305,29 +349,35 @@ func (e *ToolExecutor) getPVC(ctx context.Context, clientset *kubernetes.Clients
 
 func (e *ToolExecutor) listPVCs(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	namespace := namespaceOrAll(scope.Namespace)
-	claims, err := clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
-	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list pvcs: %w", err)
-	}
-
-	items := make([]evidenceSummary, 0, len(claims.Items))
+	items := make([]evidenceSummary, 0, MAX_PER_PAGE)
 	pending := 0
-	for _, claim := range claims.Items {
-		if claim.Status.Phase != corev1.ClaimBound {
-			pending++
+	truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+		claims, err := clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, opts)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to list pvcs: %w", err)
 		}
-		items = append(items, evidenceSummary{
-			Kind:      "PersistentVolumeClaim",
-			Namespace: claim.Namespace,
-			Name:      claim.Name,
-			Status:    string(claim.Status.Phase),
-			Message:   pvcCapacityText(claim),
-			Extra:     map[string]any{"storage_class": pvcStorageClass(claim)},
-		})
+		for i := range claims.Items {
+			claim := claims.Items[i]
+			if claim.Status.Phase != corev1.ClaimBound {
+				pending++
+			}
+			items = append(items, evidenceSummary{
+				Kind:      "PersistentVolumeClaim",
+				Namespace: claim.Namespace,
+				Name:      claim.Name,
+				Status:    string(claim.Status.Phase),
+				Message:   pvcCapacityText(claim),
+				Extra:     map[string]any{"storage_class": pvcStorageClass(claim)},
+			})
+		}
+		return len(claims.Items), claims.Continue, nil
+	})
+	if err != nil {
+		return domain.ToolCallResult{}, err
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 PVC,其中 %d 个未 Bound。", len(items), pending)
-	return listResult(summary, items, "pvc", "", "v1", "PersistentVolumeClaim", scope.Namespace, "pvc-list"), nil
+	return listResultTruncated(summary, items, truncated, "pvc", "", "v1", "PersistentVolumeClaim", scope.Namespace, "pvc-list"), nil
 }
 
 func pvcSummary(claim corev1.PersistentVolumeClaim) string {
@@ -370,25 +420,31 @@ func (e *ToolExecutor) getHPA(ctx context.Context, clientset *kubernetes.Clients
 
 func (e *ToolExecutor) listHPAs(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	namespace := namespaceOrAll(scope.Namespace)
-	hpas, err := clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+	items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+	truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+		hpas, err := clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(ctx, opts)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to list hpas: %w", err)
+		}
+		for i := range hpas.Items {
+			hpa := hpas.Items[i]
+			items = append(items, evidenceSummary{
+				Kind:      "HorizontalPodAutoscaler",
+				Namespace: hpa.Namespace,
+				Name:      hpa.Name,
+				Status:    fmt.Sprintf("%d/%d replicas", hpa.Status.CurrentReplicas, hpa.Status.DesiredReplicas),
+				Message:   fmt.Sprintf("target=%s/%s", hpa.Spec.ScaleTargetRef.Kind, hpa.Spec.ScaleTargetRef.Name),
+				Extra:     map[string]any{"min_replicas": hpaMinReplicas(hpa), "max_replicas": hpa.Spec.MaxReplicas},
+			})
+		}
+		return len(hpas.Items), hpas.Continue, nil
+	})
 	if err != nil {
-		return domain.ToolCallResult{}, fmt.Errorf("failed to list hpas: %w", err)
-	}
-
-	items := make([]evidenceSummary, 0, len(hpas.Items))
-	for _, hpa := range hpas.Items {
-		items = append(items, evidenceSummary{
-			Kind:      "HorizontalPodAutoscaler",
-			Namespace: hpa.Namespace,
-			Name:      hpa.Name,
-			Status:    fmt.Sprintf("%d/%d replicas", hpa.Status.CurrentReplicas, hpa.Status.DesiredReplicas),
-			Message:   fmt.Sprintf("target=%s/%s", hpa.Spec.ScaleTargetRef.Kind, hpa.Spec.ScaleTargetRef.Name),
-			Extra:     map[string]any{"min_replicas": hpaMinReplicas(hpa), "max_replicas": hpa.Spec.MaxReplicas},
-		})
+		return domain.ToolCallResult{}, err
 	}
 
 	summary := fmt.Sprintf("读取到 %d 个 HPA。", len(items))
-	return listResult(summary, items, "hpa", "autoscaling", "v2", "HorizontalPodAutoscaler", scope.Namespace, "hpa-list"), nil
+	return listResultTruncated(summary, items, truncated, "hpa", "autoscaling", "v2", "HorizontalPodAutoscaler", scope.Namespace, "hpa-list"), nil
 }
 
 func hpaSummary(hpa autoscalingv2.HorizontalPodAutoscaler) string {
@@ -443,16 +499,23 @@ func (e *ToolExecutor) getRBAC(ctx context.Context, clientset *kubernetes.Client
 func (e *ToolExecutor) getRole(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, name string) (domain.ToolCallResult, error) {
 	if name == "" {
 		namespace := namespaceOrAll(scope.Namespace)
-		roles, err := clientset.RbacV1().Roles(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+		items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			roles, err := clientset.RbacV1().Roles(namespace).List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list roles: %w", err)
+			}
+			for i := range roles.Items {
+				role := roles.Items[i]
+				items = append(items, evidenceSummary{Kind: "Role", Namespace: role.Namespace, Name: role.Name, Status: fmt.Sprintf("%d rules", len(role.Rules))})
+			}
+			return len(roles.Items), roles.Continue, nil
+		})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to list roles: %w", err)
-		}
-		items := make([]evidenceSummary, 0, len(roles.Items))
-		for _, role := range roles.Items {
-			items = append(items, evidenceSummary{Kind: "Role", Namespace: role.Namespace, Name: role.Name, Status: fmt.Sprintf("%d rules", len(role.Rules))})
+			return domain.ToolCallResult{}, err
 		}
 		summary := fmt.Sprintf("读取到 %d 个 Role。", len(items))
-		return listResult(summary, items, "rbac", apiGroupRBAC, "v1", "Role", scope.Namespace, "role-list"), nil
+		return listResultTruncated(summary, items, truncated, "rbac", apiGroupRBAC, "v1", "Role", scope.Namespace, "role-list"), nil
 	}
 
 	namespace := namespaceOrDefault(scope.Namespace)
@@ -467,16 +530,23 @@ func (e *ToolExecutor) getRole(ctx context.Context, clientset *kubernetes.Client
 
 func (e *ToolExecutor) getClusterRole(ctx context.Context, clientset *kubernetes.Clientset, name string) (domain.ToolCallResult, error) {
 	if name == "" {
-		roles, err := clientset.RbacV1().ClusterRoles().List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+		items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			roles, err := clientset.RbacV1().ClusterRoles().List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list clusterroles: %w", err)
+			}
+			for i := range roles.Items {
+				role := roles.Items[i]
+				items = append(items, evidenceSummary{Kind: "ClusterRole", Name: role.Name, Status: fmt.Sprintf("%d rules", len(role.Rules))})
+			}
+			return len(roles.Items), roles.Continue, nil
+		})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to list clusterroles: %w", err)
-		}
-		items := make([]evidenceSummary, 0, len(roles.Items))
-		for _, role := range roles.Items {
-			items = append(items, evidenceSummary{Kind: "ClusterRole", Name: role.Name, Status: fmt.Sprintf("%d rules", len(role.Rules))})
+			return domain.ToolCallResult{}, err
 		}
 		summary := fmt.Sprintf("读取到 %d 个 ClusterRole。", len(items))
-		return listResult(summary, items, "rbac", apiGroupRBAC, "v1", "ClusterRole", "", "clusterrole-list"), nil
+		return listResultTruncated(summary, items, truncated, "rbac", apiGroupRBAC, "v1", "ClusterRole", "", "clusterrole-list"), nil
 	}
 
 	role, err := clientset.RbacV1().ClusterRoles().Get(ctx, name, metav1.GetOptions{})
@@ -491,16 +561,23 @@ func (e *ToolExecutor) getClusterRole(ctx context.Context, clientset *kubernetes
 func (e *ToolExecutor) getRoleBinding(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, name string) (domain.ToolCallResult, error) {
 	if name == "" {
 		namespace := namespaceOrAll(scope.Namespace)
-		bindings, err := clientset.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+		items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			bindings, err := clientset.RbacV1().RoleBindings(namespace).List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list rolebindings: %w", err)
+			}
+			for i := range bindings.Items {
+				binding := bindings.Items[i]
+				items = append(items, evidenceSummary{Kind: "RoleBinding", Namespace: binding.Namespace, Name: binding.Name, Status: roleRefText(binding.RoleRef), Message: subjectsText(binding.Subjects)})
+			}
+			return len(bindings.Items), bindings.Continue, nil
+		})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to list rolebindings: %w", err)
-		}
-		items := make([]evidenceSummary, 0, len(bindings.Items))
-		for _, binding := range bindings.Items {
-			items = append(items, evidenceSummary{Kind: "RoleBinding", Namespace: binding.Namespace, Name: binding.Name, Status: roleRefText(binding.RoleRef), Message: subjectsText(binding.Subjects)})
+			return domain.ToolCallResult{}, err
 		}
 		summary := fmt.Sprintf("读取到 %d 个 RoleBinding。", len(items))
-		return listResult(summary, items, "rbac", apiGroupRBAC, "v1", "RoleBinding", scope.Namespace, "rolebinding-list"), nil
+		return listResultTruncated(summary, items, truncated, "rbac", apiGroupRBAC, "v1", "RoleBinding", scope.Namespace, "rolebinding-list"), nil
 	}
 
 	namespace := namespaceOrDefault(scope.Namespace)
@@ -514,16 +591,23 @@ func (e *ToolExecutor) getRoleBinding(ctx context.Context, clientset *kubernetes
 
 func (e *ToolExecutor) getClusterRoleBinding(ctx context.Context, clientset *kubernetes.Clientset, name string) (domain.ToolCallResult, error) {
 	if name == "" {
-		bindings, err := clientset.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{Limit: DEFAULT_LIST_LIMIT})
+		items := make([]evidenceSummary, 0, MAX_PER_PAGE)
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			bindings, err := clientset.RbacV1().ClusterRoleBindings().List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list clusterrolebindings: %w", err)
+			}
+			for i := range bindings.Items {
+				binding := bindings.Items[i]
+				items = append(items, evidenceSummary{Kind: "ClusterRoleBinding", Name: binding.Name, Status: roleRefText(binding.RoleRef), Message: subjectsText(binding.Subjects)})
+			}
+			return len(bindings.Items), bindings.Continue, nil
+		})
 		if err != nil {
-			return domain.ToolCallResult{}, fmt.Errorf("failed to list clusterrolebindings: %w", err)
-		}
-		items := make([]evidenceSummary, 0, len(bindings.Items))
-		for _, binding := range bindings.Items {
-			items = append(items, evidenceSummary{Kind: "ClusterRoleBinding", Name: binding.Name, Status: roleRefText(binding.RoleRef), Message: subjectsText(binding.Subjects)})
+			return domain.ToolCallResult{}, err
 		}
 		summary := fmt.Sprintf("读取到 %d 个 ClusterRoleBinding。", len(items))
-		return listResult(summary, items, "rbac", apiGroupRBAC, "v1", "ClusterRoleBinding", "", "clusterrolebinding-list"), nil
+		return listResultTruncated(summary, items, truncated, "rbac", apiGroupRBAC, "v1", "ClusterRoleBinding", "", "clusterrolebinding-list"), nil
 	}
 
 	binding, err := clientset.RbacV1().ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})

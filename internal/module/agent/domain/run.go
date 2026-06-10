@@ -32,9 +32,12 @@ type AgentRun struct {
 	ClusterID    string     `json:"cluster_id"`
 	Input        string     `json:"input"`
 	Scope        AgentScope `json:"scope"`
-	Status       string     `json:"status"`
-	Confidence   float64    `json:"confidence"`
-	RouteReason  string     `json:"route_reason"`
+	Status      string     `json:"status"`
+	Confidence  float64    `json:"confidence"`
+	RouteReason string     `json:"route_reason"`
+	// RouteSource 标识 Agent 的选中方式(llm/keyword/user),见 ROUTE_SOURCE_*。
+	// omitempty 兼容既有消费方。
+	RouteSource  string     `json:"route_source,omitempty"`
 	Summary      string     `json:"summary"`
 	ErrorMessage string     `json:"error_message,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`

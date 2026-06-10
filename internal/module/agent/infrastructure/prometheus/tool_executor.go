@@ -105,6 +105,9 @@ func (e *ToolExecutor) query(ctx context.Context, clientset *kubernetes.Clientse
 
 	params := map[string]string{"query": args.Query}
 	if t := strings.TrimSpace(args.Time); t != "" {
+		if !isValidPromTime(t) {
+			return domain.ToolCallResult{}, fmt.Errorf("invalid time %q: expect RFC3339 or unix seconds", t)
+		}
 		params["time"] = t
 	}
 
@@ -134,6 +137,10 @@ func (e *ToolExecutor) queryRange(ctx context.Context, clientset *kubernetes.Cli
 	step := strings.TrimSpace(args.Step)
 	if step == "" {
 		step = autoStep(window)
+	} else if !isValidPromStep(step) {
+		// 校验模型提供的 step,坏值(如 "0"/"abc")提前返回明确错误,而非透传给
+		// Prometheus 得到不透明的 400。与 duration 的校验保持一致。
+		return domain.ToolCallResult{}, fmt.Errorf("invalid step %q: expect a positive duration like 30s/1m", step)
 	}
 
 	now := time.Now().UTC()
@@ -178,6 +185,30 @@ func autoStep(window time.Duration) string {
 		step = 15 * time.Second
 	}
 	return strconv.FormatInt(int64(step.Seconds()), 10) + "s"
+}
+
+// isValidPromStep 校验 step 是否为合法的正向 Prometheus 步长:既接受 Go duration
+// 形式(30s/1m/2h),也接受纯秒数(>0)。
+func isValidPromStep(step string) bool {
+	if seconds, err := strconv.ParseFloat(step, 64); err == nil {
+		return seconds > 0
+	}
+	if d, err := time.ParseDuration(step); err == nil {
+		return d > 0
+	}
+	return false
+}
+
+// isValidPromTime 校验 instant query 的 time 参数:接受 RFC3339 时间戳或 unix 秒
+// (可带小数)。
+func isValidPromTime(value string) bool {
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return true
+	}
+	if _, err := time.Parse(time.RFC3339, value); err == nil {
+		return true
+	}
+	return false
 }
 
 func parseQueryArgs(rawArgs string) (queryArgs, error) {

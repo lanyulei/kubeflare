@@ -16,6 +16,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
+	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
 const (
@@ -31,6 +32,9 @@ const (
 	// 超限错误而导致会话无法继续。
 	MAX_CONTEXT_MESSAGES = 20
 	MAX_CONTEXT_CHARS    = 24000
+	// MAX_RESPONSE_CHARS 限制单条流式回复累计字符数。输入有上下文上限,输出此前
+	// 不设限,异常 provider 可无限增长占用内存直到流超时。超限后停止累计并收尾。
+	MAX_RESPONSE_CHARS = 200000
 
 	STREAM_EVENT_MESSAGE_CREATED   = "message.created"
 	STREAM_EVENT_MESSAGE_DELTA     = "message.delta"
@@ -386,6 +390,7 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 	s.activeStreams.Store(assistantMessage.ID, cancelStream)
 	events := make(chan StreamMessageEvent, 16)
 	go func() {
+		defer safego.Recover(s.logger, "ai stream message")
 		defer s.activeStreams.Delete(assistantMessage.ID)
 		defer cancelStream()
 		s.runMessageStream(ctx, streamCtx, events, normalizedUserID, repo, updatedSession, userMessage, assistantMessage, history, content, firstTurn)
@@ -442,7 +447,16 @@ func (s *Service) runMessageStream(
 		}
 		if event.Delta != "" {
 			responseContent.WriteString(event.Delta)
-			if !sendStreamEvent(ctx, events, StreamMessageEvent{
+			// 输出超出上限即停止累计并主动收尾,防止异常 provider 无限增长撑爆内存。
+			if responseContent.Len() > MAX_RESPONSE_CHARS {
+				finalReply.Content = responseContent.String()
+				streamCompleted = true
+				break
+			}
+			// 用 streamCtx(而非原始 ctx)发送 delta:CancelMessage 取消的是
+			// streamCtx,这样客户端取消能确定性地解除事件发送阻塞并停止上游消耗;
+			// streamCtx 是 ctx 的子上下文,客户端断开时同样会被取消。
+			if !sendStreamEvent(streamCtx, events, StreamMessageEvent{
 				Event:     STREAM_EVENT_MESSAGE_DELTA,
 				MessageID: assistantMessage.ID,
 				Delta:     event.Delta,
@@ -840,6 +854,7 @@ func (s *Service) maybeGenerateTitle(ctx context.Context, userID string, session
 	}
 	bgCtx := context.WithoutCancel(ctx)
 	go func() {
+		defer safego.Recover(s.logger, "generate chat title")
 		titleCtx, cancel := context.WithTimeout(bgCtx, 30*time.Second)
 		defer cancel()
 		s.generateTitle(titleCtx, userID, session, source)
@@ -907,6 +922,14 @@ func truncateRunes(text string, max int) string {
 		return text
 	}
 	return string(runes[:max])
+}
+
+// ChatHistoryContext 把会话消息转换为可直接随 LLM 请求发送的历史上下文:
+// 成对保留已完成的 user/assistant 消息,并施加与普通对话一致的滑动窗口
+// (MAX_CONTEXT_MESSAGES / MAX_CONTEXT_CHARS)。供 agent 等模块在同一会话内
+// 复用既有对话记忆。
+func ChatHistoryContext(messages []domain.ChatMessage) []MessageContext {
+	return toMessageContext(messages)
 }
 
 func toMessageContext(messages []domain.ChatMessage) []MessageContext {

@@ -54,6 +54,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/shared/health"
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 	"github.com/lanyulei/kubeflare/internal/shared/response"
+	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
@@ -104,6 +105,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	} else if redisClient != nil {
 		authStateStore = iamredis.NewAuthStateStore(redisClient)
 	}
+	if authStateStore == nil {
+		// 无持久化存储时,会话撤销/刷新轮换全部静默失效(登出无效、token 无法
+		// 吊销)。生产环境视为严重风险,启动即拒绝;其余环境降级为告警。
+		if cfg.Service.Environment == "production" {
+			return nil, errors.New("auth state store is required in production (configure database or redis) to enable session revocation")
+		}
+		logger.Warn("auth state store is not configured; session revocation and refresh-token rotation are disabled")
+	}
 	uploadRepo := uploadlocal.NewFileRepository(cfg.Upload.RootDir)
 	clusterRepo := clusterpostgres.NewClusterRepository(gormDB, cfg.Database.QueryTimeout)
 	clusterInspector := clusterkubernetes.NewInspector(cfg.Database.QueryTimeout)
@@ -143,6 +152,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
 	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), logger)
 	agentClientFactory := agentkubeclient.NewFactory(clusterService, 0)
+	// 集群 kubeconfig 更新/删除后失效缓存的 clientset,避免 TTL 窗口内沿用旧凭证。
+	clusterService.RegisterCacheInvalidator(agentClientFactory.Invalidate)
 	agentKubernetesExecutor := agentkubernetes.NewToolExecutor(agentClientFactory)
 	agentPrometheusExecutor := agentprometheus.NewToolExecutor(agentClientFactory, agentprometheus.Config{
 		Namespace:    cfg.Agent.Prometheus.Namespace,
@@ -173,12 +184,22 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			ToolChoice:               cfg.Agent.ToolChoice,
 			LLMRouting:               cfg.Agent.LLMRouting,
 			StreamThink:              cfg.Agent.StreamThink,
+			Planning:                 cfg.Agent.Planning,
+			Reflection:               cfg.Agent.Reflection,
+			MaxReflectionSteps:       cfg.Agent.MaxReflectionSteps,
+			MaxReflections:           cfg.Agent.MaxReflections,
+			ObserveCompression:       cfg.Agent.ObserveCompression,
+			CaseLibrary:              cfg.Agent.CaseLibrary,
+			CaseFewShotLimit:         cfg.Agent.CaseFewShotLimit,
+			RouteLearning:            cfg.Agent.RouteLearning,
+			RouteFewShotLimit:        cfg.Agent.RouteFewShotLimit,
 			MaxConcurrentRunsPerUser: cfg.Agent.MaxConcurrentRunsPerUser,
 			MaxConcurrentRuns:        cfg.Agent.MaxConcurrentRuns,
 		},
 		SystemPrompts: resolveAgentPrompts(cfg.Agent, logger),
 		ToolOverrides: resolveAgentToolOverrides(cfg.Agent),
 		Skills:        resolveAgentSkills(cfg.Agent),
+		Logger:        logger,
 	})
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
@@ -191,8 +212,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	authCleanupCtx, stopAuthCleanup := context.WithCancel(context.Background())
-	go runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore)
-	go runAIStateRecovery(authCleanupCtx, logger, aiService, agentService)
+	safego.Go(logger, "auth state cleanup", func() { runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore) })
+	safego.Go(logger, "ai state recovery", func() { runAIStateRecovery(authCleanupCtx, logger, aiService, agentService) })
 
 	healthManager := health.NewManager(
 		cfg.HTTP.ReadinessTimeout,
@@ -232,6 +253,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	})
 
 	rootHandler = metrics.InstrumentHTTP(metricsRegistry, rootHandler)
+	rootHandler = middleware.SecurityHeadersHTTP(rootHandler)
 	rootHandler = middleware.CORSHTTP(toCORSConfig(cfg), rootHandler)
 	rootHandler = middleware.AccessLogHTTP(logger, rootHandler)
 	rootHandler = middleware.RequestIDHTTP(rootHandler)
@@ -259,7 +281,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 }
 
 func newKAPIHandler(clusterService *clusterapplication.Service, authenticator middleware.Authenticator, timeout time.Duration, security clusterkubernetes.SecurityOptions) http.Handler {
-	var handler http.Handler = clusterkubernetes.NewProxyHandlerWithSecurity(clusterService, timeout, security)
+	proxy := clusterkubernetes.NewProxyHandlerWithSecurity(clusterService, timeout, security)
+	// 集群 kubeconfig 更新/删除后失效代理缓存的 transport,避免继续复用旧端点连接池。
+	clusterService.RegisterCacheInvalidator(proxy.Invalidate)
+	var handler http.Handler = proxy
 	handler = middleware.RequireRolesHTTP("admin")(handler)
 	handler = middleware.RequireCSRFHTTP(handler)
 	handler = middleware.AuthenticateHTTP(authenticator, handler)
@@ -343,9 +368,10 @@ func resolveAgentToolOverrides(cfg config.AgentConfig) map[string]agentdomain.To
 			continue
 		}
 		overrides[toolID] = agentdomain.ToolOverride{
-			Enabled:     override.Enabled,
-			Description: override.Description,
-			TimeoutMS:   override.TimeoutMS,
+			Enabled:         override.Enabled,
+			Description:     override.Description,
+			TimeoutMS:       override.TimeoutMS,
+			ObserveMaxChars: override.ObserveMaxChars,
 		}
 	}
 	return overrides
@@ -431,7 +457,11 @@ func newAPIHandler(
 		})
 	})
 	iamhttp.RegisterProtectedRoutes(protectedAPI, iamHandler)
-	iamhttp.RegisterAdminRoutes(protectedAPI, iamHandler)
+	// 用户增删改查属于管理操作,必须带 admin 角色守卫,避免任何已登录用户越权
+	// 枚举/创建/改密/删除其他账户。
+	adminAPI := protectedAPI.Group("")
+	adminAPI.Use(middleware.RequireRolesGin(middleware.RoleAdmin))
+	iamhttp.RegisterAdminRoutes(adminAPI, iamHandler)
 	uploadhttp.RegisterProtectedRoutes(protectedAPI, uploadHandler)
 	clusterHandler := clusterhttp.NewHandler(clusterService)
 	clusterhttp.RegisterRoutes(protectedAPI, clusterHandler)

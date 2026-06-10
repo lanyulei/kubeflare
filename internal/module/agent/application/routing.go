@@ -2,7 +2,6 @@ package application
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -32,11 +31,13 @@ func (s *Service) llmRoutingEnabled() bool {
 	return s.opts.LLMRouting == nil || *s.opts.LLMRouting
 }
 
-// routeRawResult 是 LLM 路由返回的原始 JSON 结构。
+// routeRawResult 是 LLM 路由返回的原始 JSON 结构。SkillID 仅在路由提示携带技能
+// 候选段时才会被模型填写,空值表示未命中。
 type routeRawResult struct {
 	AgentType  string  `json:"agent_type"`
 	Confidence float64 `json:"confidence"`
 	Reason     string  `json:"reason"`
+	SkillID    string  `json:"skill_id"`
 }
 
 // routeWithLLM 用 LLM 在可用 Agent 中分类选择。返回 ok=false 表示应回退到关键词
@@ -51,11 +52,21 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 		return domain.AgentRouteResult{}, false
 	}
 
+	// 路由学习启用时附加历史确认样例(few-shot,仅读内存缓存,空缓存时提示与
+	// 未启用学习时逐字节一致)。技能候选段同理:无已启用技能时为空串,零回归。
+	systemContent := fmt.Sprintf(routeSystemPrompt, agentCatalog(available))
+	if s.routeLearningEnabled() {
+		systemContent += s.routeFewShotPromptSection()
+	}
+	systemContent += s.routeSkillPromptSection()
 	prompt := []aiapplication.MessageContext{{
 		Role:    "system",
-		Content: fmt.Sprintf(routeSystemPrompt, agentCatalog(available)),
+		Content: systemContent,
 	}}
-	reply, err := s.generator.Generate(ctx, prompt, routeUserMessage(req))
+	// 路由 LLM 调用经 generateWithStepTimeout 施加单步超时,避免 provider 挂起时
+	// 阻塞整个 StreamRun。解析失败不做纠偏重试:关键词回退是零成本的,重试只会
+	// 徒增路由时延。
+	reply, err := s.generateWithStepTimeout(ctx, prompt, routeUserMessage(req))
 	if err != nil {
 		return domain.AgentRouteResult{}, false
 	}
@@ -68,7 +79,9 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 	confidence := clampConfidence(parsed.Confidence)
 	reason := strings.TrimSpace(parsed.Reason)
 	if agentType == domain.AGENT_TYPE_ASSISTANT || agentType == domain.AGENT_TYPE_NONE {
-		return assistantRouteResult(reason, agentDefinitionCandidates(available)), true
+		result := assistantRouteResult(reason, agentDefinitionCandidates(available))
+		result.Source = domain.ROUTE_SOURCE_LLM
+		return result, true
 	}
 
 	agent, ok := s.agentRegistry.Get(agentType)
@@ -88,16 +101,62 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 		candidates = append(candidates, toCandidate(other, 0, other.Description))
 	}
 	if confidence < MIN_AGENT_ROUTE_CONFIDENCE {
-		return assistantRouteResult("用户问题与可用 Agent 的匹配置信度低,使用普通对话助手。", candidates), true
+		result := assistantRouteResult("用户问题与可用 Agent 的匹配置信度低,使用普通对话助手。", candidates)
+		result.Source = domain.ROUTE_SOURCE_LLM
+		return result, true
 	}
 	return domain.AgentRouteResult{
 		AgentType:    agent.Type,
 		Confidence:   confidence,
 		Reason:       reason,
+		Source:       domain.ROUTE_SOURCE_LLM,
+		SkillID:      s.normalizeRoutedSkill(agent.Type, parsed.SkillID),
 		NeedConfirm:  confidence < 0.7 && len(available) > 1,
 		Candidates:   candidates,
 		Alternatives: candidateAgentTypes(candidates[1:]),
 	}, true
+}
+
+// routeSkillPromptSection 把已启用技能编排为路由系统提示的附加段,让路由 LLM
+// 在分类的同时顺带给出技能命中(语义匹配,召回率高于关键词子串)。无已启用技能
+// 时返回 "",路由提示与无技能特性时逐字节一致(零回归)。
+func (s *Service) routeSkillPromptSection() string {
+	skills := s.skillRegistry.List()
+	var builder strings.Builder
+	for _, skill := range skills {
+		if !skill.Enabled {
+			continue
+		}
+		description := strings.TrimSpace(skill.Description)
+		if description == "" {
+			description = strings.Join(skill.Triggers, "、")
+		}
+		builder.WriteString("\n- ")
+		builder.WriteString(skill.ID)
+		builder.WriteString("(")
+		builder.WriteString(skill.Name)
+		builder.WriteString("):")
+		builder.WriteString(description)
+	}
+	if builder.Len() == 0 {
+		return ""
+	}
+	return "\n\n可选技能(若用户问题明显匹配某技能,请在 JSON 中额外输出 \"skill_id\":\"<技能ID>\";不匹配则省略该字段):" + builder.String()
+}
+
+// normalizeRoutedSkill 校验路由 LLM 给出的技能提示:必须存在、已启用且适用于
+// 选中的 Agent,否则丢弃(loop 内回退关键词匹配)。fail-closed,确保模型幻觉的
+// 技能 ID 不会进入执行路径。
+func (s *Service) normalizeRoutedSkill(agentType string, skillID string) string {
+	skillID = strings.TrimSpace(skillID)
+	if skillID == "" {
+		return ""
+	}
+	skill, ok := s.skillRegistry.Get(skillID)
+	if !ok || !skill.Enabled || !skill.AppliesToAgent(agentType) {
+		return ""
+	}
+	return skill.ID
 }
 
 func routeUserMessage(req RouteAgentRequest) string {
@@ -139,26 +198,11 @@ func availableAgents(agents []domain.AgentDefinition) []domain.AgentDefinition {
 	return items
 }
 
-// parseRouteResult 容错解析 LLM 返回:优先整体解析,失败则提取首个 {...} 片段
-// (兼容模型偶尔包裹代码块或夹带说明文字)。
+// parseRouteResult 容错解析 LLM 路由返回(整体解析失败时提取 {...} 片段重试),
+// agent_type 为空视为非法。
 func parseRouteResult(content string) (routeRawResult, bool) {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return routeRawResult{}, false
-	}
 	var result routeRawResult
-	if err := json.Unmarshal([]byte(trimmed), &result); err == nil && strings.TrimSpace(result.AgentType) != "" {
-		return result, true
-	}
-	start := strings.IndexByte(trimmed, '{')
-	end := strings.LastIndexByte(trimmed, '}')
-	if start < 0 || end <= start {
-		return routeRawResult{}, false
-	}
-	if err := json.Unmarshal([]byte(trimmed[start:end+1]), &result); err != nil {
-		return routeRawResult{}, false
-	}
-	if strings.TrimSpace(result.AgentType) == "" {
+	if !decodeLooseJSON(content, &result) || strings.TrimSpace(result.AgentType) == "" {
 		return routeRawResult{}, false
 	}
 	return result, true

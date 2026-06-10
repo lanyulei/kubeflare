@@ -137,6 +137,10 @@ type StreamEvent struct {
 	FinishReason string
 }
 
+// ErrStreamingDisabled 表示 provider 关闭了流式输出。包装进 ProviderError.Err,
+// 调用方用 errors.Is 结构化判定后回退到非流式 Generate,避免脆弱的错误字符串匹配。
+var ErrStreamingDisabled = errors.New("llm provider streaming is disabled")
+
 type ProviderError struct {
 	Provider   string
 	StatusCode int
@@ -427,7 +431,7 @@ func (c *openAICompatibleClient) Generate(ctx context.Context, request ChatReque
 
 func (c *openAICompatibleClient) Stream(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error) {
 	if !c.config.Stream {
-		return nil, providerError(c.provider, 0, "llm provider streaming is disabled", nil)
+		return nil, providerError(c.provider, 0, "llm provider streaming is disabled", ErrStreamingDisabled)
 	}
 
 	body, err := c.newRequestBody(request, true)

@@ -19,6 +19,9 @@ type RunAgentRequest struct {
 	SessionID     string            `json:"session_id" validate:"omitempty,max=64"`
 	ClusterID     string            `json:"cluster_id" validate:"omitempty,max=64"`
 	Scope         domain.AgentScope `json:"scope"`
+	// routedSkillID 是路由阶段 LLM 给出的技能命中提示,仅在服务内部传递(非导出,
+	// 不参与 JSON 反序列化与校验);loop 会校验其合法性,非法时回退关键词匹配。
+	routedSkillID string
 }
 
 // ReloadToolsRequest 是 POST /agent/tool/reload 的请求体。工具 overrides 使用
@@ -73,7 +76,9 @@ type ReloadToolOverride struct {
 	Enabled     *bool   `json:"enabled"`
 	Description *string `json:"description"`
 	TimeoutMS   *int    `json:"timeout_ms"`
-	ReadOnly    *bool   `json:"read_only"`
+	// ObserveMaxChars 覆盖单步回喂观察文本上限(字符),越界值会被钳制到合法区间。
+	ObserveMaxChars *int  `json:"observe_max_chars"`
+	ReadOnly        *bool `json:"read_only"`
 }
 
 // ReloadToolsResult 汇总一次重载后的对外视图。

@@ -196,7 +196,7 @@ func (s *Service) LoginWithOptions(ctx context.Context, req LoginRequest, opts L
 		if err != nil {
 			return LoginResponse{}, err
 		}
-		if !totp.Validate(req.OTPCode, mfaSecret) {
+		if !s.validateTOTP(ctx, userSubject(user), mfaSecret, req.OTPCode) {
 			if recordErr := s.recordLoginFailure(ctx, username, opts.ClientIP); recordErr != nil {
 				return LoginResponse{}, authStateUnavailable(recordErr)
 			}
@@ -550,7 +550,7 @@ func (s *Service) ConfirmMFA(ctx context.Context, subject string, req ConfirmMFA
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(mfaSecret) == "" || !totp.Validate(req.OTPCode, mfaSecret) {
+	if strings.TrimSpace(mfaSecret) == "" || !s.validateTOTP(ctx, subject, mfaSecret, req.OTPCode) {
 		return &sharedErrors.AppError{
 			Code:    sharedErrors.CodeUnauthorized,
 			Message: "invalid mfa code",
@@ -583,7 +583,7 @@ func (s *Service) DisableMFA(ctx context.Context, subject string, req DisableMFA
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(mfaSecret) == "" || !totp.Validate(req.OTPCode, mfaSecret) {
+	if strings.TrimSpace(mfaSecret) == "" || !s.validateTOTP(ctx, subject, mfaSecret, req.OTPCode) {
 		return &sharedErrors.AppError{
 			Code:    sharedErrors.CodeUnauthorized,
 			Message: "invalid mfa code",
@@ -699,6 +699,42 @@ func loginKey(username string, clientIP string) string {
 	return username + "|" + strings.TrimSpace(clientIP)
 }
 
+// usernameLoginKey 是不含 IP 维度的失败计数键。与 per-IP 键并存,使攻击者无法靠
+// 轮换源 IP 绕过 MaxFailedAttempts —— 任一维度触顶即锁定/要求验证码。
+func usernameLoginKey(username string) string {
+	return "user|" + username
+}
+
+// totpPeriodSeconds 是 TOTP 默认时间步长(与 pquerna/otp 默认一致)。
+const totpPeriodSeconds = 30
+
+// validateTOTP 校验一次性口令并防重放:校验通过后,以 subject + 时间步为键原子
+// 占用该口令,使被截获的有效码无法在其窗口内被二次使用。占用键覆盖相邻步长以
+// 匹配校验时允许的 ±1 skew。当安全存储不可用时退化为仅校验(不阻断登录可用性),
+// 与既有 authStateUnavailable 容错策略一致。
+func (s *Service) validateTOTP(ctx context.Context, subject string, secret string, code string) bool {
+	code = strings.TrimSpace(code)
+	if code == "" || strings.TrimSpace(secret) == "" {
+		return false
+	}
+	if !totp.Validate(code, secret) {
+		return false
+	}
+	if s.security == nil {
+		return true
+	}
+	// 用提交的 code 本身作为键(同一窗口内同一 code 只能消费一次),TTL 覆盖
+	// 校验允许的 skew 窗口,过期后自然回收。
+	key := "totp:" + subject + ":" + code
+	expiresAt := time.Now().UTC().Add(2 * totpPeriodSeconds * time.Second)
+	claimed, err := s.security.ClaimOnce(ctx, key, expiresAt)
+	if err != nil {
+		// 存储抖动时不因防重放误伤正常登录;校验本身已通过。
+		return true
+	}
+	return claimed
+}
+
 func (s *Service) requiresCaptcha(ctx context.Context, username string, clientIP string) (bool, error) {
 	if s.policy.CaptchaFailureTrigger <= 0 {
 		return false, nil
@@ -707,24 +743,45 @@ func (s *Service) requiresCaptcha(ctx context.Context, username string, clientIP
 	if err != nil {
 		return false, err
 	}
-	return failure.Count >= s.policy.CaptchaFailureTrigger, nil
+	if failure.Count >= s.policy.CaptchaFailureTrigger {
+		return true, nil
+	}
+	userFailure, err := s.getLoginFailureByKey(ctx, usernameLoginKey(username))
+	if err != nil {
+		return false, err
+	}
+	return userFailure.Count >= s.policy.CaptchaFailureTrigger, nil
 }
 
 func (s *Service) loginLock(ctx context.Context, username string, clientIP string) (time.Time, bool, error) {
+	now := time.Now().UTC()
 	failure, err := s.getLoginFailure(ctx, username, clientIP)
 	if err != nil {
 		return time.Time{}, false, err
 	}
-	if failure.LockedUntil.After(time.Now().UTC()) {
+	if failure.LockedUntil.After(now) {
 		return failure.LockedUntil, true, nil
+	}
+	userFailure, err := s.getLoginFailureByKey(ctx, usernameLoginKey(username))
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if userFailure.LockedUntil.After(now) {
+		return userFailure.LockedUntil, true, nil
 	}
 	return time.Time{}, false, nil
 }
 
 func (s *Service) recordLoginFailure(ctx context.Context, username string, clientIP string) error {
-	key := loginKey(username, clientIP)
-	if s.security != nil {
-		_, err := s.security.IncrementLoginFailure(ctx, key, time.Now().UTC().Add(s.policy.LockoutDuration), s.policy.MaxFailedAttempts, s.policy.LockoutDuration)
+	if s.security == nil {
+		return nil
+	}
+	lockUntil := time.Now().UTC().Add(s.policy.LockoutDuration)
+	// 同时累加 per-IP 与 per-username 两个维度,任一触顶即锁定。
+	if _, err := s.security.IncrementLoginFailure(ctx, loginKey(username, clientIP), lockUntil, s.policy.MaxFailedAttempts, s.policy.LockoutDuration); err != nil {
+		return err
+	}
+	if _, err := s.security.IncrementLoginFailure(ctx, usernameLoginKey(username), lockUntil, s.policy.MaxFailedAttempts, s.policy.LockoutDuration); err != nil {
 		return err
 	}
 	return nil
@@ -733,14 +790,19 @@ func (s *Service) recordLoginFailure(ctx context.Context, username string, clien
 func (s *Service) clearLoginFailures(ctx context.Context, username string, clientIP string) {
 	if s.security != nil {
 		_ = s.security.ClearLoginFailure(ctx, loginKey(username, clientIP))
+		_ = s.security.ClearLoginFailure(ctx, usernameLoginKey(username))
 	}
 }
 
 func (s *Service) getLoginFailure(ctx context.Context, username string, clientIP string) (domain.LoginFailure, error) {
+	return s.getLoginFailureByKey(ctx, loginKey(username, clientIP))
+}
+
+func (s *Service) getLoginFailureByKey(ctx context.Context, key string) (domain.LoginFailure, error) {
 	if s.security == nil {
 		return domain.LoginFailure{}, nil
 	}
-	return s.security.GetLoginFailure(ctx, loginKey(username, clientIP))
+	return s.security.GetLoginFailure(ctx, key)
 }
 
 func (s *Service) encryptSecret(value string) (string, error) {

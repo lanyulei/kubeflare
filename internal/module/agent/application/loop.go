@@ -23,9 +23,10 @@ const (
 
 // plannedToolCall 是 loop 校验通过、待执行的一次工具调用。
 type plannedToolCall struct {
-	tool    domain.ToolDefinition
-	request domain.ToolCallRequest
-	inv     aiapplication.ToolInvocation
+	tool     domain.ToolDefinition
+	request  domain.ToolCallRequest
+	inv      aiapplication.ToolInvocation
+	dedupKey string // 执行成功后才登记到 seen,允许瞬时失败的调用被模型重试
 }
 
 // execOutcome 是单次工具执行的结构化结果,供 observe 阶段精确配对回喂。
@@ -45,8 +46,10 @@ type execOutcome struct {
 // 工具、达到 MaxSteps、超出 token 预算或连续失败超限。
 //
 // ctx 可被客户端断连取消(用于 think 与 act);persistCtx 用于落库,不受断连
-// 影响。返回:answer 为最终结论(COMPLETED);alive=false 表示客户端已断开
-// (上层提前返回,由 defer 兜底 cancelled);err!=nil 表示运行失败(FAILED)。
+// 影响。chatHistory 是同会话内既往的对话上下文(可为空),用于让模型理解
+// "上一次诊断说了什么"之类的追问。返回:answer 为最终结论(COMPLETED);
+// alive=false 表示客户端已断开(上层提前返回,由 defer 兜底 cancelled);
+// err!=nil 表示运行失败(FAILED)。
 func (s *Service) runLoop(
 	ctx context.Context,
 	persistCtx context.Context,
@@ -54,14 +57,16 @@ func (s *Service) runLoop(
 	run domain.AgentRun,
 	agent domain.AgentDefinition,
 	req RunAgentRequest,
+	chatHistory []aiapplication.MessageContext,
 ) (answer string, alive bool, err error) {
 	tools := s.toolRegistry.ToolsForAgent(agent.Type)
 	systemHistory := s.systemHistory(agent)
 
-	// 关键词触发的被动技能:命中则收窄工具集(交集)并追加专家提示词。未命中时
-	// allowedIDs 为 nil,后续校验与工具集均与无技能时逐字节一致(零回归)。
+	// 被动技能:优先采纳路由 LLM 的技能提示(语义命中),回退关键词匹配。命中则
+	// 收窄工具集(交集)并追加专家提示词。未命中时 allowedIDs 为 nil,后续校验与
+	// 工具集均与无技能时逐字节一致(零回归)。
 	var allowedIDs map[string]struct{}
-	if skill, ok := s.skillRegistry.MatchForAgent(agent.Type, req.Message); ok {
+	if skill, ok := s.resolveRunSkill(agent.Type, req); ok {
 		tools = filterToolsByAllowed(tools, skill.AllowedTools)
 		systemHistory = appendSkillPrompt(systemHistory, skill)
 		// 仅在声明了白名单时设置 allowedIDs,使其成为 validateInvocation 的权威约束。
@@ -72,7 +77,45 @@ func (s *Service) runLoop(
 			allowedIDs = toolIDSet(tools)
 		}
 	}
+	// 追加同会话的既往对话作为跨 run 的诊断记忆。必须在技能提示词合并之后:
+	// appendSkillPrompt 依赖"历史尾部是 system 消息"才能就地合并,先追加对话
+	// 会把 system 挤离尾部,导致产生第二条 system 消息。
+	if len(chatHistory) > 0 {
+		merged := make([]aiapplication.MessageContext, 0, len(systemHistory)+len(chatHistory))
+		merged = append(merged, systemHistory...)
+		merged = append(merged, chatHistory...)
+		systemHistory = merged
+	}
+	// 诊断案例库:把与本次问题相似的历史案例(症状→根因)以 few-shot 注入系统
+	// 提示。仅读内存缓存,无匹配时系统提示与未启用案例库时逐字节一致。
+	if s.caseLibraryEnabled() {
+		if section := s.caseFewShotPromptSection(agent.Type, req.Message); section != "" {
+			systemHistory = mergeLeadingSystemPrompt(systemHistory, section)
+		}
+	}
 	specs, nameToID := s.buildToolSpecs(tools)
+
+	// extraTokens 累加旁路 LLM 调用(显式计划/反思 critic)的消耗:它们是独立请求,
+	// 不在主循环"取每步累计 max"的 tokenUsed 之内,预算判定时两者相加。
+	extraTokens := 0
+	// 显式计划:取证开始前让模型产出假设与验证步骤,注入系统提示作为全程路标,
+	// 降低复杂故障下逐步 ReAct 的"迷路"概率。任何失败(LLM 错误/JSON 不可解析/
+	// 内容为空)仅告警并降级,循环行为与无计划时完全一致。
+	if s.planningEnabled() {
+		planText, planTokens, planErr := s.generatePlan(ctx, systemHistory, req.Message, tools)
+		extraTokens += planTokens
+		if planErr != nil {
+			if ctx.Err() != nil {
+				return "", false, nil
+			}
+			s.logAgentWarn("generate plan", planErr, "run_id", run.ID)
+		} else {
+			systemHistory = mergeLeadingSystemPrompt(systemHistory, planText)
+			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_PLAN_GENERATED, Delta: planText}) {
+				return "", false, nil
+			}
+		}
+	}
 
 	var priorTurns []aiapplication.ToolCallTurn
 	tokenUsed := 0
@@ -80,7 +123,12 @@ func (s *Service) runLoop(
 	errStreak := 0
 	seen := map[string]bool{}
 
-	for step := 0; step < s.opts.MaxSteps; step++ {
+	// maxSteps 可被反思自检延长(每轮至多 MaxReflectionSteps 步补证);reflections
+	// 计数限制每 run 的 critic 轮数(上限 MaxReflections),杜绝反思死循环。
+	maxSteps := s.opts.MaxSteps
+	reflections := 0
+
+	for step := 0; step < maxSteps; step++ {
 		reply, invocations, streamed, genErr := s.think(ctx, events, systemHistory, req.Message, priorTurns, specs)
 		if genErr != nil {
 			if ctx.Err() != nil {
@@ -88,13 +136,19 @@ func (s *Service) runLoop(
 			}
 			return "", true, genErr
 		}
-		// provider 返回了真实 usage 时直接累加;部分 provider(尤其流式且未开启
-		// include_usage)恒返回 0,此时用字符数估算兜底,避免 MaxTokenBudget
-		// 护栏在流式下静默失效。
+		// token 预算计数:provider 的 prompt/total tokens 是「本次请求的累计值」,
+		// 每步都重发完整上下文(system + question + 所有 priorTurns),其值已含此前
+		// 各步。若逐步 += 会把同一上下文重复计入 O(n²) 次,使 MaxTokenBudget 被
+		// 「除以步数」后提前触发。改为取最新一步的累计值(取代,而非累加)。流式且
+		// 未开启 include_usage 的 provider 恒返回 0,此时用累计字符估算兜底。
 		if reply.TotalTokens > 0 {
-			tokenUsed += reply.TotalTokens
+			if reply.TotalTokens > tokenUsed {
+				tokenUsed = reply.TotalTokens
+			}
 		} else {
-			tokenUsed += estimateStepTokens(systemHistory, req.Message, priorTurns, reply.Content)
+			if est := estimateStepTokens(systemHistory, req.Message, priorTurns, reply.Content); est > tokenUsed {
+				tokenUsed = est
+			}
 		}
 
 		// 非流式路径下整段补发一次 thinking;流式路径已逐 token 发送,不再重复。
@@ -104,13 +158,47 @@ func (s *Service) runLoop(
 			}
 		}
 
-		// 模型不再请求工具 → 收尾。
+		// 模型不再请求工具 → 候选结论。启用反思时先做 critic 自检(每 run 至多
+		// MaxReflections 轮):结论未被充分支持(unsupported/partially)则注入分级
+		// 缺口指引并允许至多 MaxReflectionSteps 步补充取证;critic 任何失败(LLM
+		// 错误/JSON 不可解析)都保留原结论,绝不让 run 失败。forceConclude 路径
+		// (超步数/超预算/连续失败)不反思——那里已在收尾止损。
 		if len(invocations) == 0 {
-			return strings.TrimSpace(reply.Content), true, nil
+			answer := strings.TrimSpace(reply.Content)
+			if reflections < s.opts.MaxReflections && answer != "" && s.reflectionEnabled() && s.reflectionBudgetLeft(tokenUsed+extraTokens) {
+				reflections++
+				verdict, criticTokens, reflectErr := s.reflectAnswer(ctx, req.Message, priorTurns, answer)
+				extraTokens += criticTokens
+				if reflectErr != nil {
+					if ctx.Err() != nil {
+						return "", false, nil
+					}
+					s.logAgentWarn("reflect answer", reflectErr, "run_id", run.ID)
+					return answer, true, nil
+				}
+				if verdict.level() != REFLECTION_VERDICT_SUPPORTED {
+					if guidance := reflectionGuidance(verdict); guidance != "" {
+						// 草稿结论以 assistant 轮次入上下文(空 ToolCalls 序列化为
+						// 普通 assistant 消息),补证指引并入头部 system 消息。步数
+						// 上限相对当前步延长一轮,绝对不超过 MaxSteps 加全部反思轮
+						// 的补证步数之和。
+						maxSteps = min(s.opts.MaxSteps+s.opts.MaxReflections*s.opts.MaxReflectionSteps, step+1+s.opts.MaxReflectionSteps)
+						priorTurns = append(priorTurns, aiapplication.ToolCallTurn{AssistantContent: answer})
+						systemHistory = mergeLeadingSystemPrompt(systemHistory, guidance)
+						continue
+					}
+				}
+			}
+			return answer, true, nil
 		}
 
-		// token 预算超限 → 强制收尾。
-		if s.opts.MaxTokenBudget > 0 && tokenUsed > s.opts.MaxTokenBudget {
+		// 兜底补全空 tool_call ID:部分 provider 在非流式 function-calling 下省略 ID,
+		// 后续 assistant/tool 消息配对依赖该 ID,空 ID 会被严格的 OpenAI 兼容端拒绝
+		// (400),把可恢复的坏参数升级为整轮失败。这里为缺失项生成稳定占位 ID。
+		ensureInvocationIDs(invocations)
+
+		// token 预算超限 → 强制收尾(预算判定包含计划/反思等旁路调用的消耗)。
+		if s.opts.MaxTokenBudget > 0 && tokenUsed+extraTokens > s.opts.MaxTokenBudget {
 			return s.forceConclude(ctx, systemHistory, req.Message, priorTurns)
 		}
 
@@ -140,14 +228,36 @@ func (s *Service) runLoop(
 		if !batchAlive {
 			return "", false, nil
 		}
+		// 观察智能压缩(可选):超出回喂预算的观察文本按当前问题做 LLM 压缩,失败
+		// 回退 observeToolResult 的硬截断;压缩消耗计入运行预算。
+		if s.observeCompressionEnabled() {
+			extraTokens += s.compressObservations(ctx, req.Message, planned, outcomes)
+		}
 		for index := range planned {
-			turn.Results = append(turn.Results, observeToolResult(planned[index].inv, outcomes[index]))
+			// 仅在执行成功后登记去重键:失败(超时/apiserver 抖动)的调用允许模型
+			// 重试,避免把瞬时故障误判为"已查询过"而拒绝。
+			if outcomes[index].executed && outcomes[index].err == nil {
+				seen[planned[index].dedupKey] = true
+			}
+			turn.Results = append(turn.Results, observeToolResult(planned[index].inv, outcomes[index], planned[index].tool.ObserveMaxChars))
 		}
 		priorTurns = append(priorTurns, turn)
 	}
 
 	// 达到 MaxSteps,强制收尾。
 	return s.forceConclude(ctx, systemHistory, req.Message, priorTurns)
+}
+
+// resolveRunSkill 选定本次 run 的技能:优先采纳路由阶段 LLM 给出的技能提示
+// (须存在、已启用且适用于该 Agent,fail-closed),否则回退关键词匹配。返回值
+// 语义与 SkillRegistry.MatchForAgent 一致。
+func (s *Service) resolveRunSkill(agentType string, req RunAgentRequest) (domain.SkillDefinition, bool) {
+	if id := strings.TrimSpace(req.routedSkillID); id != "" {
+		if skill, ok := s.skillRegistry.Get(id); ok && skill.Enabled && skill.AppliesToAgent(agentType) {
+			return skill, true
+		}
+	}
+	return s.skillRegistry.MatchForAgent(agentType, req.Message)
 }
 
 // think 执行一步带工具的 LLM 生成,带单步超时保护。streamThink 开启时逐 token
@@ -278,7 +388,9 @@ func (s *Service) validateInvocation(
 	if seen[key] {
 		return plannedToolCall{}, validationResult{reason: "该工具与参数已调用过,请基于已有证据继续分析或给出结论"}
 	}
-	seen[key] = true
+	// 注意:此处仅做去重检查,不在此标记 seen。标记推迟到执行成功之后(见
+	// runLoop),否则一次因超时/apiserver 抖动而失败的调用会被永久拉黑,模型无法
+	// 对同一查询发起合理重试。
 
 	// loop 不替工具解析参数:K8s 专属的 Scope 合并由集群执行器在 Execute 内自行
 	// 完成(与监控类工具自解析 Arguments 对称),loop 仅透传预设 Scope 与原始
@@ -292,7 +404,7 @@ func (s *Service) validateInvocation(
 		Scope:     req.Scope,
 		Arguments: inv.Arguments,
 	}
-	return plannedToolCall{tool: tool, request: toolReq, inv: inv}, validationResult{valid: true}
+	return plannedToolCall{tool: tool, request: toolReq, inv: inv, dedupKey: key}, validationResult{valid: true}
 }
 
 // executeToolBatch 执行一批已校验的工具调用,沿用三阶段(串行建调用+started →
@@ -321,7 +433,13 @@ func (s *Service) executeToolBatch(
 			Status:    domain.TOOL_CALL_STATUS_RUNNING,
 			StartedAt: time.Now().UTC(),
 		}
-		call.Input, _ = json.Marshal(toolReq)
+		input, err := json.Marshal(toolReq)
+		if err != nil {
+			// 入参序列化失败极罕见(toolReq 为内部结构),但静默丢弃会让工具调用记录
+			// 落库时 Input 为 null,排障时无法还原模型当时请求的参数。记录后继续。
+			s.logPersistError("marshal tool call input", err, "tool_id", calls[index].tool.ID, "run_id", run.ID)
+		}
+		call.Input = input
 		call = s.createToolCall(persistCtx, call)
 		toolCalls[index] = call
 		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_TOOL_STARTED, ToolCall: &call}) {
@@ -365,12 +483,10 @@ func (s *Service) executeToolBatch(
 		}
 		call.Status = domain.TOOL_CALL_STATUS_COMPLETED
 		call.OutputSummary = strings.TrimSpace(execution.result.Summary)
-		call = s.updateToolCall(persistCtx, call)
 
-		collected := make([]domain.Evidence, 0, len(execution.result.Evidence))
-		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_TOOL_COMPLETED, ToolCall: &call}) {
-			return outcomes, false
-		}
+		// 预先组装本次调用的全部证据(补全关联字段),连同工具调用终态在单事务内
+		// 原子落库,避免"调用已完成但证据部分缺失"的不一致。
+		prepared := make([]domain.Evidence, 0, len(execution.result.Evidence))
 		for _, evidence := range execution.result.Evidence {
 			evidence.RunID = run.ID
 			evidence.ToolCallID = call.ID
@@ -380,7 +496,16 @@ func (s *Service) executeToolBatch(
 			if evidence.CollectedAt.IsZero() {
 				evidence.CollectedAt = time.Now().UTC()
 			}
-			evidence = s.createEvidence(persistCtx, evidence)
+			prepared = append(prepared, evidence)
+		}
+		call, collectedEvidence := s.completeToolCallWithEvidence(persistCtx, call, prepared)
+
+		collected := make([]domain.Evidence, 0, len(collectedEvidence))
+		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_TOOL_COMPLETED, ToolCall: &call}) {
+			return outcomes, false
+		}
+		for i := range collectedEvidence {
+			evidence := collectedEvidence[i]
 			*evidenceSeq++
 			collected = append(collected, evidence)
 			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_EVIDENCE_CREATED, Evidence: &evidence}) {
@@ -476,6 +601,26 @@ func appendSkillPrompt(history []aiapplication.MessageContext, skill domain.Skil
 	return append(history, aiapplication.MessageContext{Role: "system", Content: addition})
 }
 
+// mergeLeadingSystemPrompt 把附加指引并入历史头部的 system 消息(无则前插一条),
+// 保证全程只有单条 system 消息。与 appendSkillPrompt(尾部合并,仅在 chatHistory
+// 合并前有效)互补:chatHistory 合并后唯一的 system 消息位于头部,本函数用于此后
+// 的注入(显式计划/反思指引)。拷贝切片,不修改入参。
+func mergeLeadingSystemPrompt(history []aiapplication.MessageContext, addition string) []aiapplication.MessageContext {
+	addition = strings.TrimSpace(addition)
+	if addition == "" {
+		return history
+	}
+	if len(history) > 0 && history[0].Role == "system" {
+		merged := make([]aiapplication.MessageContext, len(history))
+		copy(merged, history)
+		merged[0].Content = strings.TrimSpace(merged[0].Content + "\n\n" + addition)
+		return merged
+	}
+	merged := make([]aiapplication.MessageContext, 0, len(history)+1)
+	merged = append(merged, aiapplication.MessageContext{Role: "system", Content: addition})
+	return append(merged, history...)
+}
+
 // toolIDSet 收集工具 ID 集合,供 validateInvocation 做技能白名单权威校验。
 func toolIDSet(tools []domain.ToolDefinition) map[string]struct{} {
 	set := make(map[string]struct{}, len(tools))
@@ -525,10 +670,25 @@ func errToolResult(inv aiapplication.ToolInvocation, reason string) aiapplicatio
 	}
 }
 
+// ensureInvocationIDs 为缺失 ID 的工具调用生成稳定占位 ID(原地修改),保证后续
+// assistant.tool_calls 与 tool.tool_call_id 能正确配对,避免严格 provider 因空
+// tool_call_id 返回 400。已有 ID 的调用保持不变。
+func ensureInvocationIDs(invocations []aiapplication.ToolInvocation) {
+	for i := range invocations {
+		if strings.TrimSpace(invocations[i].ID) == "" {
+			invocations[i].ID = fmt.Sprintf("call_%d_%s", i, newID("tool"))
+		}
+	}
+}
+
 // observeToolResult 把一次工具执行结果压缩成回喂给 LLM 的观察文本。
 // 优先使用执行器提供的结构化 Observation(含异常资源明细/日志正文等关键信息),
-// 否则退回 summary + 各证据摘要。始终截断到上限,绝不回喂完整 RawJSON。
-func observeToolResult(inv aiapplication.ToolInvocation, outcome execOutcome) aiapplication.ToolResultMessage {
+// 否则退回 summary + 各证据摘要。始终截断到 maxChars(<=0 时沿用全局默认
+// MAX_OBSERVE_CHARS),绝不回喂完整 RawJSON。
+func observeToolResult(inv aiapplication.ToolInvocation, outcome execOutcome, maxChars int) aiapplication.ToolResultMessage {
+	if maxChars <= 0 {
+		maxChars = MAX_OBSERVE_CHARS
+	}
 	if outcome.err != nil {
 		return aiapplication.ToolResultMessage{
 			ToolCallID: inv.ID,
@@ -541,7 +701,7 @@ func observeToolResult(inv aiapplication.ToolInvocation, outcome execOutcome) ai
 	// 执行器给出的结构化观察优先(信息量远高于一句话 summary),它已是为模型
 	// 推理裁剪过的关键明细。
 	if observation := strings.TrimSpace(outcome.observation); observation != "" {
-		builder.WriteString(truncate(observation, MAX_OBSERVE_CHARS))
+		builder.WriteString(truncate(observation, maxChars))
 	} else {
 		if summary := strings.TrimSpace(outcome.summary); summary != "" {
 			builder.WriteString(truncate(summary, MAX_OBSERVE_SUMMARY_CHARS))
@@ -551,7 +711,7 @@ func observeToolResult(inv aiapplication.ToolInvocation, outcome execOutcome) ai
 			if line == "" {
 				continue
 			}
-			if builder.Len()+len(line)+8 > MAX_OBSERVE_CHARS {
+			if builder.Len()+len(line)+8 > maxChars {
 				builder.WriteString("\n…(更多证据已省略,可在证据列表中查看)")
 				break
 			}

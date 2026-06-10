@@ -30,6 +30,7 @@ type agentRunRecord struct {
 	Status       string           `gorm:"size:32;not null;index"`
 	Confidence   float64          `gorm:"not null;default:0"`
 	RouteReason  string           `gorm:"type:text;not null;default:''"`
+	RouteSource  string           `gorm:"size:16;not null;default:''"`
 	Summary      string           `gorm:"type:text;not null;default:''"`
 	ErrorMessage string           `gorm:"type:text;not null;default:''"`
 	CreatedAt    time.Time        `gorm:"not null;index"`
@@ -70,6 +71,19 @@ type agentEvidenceRecord struct {
 	DeletedAt       gorm.DeletedAt   `gorm:"index"`
 }
 
+// agentRouteFeedbackRecord 是路由确认反馈的存储形态(无软删:反馈是只追加的
+// 学习样本,缓存与查询均按 created_at 倒序取最近 N 条)。
+type agentRouteFeedbackRecord struct {
+	ID                string    `gorm:"primaryKey;size:64"`
+	UserID            string    `gorm:"size:128;not null;default:'';index"`
+	Message           string    `gorm:"size:512;not null;default:''"`
+	RoutedAgentType   string    `gorm:"size:64;not null;default:''"`
+	RoutedConfidence  float64   `gorm:"not null;default:0"`
+	SelectedAgentType string    `gorm:"size:64;not null;default:''"`
+	Matched           bool      `gorm:"not null;default:false"`
+	CreatedAt         time.Time `gorm:"not null;index"`
+}
+
 func (agentRunRecord) TableName() string {
 	return "agent_run"
 }
@@ -80,6 +94,10 @@ func (agentToolCallRecord) TableName() string {
 
 func (agentEvidenceRecord) TableName() string {
 	return "agent_evidence"
+}
+
+func (agentRouteFeedbackRecord) TableName() string {
+	return "agent_route_feedback"
 }
 
 func NewAgentRepository(db *gorm.DB, timeout time.Duration) *AgentRepository {
@@ -114,9 +132,16 @@ func (r *AgentRepository) UpdateRun(ctx context.Context, run domain.AgentRun) (d
 		return domain.AgentRun{}, err
 	}
 
+	// 终态只能写一次:若 DB 中已是终态(取消/完成/失败),不再覆盖,直接返回现状。
+	// 防止 CancelRun 与 run() 收尾并发写时互相覆盖(如把已取消的 run 改回 completed)。
+	if isTerminalRunStatus(record.Status) && record.Status != run.Status {
+		return toDomainRun(record), nil
+	}
+
 	record.Status = run.Status
 	record.Confidence = run.Confidence
 	record.RouteReason = run.RouteReason
+	record.RouteSource = run.RouteSource
 	record.Summary = run.Summary
 	record.ErrorMessage = run.ErrorMessage
 	record.CompletedAt = run.CompletedAt
@@ -127,6 +152,16 @@ func (r *AgentRepository) UpdateRun(ctx context.Context, run domain.AgentRun) (d
 		return domain.AgentRun{}, err
 	}
 	return toDomainRun(record), nil
+}
+
+// isTerminalRunStatus 判断运行是否已到不可逆终态。
+func isTerminalRunStatus(status string) bool {
+	switch status {
+	case domain.RUN_STATUS_COMPLETED, domain.RUN_STATUS_FAILED, domain.RUN_STATUS_CANCELLED:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *AgentRepository) GetRun(ctx context.Context, runID string) (domain.AgentRun, error) {
@@ -183,6 +218,51 @@ func (r *AgentRepository) UpdateToolCall(ctx context.Context, call domain.AgentT
 		return domain.AgentToolCall{}, err
 	}
 	return toDomainToolCall(record), nil
+}
+
+// CompleteToolCallWithEvidence 在单事务内更新工具调用终态并批量写入证据。任一步
+// 失败则整体回滚,杜绝"调用已完成但证据缺失"或"孤儿证据"的中间态。事务仅覆盖这
+// 一次落库,绝不跨越 LLM 流式调用,避免长事务占用连接。
+func (r *AgentRepository) CompleteToolCallWithEvidence(ctx context.Context, call domain.AgentToolCall, evidence []domain.Evidence) (domain.AgentToolCall, []domain.Evidence, error) {
+	if r.db == nil {
+		return call, evidence, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	savedEvidence := make([]domain.Evidence, 0, len(evidence))
+	var savedCall domain.AgentToolCall
+	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
+		var record agentToolCallRecord
+		if err := tx.First(&record, "id = ?", call.ID).Error; err != nil {
+			return err
+		}
+		record.OutputSummary = call.OutputSummary
+		record.Status = call.Status
+		record.ErrorMessage = call.ErrorMessage
+		record.CompletedAt = call.CompletedAt
+		if len(call.Input) > 0 {
+			record.Input = dbplatform.NewJSONB(call.Input)
+		}
+		if err := tx.Save(&record).Error; err != nil {
+			return err
+		}
+		savedCall = toDomainToolCall(record)
+
+		for _, item := range evidence {
+			evidenceRecord := fromDomainEvidence(item)
+			if err := tx.Create(&evidenceRecord).Error; err != nil {
+				return err
+			}
+			savedEvidence = append(savedEvidence, toDomainEvidence(evidenceRecord))
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.AgentToolCall{}, nil, err
+	}
+	return savedCall, savedEvidence, nil
 }
 
 func (r *AgentRepository) ListToolCalls(ctx context.Context, runID string) ([]domain.AgentToolCall, error) {
@@ -270,6 +350,53 @@ func (r *AgentRepository) FailStaleRuns(ctx context.Context, before time.Time, e
 	return result.RowsAffected, nil
 }
 
+// MAX_ROUTE_FEEDBACK_QUERY_LIMIT 限制单次反馈查询的返回条数,防御异常入参。
+const MAX_ROUTE_FEEDBACK_QUERY_LIMIT = 100
+
+// CreateRouteFeedback 持久化一条路由确认反馈(实现 domain.RouteFeedbackRepository)。
+func (r *AgentRepository) CreateRouteFeedback(ctx context.Context, feedback domain.RouteFeedback) (domain.RouteFeedback, error) {
+	if r.db == nil {
+		return feedback, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	record := fromDomainRouteFeedback(feedback)
+	if err := r.db.WithContext(queryCtx).Create(&record).Error; err != nil {
+		return domain.RouteFeedback{}, err
+	}
+	return toDomainRouteFeedback(record), nil
+}
+
+// ListRecentRouteFeedback 按创建时间倒序返回最近的路由反馈(实现
+// domain.RouteFeedbackRepository),供启动时预热 few-shot 样例缓存。
+func (r *AgentRepository) ListRecentRouteFeedback(ctx context.Context, limit int) ([]domain.RouteFeedback, error) {
+	if r.db == nil {
+		return []domain.RouteFeedback{}, nil
+	}
+	if limit <= 0 || limit > MAX_ROUTE_FEEDBACK_QUERY_LIMIT {
+		limit = MAX_ROUTE_FEEDBACK_QUERY_LIMIT
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var records []agentRouteFeedbackRecord
+	if err := r.db.WithContext(queryCtx).
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&records).Error; err != nil {
+		return nil, err
+	}
+
+	items := make([]domain.RouteFeedback, 0, len(records))
+	for _, record := range records {
+		items = append(items, toDomainRouteFeedback(record))
+	}
+	return items, nil
+}
+
 func toDomainRun(record agentRunRecord) domain.AgentRun {
 	run := domain.AgentRun{
 		ID:           record.ID,
@@ -280,6 +407,7 @@ func toDomainRun(record agentRunRecord) domain.AgentRun {
 		Status:       record.Status,
 		Confidence:   record.Confidence,
 		RouteReason:  record.RouteReason,
+		RouteSource:  record.RouteSource,
 		Summary:      record.Summary,
 		ErrorMessage: record.ErrorMessage,
 		CreatedAt:    record.CreatedAt,
@@ -307,6 +435,7 @@ func fromDomainRun(run domain.AgentRun) agentRunRecord {
 		Status:       run.Status,
 		Confidence:   run.Confidence,
 		RouteReason:  run.RouteReason,
+		RouteSource:  run.RouteSource,
 		Summary:      run.Summary,
 		ErrorMessage: run.ErrorMessage,
 		CreatedAt:    run.CreatedAt,
@@ -393,5 +522,31 @@ func fromDomainEvidence(evidence domain.Evidence) agentEvidenceRecord {
 		Hash:            evidence.Hash,
 		Redacted:        evidence.Redacted,
 		CollectedAt:     evidence.CollectedAt,
+	}
+}
+
+func toDomainRouteFeedback(record agentRouteFeedbackRecord) domain.RouteFeedback {
+	return domain.RouteFeedback{
+		ID:                record.ID,
+		UserID:            record.UserID,
+		Message:           record.Message,
+		RoutedAgentType:   record.RoutedAgentType,
+		RoutedConfidence:  record.RoutedConfidence,
+		SelectedAgentType: record.SelectedAgentType,
+		Matched:           record.Matched,
+		CreatedAt:         record.CreatedAt,
+	}
+}
+
+func fromDomainRouteFeedback(feedback domain.RouteFeedback) agentRouteFeedbackRecord {
+	return agentRouteFeedbackRecord{
+		ID:                feedback.ID,
+		UserID:            feedback.UserID,
+		Message:           feedback.Message,
+		RoutedAgentType:   feedback.RoutedAgentType,
+		RoutedConfidence:  feedback.RoutedConfidence,
+		SelectedAgentType: feedback.SelectedAgentType,
+		Matched:           feedback.Matched,
+		CreatedAt:         feedback.CreatedAt,
 	}
 }

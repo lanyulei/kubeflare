@@ -63,8 +63,16 @@ func (a *App) Shutdown(ctx context.Context) error {
 			shutdownErr = err
 		}
 
+		// 资源清理(trace flush / redis / db)使用独立超时,避免被前面 drain +
+		// Server.Shutdown 已耗尽的 ctx 连带取消,导致连接未正常关闭、trace 丢失。
+		cleanupTimeout := a.Config.HTTP.ShutdownTimeout
+		if cleanupTimeout <= 0 {
+			cleanupTimeout = 10 * time.Second
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
 		for _, shutdowner := range a.shutdowners {
-			if err := shutdowner(ctx); err != nil && shutdownErr == nil {
+			if err := shutdowner(cleanupCtx); err != nil && shutdownErr == nil {
 				shutdownErr = err
 			}
 		}

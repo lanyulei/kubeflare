@@ -34,6 +34,9 @@ type Service struct {
 	validator *validator.Validate
 	encryptor secrets.Encryptor
 	inspector RuntimeInspector
+	// invalidators 在集群 kubeconfig 更新/删除后被调用,通知缓存层(如 agent 的
+	// clientset 工厂、代理的 transport 缓存)立即失效对应条目,避免沿用旧凭证。
+	invalidators []func(clusterID string)
 }
 
 func NewService(repo domain.Repository, validator *validator.Validate, encryptor secrets.Encryptor, inspector RuntimeInspector) *Service {
@@ -45,6 +48,22 @@ func NewService(repo domain.Repository, validator *validator.Validate, encryptor
 		validator: validator,
 		encryptor: encryptor,
 		inspector: inspector,
+	}
+}
+
+// RegisterCacheInvalidator 注册一个缓存失效回调,集群变更时按集群 ID 触发。
+// 在装配阶段调用(非并发),无需加锁。
+func (s *Service) RegisterCacheInvalidator(fn func(clusterID string)) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.invalidators = append(s.invalidators, fn)
+}
+
+// invalidateCache 通知所有已注册的缓存层失效指定集群。
+func (s *Service) invalidateCache(clusterID string) {
+	for _, fn := range s.invalidators {
+		fn(clusterID)
 	}
 }
 
@@ -145,6 +164,8 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 	if err != nil {
 		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
+	// kubeconfig 可能已变更,立即失效缓存的 client/transport,避免 TTL 窗口内沿用旧凭证。
+	s.invalidateCache(strings.TrimSpace(id))
 	return clusterWithSaveStats(updated, kubeconfig, stats, true), nil
 }
 
@@ -156,6 +177,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if err := s.repo.Delete(ctx, clusterID); err != nil {
 		return mapRepositoryError(err, "cluster not found")
 	}
+	s.invalidateCache(strings.TrimSpace(id))
 	return nil
 }
 

@@ -16,6 +16,8 @@ type scriptedGenerator struct {
 	callCount    int
 	concludeText string
 	concludeErr  error
+	// histories 记录每次 GenerateWithTools 收到的 history,供断言上下文组装。
+	histories [][]aiapplication.MessageContext
 }
 
 type scriptedStep struct {
@@ -38,12 +40,13 @@ func (g *scriptedGenerator) ConnectionStatus(_ context.Context) aiapplication.As
 
 func (g *scriptedGenerator) GenerateWithTools(
 	_ context.Context,
-	_ []aiapplication.MessageContext,
+	history []aiapplication.MessageContext,
 	_ string,
 	_ []aiapplication.ToolCallTurn,
 	tools []aiapplication.ToolSpec,
 	toolChoice string,
 ) (aiapplication.AssistantReply, []aiapplication.ToolInvocation, error) {
+	g.histories = append(g.histories, history)
 	// tools==nil 且 toolChoice==none 视为 forceConclude。
 	if tools == nil && toolChoice == "none" {
 		if g.concludeErr != nil {
@@ -149,7 +152,7 @@ func TestRunLoopHappyPath(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		answer, alive, err = s.runLoop(context.Background(), context.Background(), events, run, diagnosticAgent(s), RunAgentRequest{Message: "why pod failing", ClusterID: "c1"})
+		answer, alive, err = s.runLoop(context.Background(), context.Background(), events, run, diagnosticAgent(s), RunAgentRequest{Message: "why pod failing", ClusterID: "c1"}, nil)
 	}()
 	evts := drain(events)
 
@@ -189,7 +192,7 @@ func TestRunLoopRejectsUnknownTool(t *testing.T) {
 	events := make(chan domain.AgentRunEvent, 64)
 	go func() {
 		defer close(events)
-		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"})
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
 	}()
 	drain(events)
 
@@ -215,7 +218,7 @@ func TestRunLoopDedup(t *testing.T) {
 	events := make(chan domain.AgentRunEvent, 64)
 	go func() {
 		defer close(events)
-		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"})
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
 	}()
 	drain(events)
 
@@ -245,7 +248,7 @@ func TestRunLoopMaxStepsForceConclude(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		answer, _, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"})
+		answer, _, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
 	}()
 	drain(events)
 
@@ -271,7 +274,7 @@ func TestRunLoopGeneratorError(t *testing.T) {
 	var err error
 	go func() {
 		defer close(events)
-		_, alive, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"})
+		_, alive, err = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "x", ClusterID: "c"}, nil)
 	}()
 	drain(events)
 
@@ -338,5 +341,42 @@ func TestEstimateStepTokens(t *testing.T) {
 	more := estimateStepTokens(history, "为什么 pod 崩溃，请详细分析根因并给出修复建议步骤一二三四五", nil, "这里是一段更长的回复内容用于验证估算随长度增长")
 	if more <= tokens {
 		t.Errorf("longer content should estimate more tokens: %d <= %d", more, tokens)
+	}
+}
+
+// TestRunLoopCarriesChatHistory:同会话既往对话应在 system 提示词之后回喂给
+// 模型,使"那怎么修复"之类的追问具备跨 run 的诊断记忆。
+func TestRunLoopCarriesChatHistory(t *testing.T) {
+	gen := &scriptedGenerator{
+		steps: []scriptedStep{{reply: aiapplication.AssistantReply{Content: "结论:与上次诊断相同", TotalTokens: 10}}},
+	}
+	s := newLoopTestService(gen, &stubToolExecutor{})
+
+	chatHistory := []aiapplication.MessageContext{
+		{Role: "user", Content: "pod 为什么挂了"},
+		{Role: "assistant", Content: "镜像拉取失败导致 ImagePullBackOff"},
+	}
+	events := make(chan domain.AgentRunEvent, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = s.runLoop(context.Background(), context.Background(), events, domain.AgentRun{ID: "r"}, diagnosticAgent(s), RunAgentRequest{Message: "那怎么修复", ClusterID: "c"}, chatHistory)
+		close(events)
+	}()
+	drain(events)
+	<-done
+
+	if len(gen.histories) == 0 {
+		t.Fatal("generator did not receive any history")
+	}
+	got := gen.histories[0]
+	if len(got) != 3 {
+		t.Fatalf("history length = %d, want 3 (system + 2 chat)", len(got))
+	}
+	if got[0].Role != "system" {
+		t.Fatalf("history[0].Role = %q, want system", got[0].Role)
+	}
+	if got[1] != chatHistory[0] || got[2] != chatHistory[1] {
+		t.Fatalf("chat history not appended after system prompt: %+v", got)
 	}
 }

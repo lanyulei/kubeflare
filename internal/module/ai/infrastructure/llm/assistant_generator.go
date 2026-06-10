@@ -64,6 +64,7 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 	go func() {
 		defer close(events)
 		var reply application.AssistantReply
+		var contentBuilder strings.Builder
 		for event := range stream {
 			if event.Err != nil {
 				_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Err: event.Err})
@@ -81,12 +82,14 @@ func (generator *AssistantGenerator) Stream(ctx context.Context, history []appli
 				reply.TotalTokens = event.Usage.TotalTokens
 			}
 			if event.Delta != "" {
-				reply.Content += event.Delta
+				// 用 strings.Builder 累计,避免 reply.Content += 的 O(n²) 反复分配。
+				contentBuilder.WriteString(event.Delta)
 				if !sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Delta: event.Delta}) {
 					return
 				}
 			}
 			if event.Done {
+				reply.Content = contentBuilder.String()
 				_ = sendAssistantStreamEvent(ctx, events, application.AssistantStreamEvent{Done: true, Reply: reply})
 				return
 			}
@@ -158,6 +161,7 @@ func (generator *AssistantGenerator) StreamWithTools(
 	go func() {
 		defer close(events)
 		var reply application.AssistantReply
+		var contentBuilder strings.Builder
 		for event := range stream {
 			if event.Err != nil {
 				_ = sendToolStreamEvent(ctx, events, application.AssistantToolStreamEvent{Err: event.Err})
@@ -175,12 +179,14 @@ func (generator *AssistantGenerator) StreamWithTools(
 				reply.TotalTokens = event.Usage.TotalTokens
 			}
 			if event.Delta != "" {
-				reply.Content += event.Delta
+				// strings.Builder 累计,避免 += 的 O(n²) 分配。
+				contentBuilder.WriteString(event.Delta)
 				if !sendToolStreamEvent(ctx, events, application.AssistantToolStreamEvent{Delta: event.Delta}) {
 					return
 				}
 			}
 			if event.Done {
+				reply.Content = contentBuilder.String()
 				_ = sendToolStreamEvent(ctx, events, application.AssistantToolStreamEvent{
 					Done:      true,
 					Reply:     reply,
@@ -223,6 +229,11 @@ func (generator *AssistantGenerator) client() (platformllm.Client, error) {
 }
 
 func isStreamingDisabledError(err error) bool {
+	// 优先结构化判定:本项目 client 在禁用流式时包装 ErrStreamingDisabled。
+	if errors.Is(err, platformllm.ErrStreamingDisabled) {
+		return true
+	}
+	// 兼容回退:个别非标准 provider 可能以不同措辞返回禁用流式的错误。
 	var providerErr *platformllm.ProviderError
 	return errors.As(err, &providerErr) &&
 		providerErr.StatusCode == 0 &&

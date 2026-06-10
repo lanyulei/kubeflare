@@ -171,6 +171,26 @@ func (s *FailoverStore) HasOIDCState(ctx context.Context, state string) (bool, e
 	return store.HasOIDCState(ctx, state)
 }
 
+// ClaimOnce 在权威存储上原子占用,再尽力同步到另一存储。最终一致性以权威存储
+// 的返回为准,避免两边都判 true 导致重放被放行。
+func (s *FailoverStore) ClaimOnce(ctx context.Context, key string, expiresAt time.Time) (bool, error) {
+	store := s.authoritativeSecurityStore()
+	if store == nil {
+		return false, nil
+	}
+	claimed, err := store.ClaimOnce(ctx, key, expiresAt)
+	if err != nil {
+		return false, err
+	}
+	if claimed {
+		s.bestEffortSecurity(ctx, store, func(other domain.SecurityStateStore) error {
+			_, err := other.ClaimOnce(ctx, key, expiresAt)
+			return err
+		})
+	}
+	return claimed, nil
+}
+
 func (s *FailoverStore) ConsumeOIDCState(ctx context.Context, state string) (bool, error) {
 	store := s.authoritativeSecurityStore()
 	if store == nil {

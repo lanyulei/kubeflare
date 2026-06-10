@@ -3,42 +3,35 @@ package kubernetes
 import (
 	"net/url"
 	"strings"
-	"sync"
-	"sync/atomic"
+
+	"github.com/lanyulei/kubeflare/internal/shared/limiter"
 )
 
 // sessionLimiter caps the number of simultaneous upgrade sessions a single
-// authenticated subject may hold open at once. It is a pure in-memory map;
-// process restart resets the counter, which is acceptable because every open
-// session also dies when the process dies.
+// authenticated subject may hold open at once. It is a pure in-memory counter;
+// process restart resets it, which is acceptable because every open session
+// also dies when the process dies.
+//
+// It is a thin wrapper over shared/limiter's keyed semaphore, which deletes a
+// subject's counter once it returns to zero — important here because subjects
+// come from external (authenticated) input and would otherwise accumulate
+// unboundedly over the process lifetime.
 type sessionLimiter struct {
-	max     int
-	counts  sync.Map // map[string]*int64
+	sem *limiter.KeyedSemaphore
 }
 
 func newSessionLimiter(max int) *sessionLimiter {
-	if max < 0 {
-		max = 0
-	}
-	return &sessionLimiter{max: max}
+	return &sessionLimiter{sem: limiter.NewKeyedSemaphore(max)}
 }
 
 // Acquire reserves a session slot for the subject. If the cap is exceeded
 // the returned release func is nil and ok is false. Callers MUST defer
 // release() exactly once when ok is true.
 func (l *sessionLimiter) Acquire(subject string) (release func(), ok bool) {
-	if l == nil || l.max <= 0 || subject == "" {
+	if l == nil {
 		return func() {}, true
 	}
-	value, _ := l.counts.LoadOrStore(subject, new(int64))
-	counter := value.(*int64)
-	if atomic.AddInt64(counter, 1) > int64(l.max) {
-		atomic.AddInt64(counter, -1)
-		return nil, false
-	}
-	return func() {
-		atomic.AddInt64(counter, -1)
-	}, true
+	return l.sem.Acquire(subject)
 }
 
 // parseExecTarget extracts namespace / pod / container from an upstream

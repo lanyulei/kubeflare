@@ -272,6 +272,13 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 		return domain.ChatMessage{}, err
 	}
 
+	// 终态只写一次:消息已是 completed/failed 时,不再被另一处写入覆盖。防止
+	// CancelMessage 与 runMessageStream 收尾并发写同一行互相覆盖(如把已取消的
+	// 消息改回 completed,或两者的 error/completed_at 互踩)。
+	if isTerminalMessageStatus(record.Status) && record.Status != message.Status {
+		return toDomainMessage(record), nil
+	}
+
 	record.Status = message.Status
 	record.Content = message.Content
 	record.Provider = message.Provider
@@ -286,6 +293,11 @@ func (r *ChatRepository) UpdateMessage(ctx context.Context, userID string, messa
 		return domain.ChatMessage{}, err
 	}
 	return toDomainMessage(record), nil
+}
+
+// isTerminalMessageStatus 判断消息是否已处于不可逆终态。
+func isTerminalMessageStatus(status string) bool {
+	return status == domain.MESSAGE_STATUS_COMPLETED || status == domain.MESSAGE_STATUS_FAILED
 }
 
 func (r *ChatRepository) FailStaleMessages(ctx context.Context, before time.Time, errorMessage string) (int64, error) {

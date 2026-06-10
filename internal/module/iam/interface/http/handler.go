@@ -132,12 +132,15 @@ func (h *Handler) OIDCLogin(c *gin.Context) {
 		})
 		return
 	}
-	loginURL, err := h.oidc.LoginURL(c.Request.Context())
+	challenge, err := h.oidc.LoginURL(c.Request.Context())
 	if err != nil {
 		response.Error(c, err)
 		return
 	}
-	c.Redirect(http.StatusFound, loginURL)
+	// 将 state/nonce 绑定到发起登录的浏览器(短时 HttpOnly Cookie),回调时比对,
+	// 防 login-CSRF 与 id_token 重放。
+	h.setOIDCChallengeCookies(c, challenge.State, challenge.Nonce)
+	c.Redirect(http.StatusFound, challenge.AuthURL)
 }
 
 func (h *Handler) OIDCCallback(c *gin.Context) {
@@ -149,7 +152,11 @@ func (h *Handler) OIDCCallback(c *gin.Context) {
 		})
 		return
 	}
-	result, err := h.oidc.Callback(c.Request.Context(), c.Query("state"), c.Query("code"))
+	expectedState, _ := c.Cookie(oidcStateCookieName)
+	expectedNonce, _ := c.Cookie(oidcNonceCookieName)
+	// 无论成功与否都清理一次性挑战 Cookie,避免被复用。
+	h.clearOIDCChallengeCookies(c)
+	result, err := h.oidc.Callback(c.Request.Context(), c.Query("state"), c.Query("code"), expectedState, expectedNonce)
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -359,6 +366,47 @@ func newCSRFToken() string {
 	var buf [16]byte
 	_, _ = rand.Read(buf[:])
 	return hex.EncodeToString(buf[:])
+}
+
+const (
+	oidcStateCookieName = "kubeflare_oidc_state"
+	oidcNonceCookieName = "kubeflare_oidc_nonce"
+	// oidcChallengeMaxAge 与服务端 state TTL(10 分钟)对齐。
+	oidcChallengeMaxAge = 600
+)
+
+// setOIDCChallengeCookies 写入短时 HttpOnly Cookie,将本次登录的 state/nonce 绑定
+// 到发起浏览器。Path 限定在回调路由,SameSite=Lax 允许 IdP 重定向时回传。
+func (h *Handler) setOIDCChallengeCookies(c *gin.Context, state string, nonce string) {
+	for name, value := range map[string]string{oidcStateCookieName: state, oidcNonceCookieName: nonce} {
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     name,
+			Value:    value,
+			Path:     "/api/v1/auth/oidc",
+			Domain:   h.cookieOptions.Domain,
+			MaxAge:   oidcChallengeMaxAge,
+			HttpOnly: true,
+			Secure:   h.cookieOptions.Secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+}
+
+func (h *Handler) clearOIDCChallengeCookies(c *gin.Context) {
+	expiresAt := time.Now().Add(-time.Hour)
+	for _, name := range []string{oidcStateCookieName, oidcNonceCookieName} {
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/api/v1/auth/oidc",
+			Domain:   h.cookieOptions.Domain,
+			MaxAge:   -1,
+			Expires:  expiresAt,
+			HttpOnly: true,
+			Secure:   h.cookieOptions.Secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
 }
 
 func (h *Handler) setAuthCookies(c *gin.Context, result application.LoginResponse) {

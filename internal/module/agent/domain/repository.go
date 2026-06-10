@@ -11,6 +11,9 @@ type Repository interface {
 	GetRun(ctx context.Context, id string) (AgentRun, error)
 	CreateToolCall(ctx context.Context, call AgentToolCall) (AgentToolCall, error)
 	UpdateToolCall(ctx context.Context, call AgentToolCall) (AgentToolCall, error)
+	// CompleteToolCallWithEvidence 在单个事务内原子地把工具调用落为终态并写入其
+	// 全部证据,避免出现"工具调用已完成但证据部分缺失"或"孤儿证据"的不一致。
+	CompleteToolCallWithEvidence(ctx context.Context, call AgentToolCall, evidence []Evidence) (AgentToolCall, []Evidence, error)
 	ListToolCalls(ctx context.Context, runID string) ([]AgentToolCall, error)
 	CreateEvidence(ctx context.Context, evidence Evidence) (Evidence, error)
 	ListEvidence(ctx context.Context, runID string) ([]Evidence, error)

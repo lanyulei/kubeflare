@@ -409,10 +409,12 @@ func defaultAgents() []domain.AgentDefinition {
 
 func defaultTools() []domain.ToolDefinition {
 	return []domain.ToolDefinition{
-		newDiagnosticTool(domain.TOOL_ID_EVENT_LIST, "事件列表", "event", "读取 Kubernetes 事件。", schemaEventList),
+		// 事件/日志/describe 类工具的回喂信息密度高,放宽观察预算(其余工具沿用
+		// loop 默认 MAX_OBSERVE_CHARS),避免日志分析场景关键证据被截断。
+		withObserveMaxChars(newDiagnosticTool(domain.TOOL_ID_EVENT_LIST, "事件列表", "event", "读取 Kubernetes 事件。", schemaEventList), 4000),
 		newDiagnosticTool(domain.TOOL_ID_POD_LIST, "Pod 列表", "pod", "读取 Pod 列表。", schemaPodList),
 		newDiagnosticTool(domain.TOOL_ID_POD_GET, "Pod 详情", "pod", "读取指定 Pod 详情。", schemaPodGet),
-		newDiagnosticTool(domain.TOOL_ID_POD_LOG_TAIL, "Pod 日志尾部", "log", "读取容器日志尾部。", schemaPodLogTail),
+		withObserveMaxChars(newDiagnosticTool(domain.TOOL_ID_POD_LOG_TAIL, "Pod 日志尾部", "log", "读取容器日志尾部。", schemaPodLogTail), 8000),
 		newDiagnosticTool(domain.TOOL_ID_NODE_LIST, "Node 列表", "node", "读取 Node 列表。", schemaNodeList),
 		newDiagnosticTool(domain.TOOL_ID_NODE_GET, "Node 详情", "node", "读取指定 Node 详情。", schemaNodeGet),
 		newDiagnosticTool(domain.TOOL_ID_WORKLOAD_GET, "Workload 详情", "workload", "读取工作负载详情。", schemaWorkloadGet),
@@ -423,10 +425,16 @@ func defaultTools() []domain.ToolDefinition {
 		newDiagnosticTool(domain.TOOL_ID_PVC_GET, "PVC", "pvc", "读取 PersistentVolumeClaim(留空名称则列出):绑定状态、容量、StorageClass。", schemaPVC),
 		newDiagnosticTool(domain.TOOL_ID_HPA_GET, "HPA", "hpa", "读取 HorizontalPodAutoscaler(留空名称则列出):当前/期望副本、指标与伸缩条件。", schemaHPA),
 		newDiagnosticTool(domain.TOOL_ID_RBAC_GET, "RBAC", "rbac", "读取 Role/ClusterRole/RoleBinding/ClusterRoleBinding(留空名称则列出):权限规则与主体绑定。", schemaRBAC),
-		newDiagnosticTool(domain.TOOL_ID_DESCRIBE, "资源 describe", "describe", "kubectl describe 级聚合:汇总目标资源关键状态及其关联事件,一次定位故障横截面。", schemaDescribe),
+		withObserveMaxChars(newDiagnosticTool(domain.TOOL_ID_DESCRIBE, "资源 describe", "describe", "kubectl describe 级聚合:汇总目标资源关键状态及其关联事件,一次定位故障横截面。", schemaDescribe), 4000),
 		newMonitoringTool(domain.TOOL_ID_PROM_QUERY, "Prometheus 即时查询", "query", "执行 PromQL 即时查询,获取当前时刻的指标值。", schemaPromQuery),
 		newMonitoringTool(domain.TOOL_ID_PROM_RANGE, "Prometheus 区间查询", "query", "执行 PromQL 区间查询,获取一段时间内的指标变化曲线。", schemaPromRange),
 	}
+}
+
+// withObserveMaxChars 设置工具的观察回喂预算,供内置定义按工具类型分级。
+func withObserveMaxChars(tool domain.ToolDefinition, chars int) domain.ToolDefinition {
+	tool.ObserveMaxChars = chars
+	return tool
 }
 
 func newDiagnosticTool(id string, name string, category string, description string, schema string) domain.ToolDefinition {

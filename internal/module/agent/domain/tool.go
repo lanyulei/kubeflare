@@ -56,6 +56,10 @@ type ToolDefinition struct {
 	AgentTypes  []string `json:"agent_types"`
 	TimeoutMS   int      `json:"timeout_ms"`
 	MaxBytes    int      `json:"max_bytes"`
+	// ObserveMaxChars 限制该工具单步回喂给 LLM 的观察文本上限(字符)。日志/事件
+	// 类工具的关键信息密度高、默认截断过于苛刻,可放宽;0 表示沿用 loop 全局默认。
+	// omitempty 保证不影响既有 GET /agent/tool 响应结构。
+	ObserveMaxChars int `json:"observe_max_chars,omitempty"`
 	// Source 标识该工具的后端数据源(如 cluster / monitoring),供执行器分发
 	// 使用。omitempty 保证不影响既有 GET /agent/tool 响应结构。
 	Source string `json:"source,omitempty"`
@@ -83,6 +87,8 @@ type ToolOverride struct {
 	Description *string `json:"description,omitempty"`
 	// TimeoutMS 覆盖单次执行超时。nil 或 <=0 表示不改动。
 	TimeoutMS *int `json:"timeout_ms,omitempty"`
+	// ObserveMaxChars 覆盖单步回喂观察文本上限(字符)。nil 或 <=0 表示不改动。
+	ObserveMaxChars *int `json:"observe_max_chars,omitempty"`
 	// ReadOnly 覆盖只读标记。nil 表示不改动。仅用于外部来源工具的可信声明,
 	// 收紧(true→false)始终安全;放宽(false→true)由调用方自行担保可信。
 	ReadOnly *bool `json:"read_only,omitempty"`
@@ -101,6 +107,9 @@ func (o ToolOverride) ApplyTo(tool ToolDefinition) ToolDefinition {
 	}
 	if o.TimeoutMS != nil && *o.TimeoutMS > 0 {
 		tool.TimeoutMS = *o.TimeoutMS
+	}
+	if o.ObserveMaxChars != nil && *o.ObserveMaxChars > 0 {
+		tool.ObserveMaxChars = *o.ObserveMaxChars
 	}
 	if o.ReadOnly != nil {
 		tool.ReadOnly = *o.ReadOnly

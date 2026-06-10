@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -24,11 +25,21 @@ func Validate(cfg Config) error {
 			}
 		}
 	}
-	if cfg.Database.Enabled && cfg.Database.DSN == "" {
-		return errors.New("database.dsn is required when database is enabled")
+	// 生产环境严禁通配 Origin:exec/attach 代理的跨站防护完全依赖 Origin 白名单
+	// (升级请求是 GET,CSRF 被有意跳过),通配会让任何站点借管理员 Cookie 跨站
+	// 打开 Pod root shell(CSWSH)。本地/开发保留 "*" 以免阻断联调。
+	if strings.EqualFold(strings.TrimSpace(cfg.Service.Environment), "production") {
+		for _, origin := range cfg.HTTP.AllowedOrigins {
+			if strings.TrimSpace(origin) == "*" {
+				return errors.New("http.allowed_origins cannot contain * in production; configure explicit origins")
+			}
+		}
 	}
-	if cfg.Redis.Enabled && cfg.Redis.Address == "" {
-		return errors.New("redis.address is required when redis is enabled")
+	if err := validateDatabaseConfig(cfg.Database); err != nil {
+		return err
+	}
+	if err := validateRedisConfig(cfg.Redis); err != nil {
+		return err
 	}
 	key, err := hex.DecodeString(cfg.Secrets.EncryptionKey)
 	if err != nil || len(key) != 32 {
@@ -102,6 +113,15 @@ func validateAIConfig(cfg AIConfig) error {
 		if strings.TrimSpace(provider.BaseURL) == "" {
 			return errors.New("ai.providers." + name + ".base_url is required")
 		}
+		// 仅校验 scheme 合法(http/https)且可解析;不封禁内网 IP —— on-prem 内网
+		// LLM 端点是合法部署形态,封禁会破坏既有环境。
+		if parsed, perr := url.Parse(strings.TrimSpace(provider.BaseURL)); perr != nil {
+			return errors.New("ai.providers." + name + ".base_url is not a valid URL")
+		} else if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return errors.New("ai.providers." + name + ".base_url scheme must be http or https")
+		} else if parsed.Host == "" {
+			return errors.New("ai.providers." + name + ".base_url must include a host")
+		}
 		if strings.TrimSpace(provider.APIKey) == "" {
 			return errors.New("ai.providers." + name + ".api_key is required")
 		}
@@ -141,6 +161,18 @@ func validateAgentConfig(cfg AgentConfig) error {
 	if cfg.MaxToolErrorsPerStep < 0 || cfg.MaxToolErrorsPerStep > 10 {
 		return errors.New("agent.max_tool_errors_per_step must be between 0 and 10")
 	}
+	if cfg.MaxReflectionSteps < 0 || cfg.MaxReflectionSteps > 5 {
+		return errors.New("agent.max_reflection_steps must be between 0 and 5")
+	}
+	if cfg.MaxReflections < 0 || cfg.MaxReflections > 3 {
+		return errors.New("agent.max_reflections must be between 0 and 3")
+	}
+	if cfg.CaseFewShotLimit < 0 || cfg.CaseFewShotLimit > 8 {
+		return errors.New("agent.case_few_shot_limit must be between 0 and 8")
+	}
+	if cfg.RouteFewShotLimit < 0 || cfg.RouteFewShotLimit > 32 {
+		return errors.New("agent.route_few_shot_limit must be between 0 and 32")
+	}
 	if cfg.StepTimeout < 0 {
 		return errors.New("agent.step_timeout must not be negative")
 	}
@@ -163,6 +195,11 @@ func validateAgentConfig(cfg AgentConfig) error {
 	if cfg.Prometheus.QueryTimeout < 0 {
 		return errors.New("agent.prometheus.query_timeout must not be negative")
 	}
+	for toolID, override := range cfg.Tools.Overrides {
+		if override.ObserveMaxChars != nil && (*override.ObserveMaxChars < 256 || *override.ObserveMaxChars > 16000) {
+			return fmt.Errorf("agent.tools.overrides[%s].observe_max_chars must be between 256 and 16000", toolID)
+		}
+	}
 	seenSkill := make(map[string]struct{}, len(cfg.Skills))
 	for index, skill := range cfg.Skills {
 		id := strings.TrimSpace(skill.ID)
@@ -177,6 +214,57 @@ func validateAgentConfig(cfg AgentConfig) error {
 		if len(skill.Triggers) == 0 && strings.TrimSpace(skill.SystemPrompt) == "" {
 			return fmt.Errorf("agent.skills[%d] (%s) must declare triggers or system_prompt", index, id)
 		}
+	}
+	return nil
+}
+
+// validateDatabaseConfig 防呆校验连接池参数,避免错误配置静默降级(如 0=无限连接、
+// 空闲数大于最大数导致 GORM 内部纠偏、QueryTimeout=0 使所有查询失去超时)。
+func validateDatabaseConfig(cfg DatabaseConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.DSN == "" {
+		return errors.New("database.dsn is required when database is enabled")
+	}
+	if cfg.MaxOpenConns <= 0 {
+		return errors.New("database.max_open_conns must be positive when database is enabled")
+	}
+	if cfg.MaxIdleConns < 0 {
+		return errors.New("database.max_idle_conns must not be negative")
+	}
+	if cfg.MaxIdleConns > cfg.MaxOpenConns {
+		return errors.New("database.max_idle_conns must not exceed database.max_open_conns")
+	}
+	if cfg.QueryTimeout <= 0 {
+		return errors.New("database.query_timeout must be positive to bound query execution")
+	}
+	if cfg.HealthCheckTimeout <= 0 {
+		return errors.New("database.health_check_timeout must be positive")
+	}
+	return nil
+}
+
+// validateRedisConfig 确保 Redis 超时为正,避免 0 值导致用已过期 context 发起 ping
+// 而启动失败,或连接池参数互相矛盾。
+func validateRedisConfig(cfg RedisConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.Address == "" {
+		return errors.New("redis.address is required when redis is enabled")
+	}
+	if cfg.DialTimeout <= 0 || cfg.ReadTimeout <= 0 || cfg.WriteTimeout <= 0 {
+		return errors.New("redis dial_timeout, read_timeout and write_timeout must be positive")
+	}
+	if cfg.HealthCheckTimeout <= 0 {
+		return errors.New("redis.health_check_timeout must be positive")
+	}
+	if cfg.PoolSize < 0 || cfg.MinIdleConns < 0 || cfg.MaxIdleConns < 0 {
+		return errors.New("redis pool sizes must not be negative")
+	}
+	if cfg.MaxIdleConns > 0 && cfg.MinIdleConns > cfg.MaxIdleConns {
+		return errors.New("redis.min_idle_conns must not exceed redis.max_idle_conns")
 	}
 	return nil
 }
