@@ -10,7 +10,7 @@ import (
 )
 
 // scriptedGenerator 是 AssistantGenerator 的脚本化测试桩:每次 GenerateWithTools
-// 依次返回 steps 中的下一项;forceConclude(tools==nil)返回 concludeReply。
+// 依次返回 steps 中的下一项;最终回答阶段(tools==nil)返回 concludeReply。
 type scriptedGenerator struct {
 	steps        []scriptedStep
 	callCount    int

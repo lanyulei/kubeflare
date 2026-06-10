@@ -766,11 +766,6 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 		return
 	}
 
-	if answer != "" {
-		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: answer}) {
-			return
-		}
-	}
 	completedAt := time.Now().UTC()
 	run.CompletedAt = &completedAt
 	if loopErr != nil {

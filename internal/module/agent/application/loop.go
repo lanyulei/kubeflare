@@ -20,6 +20,14 @@ const (
 	MAX_OBSERVE_CHARS = 2000
 	// MAX_OBSERVE_SUMMARY_CHARS 限制单条证据摘要回喂长度。
 	MAX_OBSERVE_SUMMARY_CHARS = 512
+	// ANSWER_DELTA_CHUNK_RUNES 控制非流式兜底正文按小片段补发。
+	ANSWER_DELTA_CHUNK_RUNES = 48
+	// MIN_DIAGNOSTIC_ANSWER_RUNES 是有工具证据时最终诊断的最低实质长度。
+	MIN_DIAGNOSTIC_ANSWER_RUNES = 80
+	// MAX_ANSWER_REWRITE_ATTEMPTS 限制模型输出空泛答案后的改写次数。
+	MAX_ANSWER_REWRITE_ATTEMPTS = 1
+	// MAX_FALLBACK_EVIDENCE_CHARS 限制兜底诊断中单条证据的展示长度。
+	MAX_FALLBACK_EVIDENCE_CHARS = 520
 )
 
 // plannedToolCall 是 loop 校验通过、待执行的一次工具调用。
@@ -128,6 +136,7 @@ func (s *Service) runLoop(
 	// 计数限制每 run 的 critic 轮数(上限 MaxReflections),杜绝反思死循环。
 	maxSteps := s.opts.MaxSteps
 	reflections := 0
+	answerRewriteAttempts := 0
 
 	for step := 0; step < maxSteps; step++ {
 		reply, invocations, streamed, genErr := s.think(ctx, events, systemHistory, req.Message, priorTurns, specs)
@@ -153,7 +162,8 @@ func (s *Service) runLoop(
 		}
 
 		// 非流式路径下仅把"即将调用工具的中间说明"作为 thinking 发送。
-		// 无工具调用时 reply.Content 是最终答案,由上层以 answer.delta 统一发送,
+		// 无工具调用时 reply.Content 是候选最终答案,真正展示正文由最终回答流
+		// 转发为 answer.delta,
 		// 避免最终正文同时出现在 thinking 和 answer 两条语义不同的事件里。
 		if !streamed && len(invocations) > 0 && strings.TrimSpace(reply.Content) != "" {
 			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_THINKING, Delta: reply.Content}) {
@@ -168,6 +178,18 @@ func (s *Service) runLoop(
 		// (超步数/超预算/连续失败)不反思——那里已在收尾止损。
 		if len(invocations) == 0 {
 			answer := strings.TrimSpace(reply.Content)
+			if !isSubstantiveDiagnosticAnswer(answer, priorTurns) {
+				answerRewriteAttempts++
+				if answerRewriteAttempts <= MAX_ANSWER_REWRITE_ATTEMPTS {
+					systemHistory = mergeLeadingSystemPrompt(systemHistory, diagnosticAnswerRewriteInstruction(answer))
+					continue
+				}
+				answer = fallbackDiagnosticAnswer(req.Message, priorTurns)
+				if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer) {
+					return "", false, nil
+				}
+				return answer, true, nil
+			}
 			if reflections < s.opts.MaxReflections && answer != "" && s.reflectionEnabled() && s.reflectionBudgetLeft(tokenUsed+extraTokens) {
 				reflections++
 				verdict, criticTokens, reflectErr := s.reflectAnswer(ctx, req.Message, priorTurns, answer)
@@ -177,7 +199,7 @@ func (s *Service) runLoop(
 						return "", false, nil
 					}
 					s.logAgentWarn("reflect answer", reflectErr, "run_id", run.ID)
-					return answer, true, nil
+					return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer)
 				}
 				if verdict.level() != REFLECTION_VERDICT_SUPPORTED {
 					if guidance := reflectionGuidance(verdict); guidance != "" {
@@ -192,7 +214,7 @@ func (s *Service) runLoop(
 					}
 				}
 			}
-			return answer, true, nil
+			return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer)
 		}
 
 		// 兜底补全空 tool_call ID:部分 provider 在非流式 function-calling 下省略 ID,
@@ -202,7 +224,7 @@ func (s *Service) runLoop(
 
 		// token 预算超限 → 强制收尾(预算判定包含计划/反思等旁路调用的消耗)。
 		if s.opts.MaxTokenBudget > 0 && tokenUsed+extraTokens > s.opts.MaxTokenBudget {
-			return s.forceConclude(ctx, systemHistory, req.Message, priorTurns)
+			return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
 		}
 
 		turn := aiapplication.ToolCallTurn{AssistantContent: reply.Content, ToolCalls: invocations}
@@ -221,7 +243,7 @@ func (s *Service) runLoop(
 			errStreak++
 			priorTurns = append(priorTurns, turn)
 			if errStreak >= s.opts.MaxToolErrorsPerStep {
-				return s.forceConclude(ctx, systemHistory, req.Message, priorTurns)
+				return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
 			}
 			continue
 		}
@@ -248,7 +270,7 @@ func (s *Service) runLoop(
 	}
 
 	// 达到 MaxSteps,强制收尾。
-	return s.forceConclude(ctx, systemHistory, req.Message, priorTurns)
+	return s.forceConcludeWithAnswerStream(ctx, events, systemHistory, req.Message, priorTurns)
 }
 
 // resolveRunSkill 选定本次 run 的技能:优先采纳路由阶段 LLM 给出的技能提示
@@ -264,8 +286,9 @@ func (s *Service) resolveRunSkill(agentType string, req RunAgentRequest) (domain
 }
 
 // think 执行一步带工具的 LLM 生成,带单步超时保护。streamThink 开启时使用流式
-// provider 获取结果,但仅在确认本步包含工具调用后发送 thinking;否则最终答案交由
-// 上层以 answer.delta 发送。非流式路径由调用方按同一规则补发 thinking。
+// provider 获取结果,但仅在确认本步包含工具调用后发送 thinking;否则候选最终答案
+// 交给 streamFinalAnswer 重新走无工具最终回答流。非流式路径由调用方按同一规则
+// 补发 thinking。
 func (s *Service) think(
 	ctx context.Context,
 	events chan<- domain.AgentRunEvent,
@@ -287,7 +310,7 @@ func (s *Service) think(
 
 // streamThink 以流式方式执行一步带工具生成。由于流结束前无法可靠判断本步是
 // "中间思考+工具调用"还是"最终答案",因此先缓冲文本;只有本步确实包含工具调用时
-// 才作为 thinking 发送。最终答案由上层统一通过 answer.delta 发送。
+// 才作为 thinking 发送。最终答案交给 streamFinalAnswer 统一转发 provider delta。
 // stepCtx 控制单步超时;eventCtx 用于事件发送(随客户端断连取消)。
 func (s *Service) streamThink(
 	stepCtx context.Context,
@@ -327,29 +350,240 @@ func (s *Service) streamThinkEnabled() bool {
 	return s.opts.StreamThink == nil || *s.opts.StreamThink
 }
 
-// forceConclude 在达到步数/预算/连续失败上限时,以 tool_choice=none 再请求一次
-// 纯文本结论。无结论则返回错误(FAILED)。
-func (s *Service) forceConclude(
+func (s *Service) forceConcludeWithAnswerStream(
 	ctx context.Context,
+	events chan<- domain.AgentRunEvent,
 	history []aiapplication.MessageContext,
 	content string,
 	priorTurns []aiapplication.ToolCallTurn,
 ) (string, bool, error) {
+	return s.streamFinalAnswer(ctx, events, history, content, priorTurns, "")
+}
+
+// streamFinalAnswer 是最终诊断正文的唯一出口:使用 tool_choice=none 重新请求模型,
+// 并把 provider 返回的每个 delta 原样转发为 agent.answer.delta。仅在 provider
+// 没有返回 delta、只给出完整 Content 时,才使用小片段兜底补发。
+func (s *Service) streamFinalAnswer(
+	ctx context.Context,
+	events chan<- domain.AgentRunEvent,
+	history []aiapplication.MessageContext,
+	content string,
+	priorTurns []aiapplication.ToolCallTurn,
+	draft string,
+) (string, bool, error) {
 	stepCtx, cancel := ctxutil.WithOptionalTimeout(ctx, s.opts.StepTimeout)
 	defer cancel()
 
-	reply, _, err := s.generator.GenerateWithTools(stepCtx, history, content, priorTurns, nil, "none")
+	stream, err := s.generator.StreamWithTools(
+		stepCtx,
+		mergeLeadingSystemPrompt(history, finalAnswerStreamInstruction(draft)),
+		content,
+		priorTurns,
+		nil,
+		"none",
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", false, nil
 		}
 		return "", true, err
 	}
-	conclusion := strings.TrimSpace(reply.Content)
-	if conclusion == "" {
+
+	var answerBuilder strings.Builder
+	var reply aiapplication.AssistantReply
+	completed := false
+	for event := range stream {
+		if event.Err != nil {
+			if ctx.Err() != nil {
+				return "", false, nil
+			}
+			return "", true, event.Err
+		}
+		if event.Delta != "" {
+			answerBuilder.WriteString(event.Delta)
+			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: event.Delta}) {
+				return "", false, nil
+			}
+		}
+		if event.Done {
+			reply = event.Reply
+			completed = true
+			break
+		}
+	}
+	if !completed {
+		if ctx.Err() != nil {
+			return "", false, nil
+		}
+		return "", true, aiapplication.ErrAssistantStreamInterrupted
+	}
+
+	answer := strings.TrimSpace(answerBuilder.String())
+	if answer == "" {
+		answer = strings.TrimSpace(reply.Content)
+		if answer != "" && !sendSyntheticAnswerDeltas(ctx, events, answer) {
+			return "", false, nil
+		}
+	}
+	if answer == "" {
 		return "", true, fmt.Errorf("AI 未能基于已采集证据形成结论")
 	}
-	return conclusion, true, nil
+	return answer, true, nil
+}
+
+func sendSyntheticAnswerDeltas(ctx context.Context, events chan<- domain.AgentRunEvent, answer string) bool {
+	for _, chunk := range chunkStringByRunes(answer, ANSWER_DELTA_CHUNK_RUNES) {
+		if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ANSWER_DELTA, Delta: chunk}) {
+			return false
+		}
+		if len(chunk) >= ANSWER_DELTA_CHUNK_RUNES {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}
+	return true
+}
+
+func chunkStringByRunes(value string, chunkSize int) []string {
+	if value == "" {
+		return nil
+	}
+	if chunkSize <= 0 {
+		return []string{value}
+	}
+	runes := []rune(value)
+	chunks := make([]string, 0, (len(runes)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(runes); start += chunkSize {
+		end := min(start+chunkSize, len(runes))
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
+}
+
+func isSubstantiveDiagnosticAnswer(answer string, priorTurns []aiapplication.ToolCallTurn) bool {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return false
+	}
+	if isGenericDiagnosticClosing(answer) {
+		return false
+	}
+
+	hasEvidence := hasToolResultEvidence(priorTurns)
+	if !hasEvidence {
+		return len([]rune(answer)) >= 40
+	}
+	if len([]rune(answer)) < MIN_DIAGNOSTIC_ANSWER_RUNES {
+		return false
+	}
+
+	requiredSections := []string{"### 结论", "### 证据", "### 建议", "### 准确性提示"}
+	sectionCount := 0
+	for _, section := range requiredSections {
+		if strings.Contains(answer, section) {
+			sectionCount++
+		}
+	}
+	if sectionCount >= 3 {
+		return true
+	}
+
+	return strings.Contains(answer, "[E") &&
+		strings.Contains(answer, "证据") &&
+		(strings.Contains(answer, "建议") || strings.Contains(answer, "处理"))
+}
+
+func isGenericDiagnosticClosing(answer string) bool {
+	compact := strings.Join(strings.Fields(answer), "")
+	if strings.Contains(compact, "以上就是") && strings.Contains(compact, "完整诊断") {
+		return true
+	}
+	if strings.Contains(compact, "如果你能提供") && !strings.Contains(answer, "###") {
+		return true
+	}
+	return false
+}
+
+func hasToolResultEvidence(priorTurns []aiapplication.ToolCallTurn) bool {
+	for _, turn := range priorTurns {
+		for _, result := range turn.Results {
+			if strings.TrimSpace(result.Content) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func diagnosticAnswerRewriteInstruction(previousAnswer string) string {
+	previousAnswer = strings.TrimSpace(previousAnswer)
+	var builder strings.Builder
+	builder.WriteString("上一轮最终诊断正文不合格:内容过短、缺少证据展开或只是泛化收尾。")
+	builder.WriteString("请基于已经采集到的工具结果重新输出完整诊断,不要只说\"以上就是完整诊断\"。")
+	builder.WriteString("必须使用中文 Markdown 四段:### 结论、### 证据、### 建议、### 准确性提示。")
+	builder.WriteString("证据段必须列出具体工具返回的信息并使用 [E1]、[E2] 编号;证据不足时也要明确列出已获得的证据和不足。")
+	builder.WriteString("建议段只能给只读视角的排查建议,不要给会修改集群的命令。")
+	if previousAnswer != "" {
+		builder.WriteString("\n不合格回答摘录:\n")
+		builder.WriteString(truncate(previousAnswer, MAX_OBSERVE_SUMMARY_CHARS))
+	}
+	return builder.String()
+}
+
+func finalAnswerStreamInstruction(draft string) string {
+	var builder strings.Builder
+	builder.WriteString("现在进入最终回答阶段:禁止再调用工具,直接基于已采集工具结果输出完整诊断。")
+	builder.WriteString("必须用中文 Markdown 四段:### 结论、### 证据、### 建议、### 准确性提示。")
+	builder.WriteString("证据段必须展开具体证据并使用 [E1]、[E2] 编号;不要只说\"以上就是完整诊断\"或要求用户再提供信息后才分析。")
+	builder.WriteString("建议段保持只读视角,不要给会修改集群的命令。")
+	if strings.TrimSpace(draft) != "" {
+		builder.WriteString("\n可参考但必须补全格式和证据展开的候选结论:\n")
+		builder.WriteString(truncate(draft, MAX_REFLECT_ANSWER_CHARS))
+	}
+	return builder.String()
+}
+
+func fallbackDiagnosticAnswer(question string, priorTurns []aiapplication.ToolCallTurn) string {
+	var builder strings.Builder
+	builder.WriteString("### 结论\n")
+	builder.WriteString("已完成只读诊断取证。")
+	if hasToolResultEvidence(priorTurns) {
+		builder.WriteString("基于已采集证据,当前应优先围绕下方异常、失败或空结果继续核对 Pod 运行状态、事件、日志与关联 Workload。")
+	} else {
+		builder.WriteString("当前没有可用工具证据支撑明确根因,无法给出确定性判断。")
+	}
+	if strings.TrimSpace(question) != "" {
+		builder.WriteString("\n\n用户问题: ")
+		builder.WriteString(strings.TrimSpace(question))
+	}
+
+	builder.WriteString("\n\n### 证据\n")
+	evidenceCount := 0
+	for _, turn := range priorTurns {
+		for _, result := range turn.Results {
+			content := strings.TrimSpace(result.Content)
+			if content == "" {
+				continue
+			}
+			evidenceCount++
+			builder.WriteString(fmt.Sprintf("- [E%d] `%s`: %s\n", evidenceCount, result.Name, truncate(content, MAX_FALLBACK_EVIDENCE_CHARS)))
+		}
+	}
+	if evidenceCount == 0 {
+		builder.WriteString("- 暂未采集到有效工具证据。\n")
+	}
+
+	builder.WriteString("\n### 建议\n")
+	builder.WriteString("- 先核对上方证据中出现的失败工具、异常字段、事件数量和日志摘要,避免只凭 Pod 名称下结论。\n")
+	builder.WriteString("- 若事件为空但 Pod 仍异常,继续补充节点系统日志、kubelet 日志、容器退出码和历史资源使用数据进行交叉确认。\n")
+	builder.WriteString("- 如果关联 Workload 或 Node 证据显示异常,优先沿 owner/workload/node 维度继续只读排查。\n")
+
+	builder.WriteString("\n### 准确性提示\n")
+	builder.WriteString("该诊断基于已采集工具摘要生成;根因仍需结合完整 Pod describe、日志、事件和节点侧信息确认。")
+	return builder.String()
 }
 
 // validationResult 描述一次工具调用的校验结论。
