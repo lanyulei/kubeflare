@@ -28,6 +28,27 @@ const (
 	MAX_FALLBACK_EVIDENCE_CHARS = 520
 )
 
+// runStats 汇总一次 run 的可观测指标(供度量闭环异步落库)与工具调用轨迹
+// (供案例库记录程序性经验)。runLoop 持有指针在执行中累积,run() 收尾读取;
+// 它不影响任何控制流,纯旁路统计。
+type runStats struct {
+	stepCount          int      // 实际执行的 think 步数
+	toolCallCount      int      // 成功执行的工具调用次数
+	tokenUsed          int      // 主循环累计 token(取每步最新累计值)
+	tokenEstimated     bool     // tokenUsed 是否含字符估算值(provider 未返回 usage)
+	extraTokenUsed     int      // 旁路调用(计划/反思/压缩)累计 token
+	reflectionCount    int      // 反思轮数
+	replanCount        int      // 动态重规划次数
+	planGenerated      bool     // 是否成功生成显式计划
+	reflectionJurors   int      // 最近一次反思的评委数(0=未反思)
+	playbookMatched    bool     // 是否命中诊断剧本先验
+	hypothesisTotal    int      // 假设台账的假设总数
+	hypothesisResolved int      // 已确认或已排除的假设数(取证收敛度)
+	caseRetrievalMode  string   // 案例检索模式(semantic/keyword/none)
+	caseHitCount       int      // 命中的相似案例数
+	toolTrace          []string // 成功执行的工具 ID 序列(去重保序)
+}
+
 // plannedToolCall 是 loop 校验通过、待执行的一次工具调用。
 type plannedToolCall struct {
 	tool     domain.ToolDefinition
@@ -66,6 +87,7 @@ func (s *Service) runLoop(
 	req RunAgentRequest,
 	chatHistory []aiapplication.MessageContext,
 	answerMessageID string,
+	stats *runStats,
 ) (answer string, alive bool, err error) {
 	tools := s.toolRegistry.ToolsForAgent(agent.Type)
 	systemHistory := s.systemHistory(agent)
@@ -94,11 +116,15 @@ func (s *Service) runLoop(
 		merged = append(merged, chatHistory...)
 		systemHistory = merged
 	}
-	// 诊断案例库:把与本次问题相似的历史案例(症状→根因)以 few-shot 注入系统
-	// 提示。仅读内存缓存,无匹配时系统提示与未启用案例库时逐字节一致。
+	// 诊断案例库:把与本次问题相似的历史案例(症状→根因与排查路径)以 few-shot
+	// 注入系统提示。优先语义召回,回退关键词;无匹配时系统提示与未启用案例库时
+	// 逐字节一致。检索模式与命中数记入 stats 供度量。
 	if s.caseLibraryEnabled() {
-		if section := s.caseFewShotPromptSection(agent.Type, req.Message); section != "" {
-			systemHistory = mergeLeadingSystemPrompt(systemHistory, section)
+		fewShot := s.caseFewShotPromptSection(ctx, agent.Type, req.ClusterID, req.Message)
+		stats.caseRetrievalMode = fewShot.mode
+		stats.caseHitCount = fewShot.hitCount
+		if fewShot.section != "" {
+			systemHistory = mergeLeadingSystemPrompt(systemHistory, fewShot.section)
 		}
 	}
 	specs, nameToID := s.buildToolSpecs(tools)
@@ -106,11 +132,30 @@ func (s *Service) runLoop(
 	// extraTokens 累加旁路 LLM 调用(显式计划/反思 critic)的消耗:它们是独立请求,
 	// 不在主循环"取每步累计 max"的 tokenUsed 之内,预算判定时两者相加。
 	extraTokens := 0
+	// currentPlan 持有"可被重规划替换"的计划文本。仅在启用动态重规划时使用:
+	// 此时计划不 baked 进 systemHistory,而是每步 think 临时合成,从而能整体替换
+	// 旧计划(避免多份计划在系统提示里堆叠)。未启用重规划时它恒为空,计划照旧
+	// baked 进 systemHistory,loop 行为与改造前逐字节一致(零回归)。
+	currentPlan := ""
+	// ledger 是显式假设台账:启用时承载计划与剧本先验种子化出的多个竞争假设,
+	// 每步 think 临时注入(与 currentPlan 同模式),并由 reassess 更新状态/置信度。
+	// 未启用时恒为 nil,不注入、不影响控制流(零回归)。
+	var ledger hypothesisLedger
+	ledgerEnabled := s.hypothesisLedgerEnabled()
 	// 显式计划:取证开始前让模型产出假设与验证步骤,注入系统提示作为全程路标,
 	// 降低复杂故障下逐步 ReAct 的"迷路"概率。任何失败(LLM 错误/JSON 不可解析/
 	// 内容为空)仅告警并降级,循环行为与无计划时完全一致。
 	if s.planningEnabled() {
-		planText, planTokens, planErr := s.generatePlan(ctx, systemHistory, req.Message, tools)
+		// 诊断剧本先验:命中高频故障时,把其常见根因与排查路径注入计划、并种子化进
+		// 台账,把通用推理提升为带专家骨架的推理。剧本经计划阶段注入,故仅在 planning
+		// 启用时匹配——避免 planning 关闭时 stats.playbookMatched 虚报"已命中"却未注入。
+		// 未命中为 nil,全程零回归。
+		var playbook *diagnosticPlaybook
+		if s.playbookEnabled() {
+			playbook = matchPlaybook(req.Message, req.Scope)
+			stats.playbookMatched = playbook != nil
+		}
+		plan, planText, planTokens, planErr := s.generatePlan(ctx, systemHistory, req.Message, tools, playbook)
 		extraTokens += planTokens
 		if planErr != nil {
 			if ctx.Err() != nil {
@@ -118,9 +163,30 @@ func (s *Service) runLoop(
 			}
 			s.logAgentWarn("generate plan", planErr, "run_id", run.ID)
 		} else {
-			systemHistory = mergeLeadingSystemPrompt(systemHistory, planText)
-			if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_PLAN_GENERATED, Delta: planText}) {
-				return "", false, nil
+			stats.planGenerated = true
+			// 启用假设台账时,从计划假设 + 剧本先验假设种子化台账,假设由台账独立
+			// 跟踪;此时注入的计划文本只保留验证步骤(避免假设重复注入)。
+			if ledgerEnabled {
+				var playbookHypotheses []string
+				if playbook != nil {
+					playbookHypotheses = playbook.Hypotheses
+				}
+				ledger = seedLedger(plan.Hypotheses, playbookHypotheses)
+				stats.hypothesisTotal = len(ledger)
+				planText = formatPlanSteps(plan)
+			}
+			// 启用重规划时计划交由 currentPlan 持有(后续可替换);否则 baked 进
+			// systemHistory(保持原行为)。台账启用但重规划未启用时,计划步骤仍 baked
+			// 进 systemHistory(台账另行每步注入)。
+			if planText != "" {
+				if s.replanningEnabled() {
+					currentPlan = planText
+				} else {
+					systemHistory = mergeLeadingSystemPrompt(systemHistory, planText)
+				}
+				if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_PLAN_GENERATED, Delta: planText}) {
+					return "", false, nil
+				}
 			}
 		}
 	}
@@ -137,8 +203,80 @@ func (s *Service) runLoop(
 	reflections := 0
 	answerRewriteAttempts := 0
 
+	// 动态重规划状态:replans 计数限制每 run 的重规划次数(上限 MaxReplans);
+	// lastReplanStep 记录上次规划发生的步(初始计划视作第 0 步规划),用于间隔
+	// 判定;toolCallsSinceReplan 标记自上次规划以来是否有新工具证据(无新证据则
+	// 不重规划——计划不会凭空改变)。
+	replans := 0
+	lastReplanStep := 0
+	toolCallsSinceReplan := false
+
+	// 收尾同步可观测计数到 stats(闭包按引用捕获,任意 return 点都取到最终值)。
+	// 纯旁路统计,不影响控制流。
+	defer func() {
+		stats.tokenUsed = tokenUsed
+		stats.extraTokenUsed = extraTokens
+		stats.reflectionCount = reflections
+		stats.replanCount = replans
+		stats.hypothesisResolved = ledger.resolvedCount()
+	}()
+
 	for step := 0; step < maxSteps; step++ {
-		reply, invocations, streamed, genErr := s.think(ctx, events, systemHistory, req.Message, priorTurns, specs)
+		stats.stepCount = step + 1
+
+		// 取证复盘(reassess):满足"启用 + 有复盘内容(需修订步骤或台账非空)+ 距上次
+		// 复盘达间隔 + 期间有新证据 + 未超次数 + 预算有余"时,基于已采集证据做一次复盘,
+		// 一次 LLM 调用同时产出假设台账更新与修订后的验证步骤,再按双 gate 各取所需
+		// (台账更新受台账开关、steps 修订受重规划开关)。任何失败仅告警并保留现状,
+		// 循环行为与未复盘时一致(零回归)。节流计数(replans/lastReplanStep)由重规划
+		// 参数统辖。"有复盘内容"一闸避免台账为空且未启用重规划时的无谓 LLM 调用。
+		if s.reassessEnabled() &&
+			(s.replanningEnabled() || len(ledger) > 0) &&
+			toolCallsSinceReplan &&
+			step-lastReplanStep >= s.opts.ReplanInterval &&
+			replans < s.opts.MaxReplans &&
+			s.replanBudgetLeft(tokenUsed+extraTokens) {
+			result, reassessTokens, reassessErr := s.reassess(ctx, req.Message, ledger, priorTurns)
+			extraTokens += reassessTokens
+			if reassessErr != nil {
+				if ctx.Err() != nil {
+					return "", false, nil
+				}
+				s.logAgentWarn("reassess", reassessErr, "run_id", run.ID)
+			} else {
+				replans++
+				lastReplanStep = step
+				toolCallsSinceReplan = false
+				// gate 1:假设台账更新(标注,安全)——仅改提示上下文,受台账开关统辖。
+				if ledgerEnabled && len(ledger) > 0 {
+					applyLedgerUpdates(ledger, result.Hypotheses)
+				}
+				// gate 2:验证步骤修订(改控制流)——仅在启用重规划时整体替换 currentPlan,
+				// 保持"重规划默认关"的既有保守取舍不被台账上线隐式打开。
+				if s.replanningEnabled() {
+					if revised := formatPlanSteps(runPlan{Steps: result.Steps}); revised != "" {
+						currentPlan = revised
+						if !sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_PLAN_GENERATED, Delta: revised}) {
+							return "", false, nil
+						}
+					}
+				}
+			}
+		}
+
+		// 合成本步 think 的系统上下文:启用重规划时把 currentPlan 临时并入头部
+		// system 消息(整体替换语义);启用台账时再并入当前台账状态。未启用相应特性
+		// 时对应文本为空,thinkHistory 退化为 systemHistory(同一引用),零额外开销、
+		// 零行为变化。
+		thinkHistory := systemHistory
+		if currentPlan != "" {
+			thinkHistory = mergeLeadingSystemPrompt(thinkHistory, currentPlan)
+		}
+		if ledgerEnabled && len(ledger) > 0 {
+			thinkHistory = mergeLeadingSystemPrompt(thinkHistory, formatLedger(ledger))
+		}
+
+		reply, invocations, streamed, genErr := s.think(ctx, events, thinkHistory, req.Message, priorTurns, specs)
 		if genErr != nil {
 			if ctx.Err() != nil {
 				return "", false, nil
@@ -155,7 +293,11 @@ func (s *Service) runLoop(
 				tokenUsed = reply.TotalTokens
 			}
 		} else {
-			if est := estimateStepTokens(systemHistory, req.Message, priorTurns, reply.Content); est > tokenUsed {
+			// 用本步实际下发的 thinkHistory 估算(含 currentPlan,若启用重规划),
+			// 与发给 provider 的上下文一致,避免低估。标记 token 含估算值,供度量
+			// 区分真实 usage 与估算(分析成本时可据此过滤)。
+			stats.tokenEstimated = true
+			if est := estimateStepTokens(thinkHistory, req.Message, priorTurns, reply.Content); est > tokenUsed {
 				tokenUsed = est
 			}
 		}
@@ -188,8 +330,9 @@ func (s *Service) runLoop(
 			}
 			if reflections < s.opts.MaxReflections && answer != "" && s.reflectionEnabled() && s.reflectionBudgetLeft(tokenUsed+extraTokens) {
 				reflections++
-				verdict, criticTokens, reflectErr := s.reflectAnswer(ctx, req.Message, priorTurns, answer)
+				verdict, criticTokens, reflectErr := s.reflectAnswerPanel(ctx, req.Message, priorTurns, answer, s.opts.ReflectionJurors)
 				extraTokens += criticTokens
+				stats.reflectionJurors = verdict.jurorCount
 				if reflectErr != nil {
 					if ctx.Err() != nil {
 						return "", false, nil
@@ -197,13 +340,14 @@ func (s *Service) runLoop(
 					s.logAgentWarn("reflect answer", reflectErr, "run_id", run.ID)
 					return s.streamFinalAnswer(ctx, events, systemHistory, req.Message, priorTurns, answer, answerMessageID)
 				}
-				if verdict.level() != REFLECTION_VERDICT_SUPPORTED {
+				if verdict.level != REFLECTION_VERDICT_SUPPORTED {
 					if guidance := reflectionGuidance(verdict); guidance != "" {
 						// 草稿结论以 assistant 轮次入上下文(空 ToolCalls 序列化为
-						// 普通 assistant 消息),补证指引并入头部 system 消息。步数
-						// 上限相对当前步延长一轮,绝对不超过 MaxSteps 加全部反思轮
-						// 的补证步数之和。
-						maxSteps = min(s.opts.MaxSteps+s.opts.MaxReflections*s.opts.MaxReflectionSteps, step+1+s.opts.MaxReflectionSteps)
+						// 普通 assistant 消息),补证指引并入头部 system 消息。本轮允许的
+						// 补证步数由聚合置信度驱动(置信度越低补越多),绝对不超过 MaxSteps
+						// 加全部反思轮的补证步数之和。
+						supplement := reflectionSupplementSteps(verdict.confidence, s.opts.MaxReflectionSteps)
+						maxSteps = min(s.opts.MaxSteps+s.opts.MaxReflections*s.opts.MaxReflectionSteps, step+1+supplement)
 						priorTurns = append(priorTurns, aiapplication.ToolCallTurn{AssistantContent: answer})
 						systemHistory = mergeLeadingSystemPrompt(systemHistory, guidance)
 						continue
@@ -259,6 +403,11 @@ func (s *Service) runLoop(
 			// 重试,避免把瞬时故障误判为"已查询过"而拒绝。
 			if outcomes[index].executed && outcomes[index].err == nil {
 				seen[planned[index].dedupKey] = true
+				// 工具调用计数与轨迹(去重保序):成功执行才计入,作为程序性经验。
+				stats.toolCallCount++
+				stats.toolTrace = appendToolTrace(stats.toolTrace, planned[index].tool.ID)
+				// 标记自上次规划以来已有新证据,使下次满足间隔时的重规划有意义。
+				toolCallsSinceReplan = true
 			}
 			turn.Results = append(turn.Results, observeToolResult(planned[index].inv, outcomes[index], planned[index].tool.ObserveMaxChars))
 		}
@@ -939,6 +1088,21 @@ func truncate(text string, max int) string {
 		return text
 	}
 	return string(runes[:max]) + "…"
+}
+
+// appendToolTrace 追加一个工具 ID 到轨迹,去重(已存在则跳过)且保序,并受
+// 步数上限约束(超限后不再追加,头部路径已足够表达排查思路)。
+func appendToolTrace(trace []string, toolID string) []string {
+	toolID = strings.TrimSpace(toolID)
+	if toolID == "" || len(trace) >= domain.MAX_DIAGNOSIS_CASE_TRACE_STEPS {
+		return trace
+	}
+	for _, existing := range trace {
+		if existing == toolID {
+			return trace
+		}
+	}
+	return append(trace, toolID)
 }
 
 // estimateStepTokens 在 provider 不回传 usage 时,用字符数粗略估算本步消耗的

@@ -166,6 +166,13 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if agentGenerator == nil {
 		agentGenerator = aiapplication.NewUnavailableAssistantGenerator()
 	}
+	// 可选 embedding 能力:配置 ai.embedding 后启用语义检索,否则注入 nil client
+	// (生成器 Available()=false,语义检索自动降级关键词)。构造失败视为致命配置
+	// 错误,与 chat provider 装配一致。
+	agentEmbeddingGenerator, err := newAIEmbeddingGenerator(cfg.AI, encryptor)
+	if err != nil {
+		return nil, err
+	}
 	agentService := agentapplication.NewService(agentapplication.Options{
 		Repo:              agentRepo,
 		Validator:         validator,
@@ -188,18 +195,28 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			Reflection:               cfg.Agent.Reflection,
 			MaxReflectionSteps:       cfg.Agent.MaxReflectionSteps,
 			MaxReflections:           cfg.Agent.MaxReflections,
+			ReflectionJurors:         cfg.Agent.ReflectionJurors,
+			HypothesisLedger:         cfg.Agent.HypothesisLedger,
+			Playbook:                 cfg.Agent.Playbook,
+			Replanning:               cfg.Agent.Replanning,
+			ReplanInterval:           cfg.Agent.ReplanInterval,
+			MaxReplans:               cfg.Agent.MaxReplans,
 			ObserveCompression:       cfg.Agent.ObserveCompression,
 			CaseLibrary:              cfg.Agent.CaseLibrary,
 			CaseFewShotLimit:         cfg.Agent.CaseFewShotLimit,
 			RouteLearning:            cfg.Agent.RouteLearning,
 			RouteFewShotLimit:        cfg.Agent.RouteFewShotLimit,
+			RouteCacheSize:           cfg.Agent.RouteCacheSize,
+			CaseCacheSize:            cfg.Agent.CaseCacheSize,
+			SemanticRetrieval:        cfg.Agent.SemanticRetrieval,
 			MaxConcurrentRunsPerUser: cfg.Agent.MaxConcurrentRunsPerUser,
 			MaxConcurrentRuns:        cfg.Agent.MaxConcurrentRuns,
 		},
-		SystemPrompts: resolveAgentPrompts(cfg.Agent, logger),
-		ToolOverrides: resolveAgentToolOverrides(cfg.Agent),
-		Skills:        resolveAgentSkills(cfg.Agent),
-		Logger:        logger,
+		SystemPrompts:      resolveAgentPrompts(cfg.Agent, logger),
+		ToolOverrides:      resolveAgentToolOverrides(cfg.Agent),
+		Skills:             resolveAgentSkills(cfg.Agent),
+		EmbeddingGenerator: agentEmbeddingGenerator,
+		Logger:             logger,
 	})
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
@@ -326,6 +343,35 @@ func newAIGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (aiapplica
 		return nil, err
 	}
 	return aillm.NewAssistantGenerator(registry), nil
+}
+
+// newAIEmbeddingGenerator 构造可选的 embedding 生成器:未配置 ai.embedding 时
+// 返回一个底层 client 为 nil 的生成器(Available()=false,语义检索降级关键词);
+// 配置无效(缺 base_url/api_key/model)时返回错误(与 chat provider 装配一致)。
+// api_key 走与 chat 同一套 enc:v1: 解密体系。
+func newAIEmbeddingGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (aiapplication.EmbeddingGenerator, error) {
+	if !cfg.Enabled || cfg.Embedding == nil {
+		return aillm.NewEmbeddingGenerator(nil), nil
+	}
+
+	apiKey, err := encryptor.Decrypt(strings.TrimSpace(cfg.Embedding.APIKey))
+	if err != nil {
+		return nil, fmt.Errorf("decrypt api_key for ai embedding provider: %w", err)
+	}
+	client, err := platformllm.NewEmbeddingsClient("embedding", platformllm.EmbeddingsConfig{
+		Type:         cfg.Embedding.Type,
+		BaseURL:      cfg.Embedding.BaseURL,
+		Path:         cfg.Embedding.Path,
+		APIKey:       apiKey,
+		Model:        cfg.Embedding.Model,
+		Timeout:      cfg.Embedding.Timeout,
+		MaxRetries:   cfg.Embedding.MaxRetries,
+		RetryBackoff: cfg.Embedding.RetryBackoff,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return aillm.NewEmbeddingGenerator(client), nil
 }
 
 // resolveAgentPrompts 解析各 Agent 的 system prompt 覆盖来源:内联 Prompts

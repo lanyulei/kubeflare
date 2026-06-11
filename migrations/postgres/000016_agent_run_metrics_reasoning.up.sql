@@ -1,0 +1,4 @@
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS reflection_jurors INT NOT NULL DEFAULT 0;
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS playbook_matched BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS hypothesis_total INT NOT NULL DEFAULT 0;
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS hypothesis_resolved INT NOT NULL DEFAULT 0;

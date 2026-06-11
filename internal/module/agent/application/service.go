@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	validation "github.com/go-playground/validator/v10"
@@ -48,6 +49,24 @@ const (
 	DEFAULT_MAX_STEPS                = 10
 	DEFAULT_MAX_TOOL_ERRORS_PER_STEP = 3
 	DEFAULT_STEP_TIMEOUT             = 60 * time.Second
+	// DEFAULT_CASE_CACHE_SIZE 诊断案例内存缓存默认上限。语义检索在该缓存内算
+	// 余弦相似度,放大上限可减少历史经验被淘汰的损失;每条约 1KB 文本 + 向量
+	// (~1536*4B≈6KB),数千条仅占数十 MB。
+	DEFAULT_CASE_CACHE_SIZE = 2000
+	// DEFAULT_ROUTE_CACHE_SIZE 路由样例内存缓存默认上限。样例为短文本,放大成本
+	// 极低;较大的样本池有利于语义召回覆盖更多确认样例。
+	DEFAULT_ROUTE_CACHE_SIZE = 256
+	// MAX_BACKGROUND_LLM_CONCURRENCY 限制后台 LLM 调用(案例提取+向量化)的并发,
+	// 平滑 run 收尾后异步归档的尾部负载,避免高并发下二次冲击 LLM 配额。
+	MAX_BACKGROUND_LLM_CONCURRENCY = 4
+	// BG_LLM_ACQUIRE_TIMEOUT 是后台任务获取并发槽位的最长等待:超时仍抢不到则
+	// 放弃本次归档/向量化(锦上添花,丢弃优于无界排队堆积 goroutine)。
+	BG_LLM_ACQUIRE_TIMEOUT = 5 * time.Second
+
+	// SUPPRESSED_CASE_RUNS_CAPACITY 是"负反馈抑制集"的容量上限。案例提取窗口仅秒级
+	// (CASE_EXTRACT_TIMEOUT + 落库),只需覆盖近期被标记"没用"的 runID 以消除竞态,
+	// 容量无需大;有界 FIFO 保证内存恒定。
+	SUPPRESSED_CASE_RUNS_CAPACITY = 2048
 
 	// Agent 自动路由的最低执行置信度。低于该阈值时返回普通对话助手,
 	// 避免寒暄、身份询问等非诊断输入被硬路由到 diagnostic。
@@ -115,6 +134,15 @@ type LoopConfig struct {
 	// 注入缺口指引补证)。<=0 回退默认 1(保持既有"每 run 至多一次"语义);
 	// 禁用反思请置 Reflection=false 或 MaxReflectionSteps=0。
 	MaxReflections int
+	// ReflectionJurors 反思自检的评委数(对抗式多评委:多个独立视角并发评审,
+	// 多数否决才打回)。<=0 回退默认 3;=1 退化为单评委(改造前行为)。钳到 1-5。
+	ReflectionJurors int
+	// HypothesisLedger 控制显式假设台账(把计划/剧本假设结构化为可记账的竞争假设,
+	// 逐步取证确认或排除,支持鉴别诊断)。nil 默认开;失败降级为无台账(零回归)。
+	HypothesisLedger *bool
+	// Playbook 控制诊断剧本先验(命中高频故障时注入常见根因与排查路径,种子化台账)。
+	// nil 默认开;未命中或失败时与无剧本时一致(零回归)。
+	Playbook *bool
 	// ObserveCompression 控制超长工具观察的智能压缩(超出回喂预算时按当前问题
 	// 用 LLM 压缩关键信息,失败回退硬截断)。默认关闭。
 	ObserveCompression bool
@@ -123,10 +151,26 @@ type LoopConfig struct {
 	CaseLibrary *bool
 	// CaseFewShotLimit 注入系统提示的相似案例条数上限。
 	CaseFewShotLimit int
+	// CaseCacheSize 诊断案例内存缓存上限。<=0 回退默认值。语义检索在该缓存内
+	// 算余弦相似度,放大缓存可减少历史经验被淘汰的损失(代价仅内存)。
+	CaseCacheSize int
+	// SemanticRetrieval 控制案例/路由样例的语义向量检索。nil 默认开;仅当
+	// embedding 能力就绪时生效,否则自动降级关键词匹配(零回归)。
+	SemanticRetrieval *bool
+	// Replanning 控制动态重规划(取证过程中基于已采集证据修订计划)。nil/false
+	// 默认关;需 Planning 启用方生效。任何失败保留当前计划(零回归)。
+	Replanning *bool
+	// ReplanInterval 两次重规划之间至少要执行的步数。<=0 回退默认。
+	ReplanInterval int
+	// MaxReplans 每 run 的重规划次数上限。<=0 回退默认,杜绝重规划失控。
+	MaxReplans int
 	// RouteLearning 控制路由置信度学习(反馈记录 + few-shot 回灌)。nil 默认开。
 	RouteLearning *bool
 	// RouteFewShotLimit 路由提示中携带的历史确认样例条数上限。
 	RouteFewShotLimit int
+	// RouteCacheSize 路由样例内存缓存上限。<=0 回退默认。与案例缓存对称,语义
+	// 检索在该缓存内算相似度,放大可提升路由 few-shot 的召回覆盖面。
+	RouteCacheSize int
 	// MaxConcurrentRunsPerUser 限制单个用户同时执行的 run 数,<=0 表示不限。
 	MaxConcurrentRunsPerUser int
 	// MaxConcurrentRuns 限制全实例同时执行的 run 总数,<=0 表示不限。
@@ -175,6 +219,23 @@ func (c LoopConfig) withDefaults() LoopConfig {
 	if c.MaxReflections <= 0 {
 		c.MaxReflections = 1
 	}
+	// 评委数钳到 [1,5]:<=0 回退默认 3(对抗式三视角),>5 截断,避免单次反思
+	// 发起过多并发 LLM 调用。=1 即退化为改造前的单评委。
+	if c.ReflectionJurors <= 0 {
+		c.ReflectionJurors = DEFAULT_REFLECTION_JURORS
+	}
+	if c.ReflectionJurors > MAX_REFLECTION_JURORS {
+		c.ReflectionJurors = MAX_REFLECTION_JURORS
+	}
+	// HypothesisLedger / Playbook 默认开(nil 视为开),与 Planning 同模式。
+	if c.HypothesisLedger == nil {
+		enabled := true
+		c.HypothesisLedger = &enabled
+	}
+	if c.Playbook == nil {
+		enabled := true
+		c.Playbook = &enabled
+	}
 	if c.CaseLibrary == nil {
 		enabled := true
 		c.CaseLibrary = &enabled
@@ -183,12 +244,30 @@ func (c LoopConfig) withDefaults() LoopConfig {
 	if c.CaseFewShotLimit < 0 {
 		c.CaseFewShotLimit = 0
 	}
+	if c.CaseCacheSize <= 0 {
+		c.CaseCacheSize = DEFAULT_CASE_CACHE_SIZE
+	}
+	if c.SemanticRetrieval == nil {
+		enabled := true
+		c.SemanticRetrieval = &enabled
+	}
+	// Replanning 默认关(nil 视为关):新特性保守,验证增益后再开启。Replanning
+	// 为 nil 时保持指针 nil,replanningEnabled 据此判定为关闭。
+	if c.ReplanInterval <= 0 {
+		c.ReplanInterval = DEFAULT_REPLAN_INTERVAL
+	}
+	if c.MaxReplans <= 0 {
+		c.MaxReplans = DEFAULT_MAX_REPLANS
+	}
 	if c.RouteLearning == nil {
 		enabled := true
 		c.RouteLearning = &enabled
 	}
 	if c.RouteFewShotLimit < 0 {
 		c.RouteFewShotLimit = 0
+	}
+	if c.RouteCacheSize <= 0 {
+		c.RouteCacheSize = DEFAULT_ROUTE_CACHE_SIZE
 	}
 	return c
 }
@@ -218,6 +297,9 @@ type Options struct {
 	// SystemPrompts 是 agentType -> system prompt 的覆盖(已由 bootstrap 解析
 	// 内联与文件来源),为空的项保留代码内置默认。
 	SystemPrompts map[string]string
+	// EmbeddingGenerator 可选。提供后启用语义向量检索(案例/路由样例);为 nil
+	// 或不可用时,所有语义检索自动降级关键词匹配(零回归)。
+	EmbeddingGenerator aiapplication.EmbeddingGenerator
 	// Logger 可选。用于记录持久化失败等旁路错误,为 nil 时不记录。
 	Logger *slog.Logger
 }
@@ -237,11 +319,20 @@ type Service struct {
 	// feedbackRepo / feedbackStore 是路由置信度学习的可选仓储(类型断言获取,
 	// 缺失即关闭)与内存样例缓存(路由热路径只读内存,不查库)。
 	feedbackRepo  domain.RouteFeedbackRepository
-	feedbackStore *routeFeedbackStore
+	feedbackStore *boundedVectorCache[domain.RouteFeedback]
 	// caseRepo / caseStore 是诊断案例库的可选仓储(类型断言获取,缺失即关闭)与
 	// 内存案例缓存(注入热路径只读内存,不查库)。
 	caseRepo  domain.DiagnosisCaseRepository
-	caseStore *diagnosisCaseStore
+	caseStore *boundedVectorCache[domain.DiagnosisCase]
+	// embeddingGen 是可选的文本向量化能力。可用时案例/路由样例走语义检索,
+	// 不可用时降级关键词匹配。恒非 nil(未配置时为 Unavailable 实现)。
+	embeddingGen aiapplication.EmbeddingGenerator
+	// metricsRepo 是 run 度量的可选仓储(类型断言获取,缺失即关闭):run 收尾后
+	// 异步落库步数/token/检索模式等可观测指标,失败仅告警,绝不影响 run。
+	metricsRepo domain.RunMetricsRepository
+	// runFeedbackRepo 是 run 质量反馈的可选仓储(类型断言获取,缺失即关闭):
+	// 收集用户对诊断结论的"有用/没用"评价,与度量 join 后衡量"准不准"。
+	runFeedbackRepo domain.RunFeedbackRepository
 	// startupOverrides / startupSkills 是 NewService 时捕获的启动配置快照(深拷贝),
 	// 供 ReloadTools 在收到空请求时回滚到启动态。与调用方及后续 SetXxx 相互独立。
 	startupOverrides map[string]domain.ToolOverride
@@ -255,6 +346,21 @@ type Service struct {
 	// logger 用于记录持久化失败等"运行可继续但需可观测"的旁路错误。为 nil 时
 	// 退化为不记录,不影响主流程。
 	logger *slog.Logger
+	// semanticDegradedLoggedNS 是"语义检索因维度不一致静默失效"告警的节流时间戳
+	// (UnixNano,atomic 访问)。该症状持久存在,逐次记录会刷屏,故按 interval 节流。
+	semanticDegradedLoggedNS atomic.Int64
+	// bgLLMSem 是后台 LLM 调用(案例提取+向量化)的并发信号量(带缓冲 channel):
+	// run 本身有 runLimiter,但收尾后异步的案例归档不受其约束,高并发下会堆积
+	// 大量并行 LLM 调用二次冲击配额。此信号量平滑这些"尾部"负载。
+	bgLLMSem chan struct{}
+	// suppressedCaseRuns 记录已被用户负反馈下架的 runID(有界 FIFO 集合)。案例提取
+	// 在 run 收尾后异步进行,若用户在提取完成前就标记"没用",purge 时案例可能尚未
+	// 入库;此集合让随后到达的提取据此跳过,消除该竞态。仅覆盖秒级窗口,容量很小。
+	suppressedCaseRuns *boundedStringSet
+	// routeCalibration 是按 agentType 的关键词路由置信度校准增量(copy-on-write,
+	// 原子读写)。从用户确认反馈中后台异步重算;路由热路径无锁读取并叠加到基础
+	// 规则得分上(有界 ±ROUTE_CALIBRATION_MAX_DELTA)。恒非 nil(初始为空 map)。
+	routeCalibration atomic.Pointer[map[string]float64]
 }
 
 func NewService(options Options) *Service {
@@ -276,27 +382,44 @@ func NewService(options Options) *Service {
 		toolExecutor = NewToolDispatcher(toolRegistry, options.ToolExecutors...)
 	}
 
-	service := &Service{
-		repo:             options.Repo,
-		chatRepo:         options.ChatRepo,
-		assistant:        options.AssistantStreamer,
-		validator:        validator,
-		runtimeRepo:      runtimeConfigRepositoryFrom(options.Repo),
-		agentRegistry:    agentRegistry,
-		toolRegistry:     toolRegistry,
-		skillRegistry:    skillRegistry,
-		toolExecutor:     toolExecutor,
-		generator:        options.Generator,
-		opts:             options.Loop.withDefaults(),
-		feedbackRepo:     routeFeedbackRepositoryFrom(options.Repo),
-		feedbackStore:    newRouteFeedbackStore(MAX_ROUTE_FEEDBACK_CACHE),
-		caseRepo:         diagnosisCaseRepositoryFrom(options.Repo),
-		caseStore:        newDiagnosisCaseStore(MAX_DIAGNOSIS_CASE_CACHE),
-		startupOverrides: cloneOverrides(options.ToolOverrides),
-		startupSkills:    cloneSkills(options.Skills),
-		runLimiter:       newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
-		logger:           options.Logger,
+	opts := options.Loop.withDefaults()
+
+	// embeddingGen 恒非 nil:未注入时用 Unavailable 实现,使语义检索调用点无需
+	// 判空,统一走 Available() 分支降级。
+	embeddingGen := options.EmbeddingGenerator
+	if embeddingGen == nil {
+		embeddingGen = aiapplication.NewUnavailableEmbeddingGenerator()
 	}
+
+	service := &Service{
+		repo:               options.Repo,
+		chatRepo:           options.ChatRepo,
+		assistant:          options.AssistantStreamer,
+		validator:          validator,
+		runtimeRepo:        runtimeConfigRepositoryFrom(options.Repo),
+		agentRegistry:      agentRegistry,
+		toolRegistry:       toolRegistry,
+		skillRegistry:      skillRegistry,
+		toolExecutor:       toolExecutor,
+		generator:          options.Generator,
+		opts:               opts,
+		feedbackRepo:       routeFeedbackRepositoryFrom(options.Repo),
+		feedbackStore:      newRouteFeedbackStore(opts.RouteCacheSize),
+		caseRepo:           diagnosisCaseRepositoryFrom(options.Repo),
+		caseStore:          newDiagnosisCaseStore(opts.CaseCacheSize),
+		embeddingGen:       embeddingGen,
+		metricsRepo:        runMetricsRepositoryFrom(options.Repo),
+		runFeedbackRepo:    runFeedbackRepositoryFrom(options.Repo),
+		startupOverrides:   cloneOverrides(options.ToolOverrides),
+		startupSkills:      cloneSkills(options.Skills),
+		runLimiter:         newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
+		bgLLMSem:           make(chan struct{}, MAX_BACKGROUND_LLM_CONCURRENCY),
+		suppressedCaseRuns: newBoundedStringSet(SUPPRESSED_CASE_RUNS_CAPACITY),
+		logger:             options.Logger,
+	}
+	// 路由校准初始化为空 map(恒非 nil),热路径读取无需判空;预热完成后由
+	// recomputeRouteCalibration 原子替换为基于反馈算出的增量。
+	service.routeCalibration.Store(&map[string]float64{})
 	service.loadPersistedRuntimeConfig(context.Background())
 	// 异步预热路由反馈样例缓存:不阻塞启动,失败仅告警(缓存为空时路由行为与
 	// 未启用学习时一致)。
@@ -323,6 +446,32 @@ func (s *Service) ListAgents(_ context.Context) []domain.AgentDefinition {
 	return s.agentRegistry.List()
 }
 
+// acquireBgLLM 尝试获取后台 LLM 并发槽位:成功返回 true,在 ctx 超时/取消前
+// 抢不到则返回 false(调用方应放弃本次后台任务,而非排队等待)。这避免 provider
+// 卡死、槽位长时间占满时,后续后台 goroutine 在获取处无界堆积。bgLLMSem 为 nil
+// (非 NewService 构造的退化场景)时直接放行。
+func (s *Service) acquireBgLLM(ctx context.Context) bool {
+	if s == nil || s.bgLLMSem == nil {
+		return true
+	}
+	select {
+	case s.bgLLMSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// releaseBgLLM 释放后台 LLM 并发槽位。仅在 acquireBgLLM 返回 true 时调用;nil
+// 信号量时为空操作。
+func (s *Service) releaseBgLLM() {
+	if s == nil || s.bgLLMSem == nil {
+		return
+	}
+	<-s.bgLLMSem
+}
+
+// ListTools 返回当前生效的工具定义。
 func (s *Service) ListTools(_ context.Context) []domain.ToolDefinition {
 	return s.toolRegistry.List()
 }
@@ -640,7 +789,17 @@ func (s *Service) route(ctx context.Context, req RouteAgentRequest) domain.Agent
 	}
 }
 
+// rankCandidates 是 route() 实际使用的关键词路由打分:在基础规则之上叠加从用户
+// 确认反馈中学到的有界校准增量。校准默认随 RouteLearning 开启;关闭或样本不足时
+// 退化为纯基础规则(零回归)。
 func (s *Service) rankCandidates(req RouteAgentRequest) []domain.AgentCandidate {
+	return s.applyRouteCalibration(s.rankCandidatesBase(req))
+}
+
+// rankCandidatesBase 是不含任何学习成分的基础关键词路由规则。它单独保留,既供
+// rankCandidates 叠加校准,也供影子路由(recordRouteFeedback)测量"原始规则 vs
+// 用户选择"的偏差——影子必须基于未校准规则,否则学习信号会自我反馈漂移。
+func (s *Service) rankCandidatesBase(req RouteAgentRequest) []domain.AgentCandidate {
 	message := strings.ToLower(req.Message)
 	scopeKind := strings.ToLower(req.Scope.ResourceKind)
 	agents := s.agentRegistry.List()
@@ -764,7 +923,10 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 	if chatContext.enabled {
 		answerMessageID = chatContext.assistantMessage.ID
 	}
-	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req, chatContext.history, answerMessageID)
+	// stats 由 runLoop 在执行中累积(步数/token/检索模式/工具轨迹等),供收尾
+	// 异步落度量与归档案例轨迹。纯旁路,不影响控制流。
+	var stats runStats
+	answer, alive, loopErr := s.runLoop(ctx, persistCtx, events, run, agent, req, chatContext.history, answerMessageID, &stats)
 	if !alive {
 		// 客户端断连,由上方 defer 兜底落 cancelled。
 		return
@@ -784,10 +946,13 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 	finalized = true
 
 	// 诊断案例库:run 成功结束后异步提取结构化案例(独立超时,任何失败仅告警),
-	// 不增加本次请求的任何时延。
+	// 不增加本次请求的任何时延。携带工具调用轨迹作为程序性经验。
 	if run.Status == domain.RUN_STATUS_COMPLETED {
-		s.recordDiagnosisCase(run)
+		s.recordDiagnosisCase(run, stats.toolTrace)
 	}
+	// 度量闭环:run 收尾后异步落库可观测指标(步数/token/检索模式等),独立超时,
+	// 失败仅告警,绝不影响已完成的 run。
+	s.recordRunMetrics(run, stats)
 
 	eventName := STREAM_EVENT_AGENT_RUN_COMPLETED
 	if run.Status == domain.RUN_STATUS_FAILED {

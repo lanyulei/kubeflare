@@ -83,6 +83,19 @@ ai:
       max_retries: 2               # 对网络错误/429/5xx 的最大重试次数,0 表示不重试
       retry_backoff: 500ms         # 首次重试退避基数,后续指数增长
       # include_stream_usage: true # 流式是否请求 token 用量统计(默认开,个别 provider 可关)
+  # 可选:文本向量化(embedding)provider,配置后启用 Agent 的语义检索(案例库/
+  # 路由样例按语义相似度召回,而非关键词字面匹配)。留空(不配置 embedding)时
+  # 语义检索自动降级关键词匹配,行为与今日一致(零回归)。走独立端点与模型,可
+  # 指向与 chat 不同的服务商。api_key 同样支持明文或 enc:v1: 密文。
+  # embedding:
+  #   type: openai_compatible
+  #   base_url: https://api.openai.com/v1
+  #   path: /embeddings          # 留空用 /embeddings
+  #   api_key: ${KUBEFLARE_AI__EMBEDDING__API_KEY}
+  #   model: text-embedding-3-small
+  #   timeout: 20s
+  #   max_retries: 2
+  #   retry_backoff: 500ms
 
 # Agent loop(LLM 驱动的多步只读诊断)运行参数。
 agent:
@@ -97,11 +110,20 @@ agent:
   reflection: true             # 结论产出前做一次 critic 自检,证据不足时补充取证,失败保留原结论,默认开
   max_reflection_steps: 2      # 反思触发后允许追加的最大 think 步数(0-5),0 表示禁用补证
   max_reflections: 1           # 每次运行最大反思轮数(1-3,每轮一次 critic 调用),禁用反思请用 reflection: false
+  reflection_jurors: 3         # 反思自检的评委数(对抗式多评委,多视角并发评审多数否决才打回);1 退化为单评委,钳到 1-5
+  hypothesis_ledger: true      # 显式假设台账:把计划/剧本假设结构化为可记账的竞争假设,逐步取证确认或排除,支持鉴别诊断,默认开
+  playbook: true               # 诊断剧本先验:命中高频故障(CrashLoopBackOff/OOMKilled/ImagePullBackOff/Pending/Service无Endpoint)时注入常见根因与排查路径并种子化假设台账,默认开
+  replanning: false            # 动态重规划:取证途中每隔若干步基于已采集证据修订诊断计划,纠正被推翻的初始假设;需 planning 开启方生效,失败保留当前计划,默认关
+  replan_interval: 3           # 两次重规划之间至少执行的步数(每步一次工具取证)
+  max_replans: 2               # 每次运行的重规划次数上限(控成本)
   observe_compression: false   # 超长工具观察的智能压缩:超预算时用一次 LLM 调用按当前问题压缩关键信息,失败回退硬截断(每条超长观察多一次 LLM 调用,默认关)
   case_library: true           # 诊断案例库:run 成功后异步提取"症状→根因"案例,相似问题以 few-shot 回灌,默认开
   case_few_shot_limit: 3       # 注入提示的相似案例条数上限(0-8),0 表示只归档不注入
+  case_cache_size: 2000        # 诊断案例内存缓存上限(语义检索在缓存内算相似度);放大可减少历史经验被淘汰,代价仅内存
+  semantic_retrieval: true     # 案例/路由样例的语义向量检索,默认开;仅当上方 ai.embedding 已配置时生效,否则自动降级关键词匹配
   route_learning: true         # 记录用户显式选择 Agent 的反馈并以 few-shot 回灌路由提示,默认开
   route_few_shot_limit: 8      # 路由提示携带的历史确认样例条数上限(0-32)
+  route_cache_size: 256        # 路由样例内存缓存上限(语义检索在缓存内算相似度);样例为短文本,放大成本极低
   max_concurrent_runs_per_user: 3  # 单用户并发执行的 Agent run 上限,0 表示不限(不推荐)
   max_concurrent_runs: 50          # 全实例并发执行的 Agent run 总上限,0 表示不限(不推荐)
   # 集群内 Prometheus 服务定位(经 K8s API Server 代理访问,无需额外凭证)。

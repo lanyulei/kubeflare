@@ -65,6 +65,24 @@ type AIConfig struct {
 	// Kubeflare 智能助手默认自我认知提示词。
 	SystemPrompt string                      `koanf:"system_prompt"`
 	Providers    map[string]AIProviderConfig `koanf:"providers"`
+	// Embedding 是可选的文本向量化 provider(独立于 chat providers),配置后启用
+	// 语义检索;留空(nil)时语义检索自动降级关键词匹配。
+	Embedding *AIEmbeddingConfig `koanf:"embedding"`
+}
+
+// AIEmbeddingConfig 是 embedding(文本向量化)provider 的配置。与 chat provider
+// 解耦:走独立端点(默认 /embeddings)与模型(如 text-embedding-3-small),可指向
+// 与 chat 不同的服务商。api_key 支持密文(enc:v1: 前缀)或明文。
+type AIEmbeddingConfig struct {
+	Type    string `koanf:"type"`
+	BaseURL string `koanf:"base_url"`
+	// Path 是 embedding 端点路径,留空用 /embeddings。
+	Path         string        `koanf:"path"`
+	APIKey       string        `koanf:"api_key"`
+	Model        string        `koanf:"model"`
+	Timeout      time.Duration `koanf:"timeout"`
+	MaxRetries   int           `koanf:"max_retries"`
+	RetryBackoff time.Duration `koanf:"retry_backoff"`
 }
 
 type AIProviderConfig struct {
@@ -117,6 +135,15 @@ type AgentConfig struct {
 	// MaxReflections 每次运行允许的最大反思轮数(1-3,每轮一次 critic 调用,
 	// 未通过则补证)。0 表示沿用默认 1;禁用反思请置 reflection: false。
 	MaxReflections int `koanf:"max_reflections"`
+	// ReflectionJurors 反思自检的评委数(对抗式多评委:多视角并发评审,多数否决
+	// 才打回)。0 表示沿用默认 3;1 退化为单评委。钳到 1-5。
+	ReflectionJurors int `koanf:"reflection_jurors"`
+	// HypothesisLedger 控制显式假设台账(把计划/剧本假设结构化为可记账的竞争假设,
+	// 逐步取证确认或排除,支持鉴别诊断)。nil 表示默认开启;失败降级为无台账。
+	HypothesisLedger *bool `koanf:"hypothesis_ledger"`
+	// Playbook 控制诊断剧本先验(命中高频故障时注入常见根因与排查路径,种子化
+	// 假设台账)。nil 表示默认开启;未命中或失败时与无剧本一致(零回归)。
+	Playbook *bool `koanf:"playbook"`
 	// ObserveCompression 控制超长工具观察的智能压缩:超出回喂预算时用一次 LLM
 	// 调用按当前问题压缩关键信息(失败回退硬截断)。提升日志/事件类证据的信息
 	// 密度,但每条超长观察多一次 LLM 调用,默认关闭。
@@ -126,11 +153,28 @@ type AgentConfig struct {
 	CaseLibrary *bool `koanf:"case_library"`
 	// CaseFewShotLimit 注入系统提示的相似案例条数上限(0-8),0 表示只归档不注入。
 	CaseFewShotLimit int `koanf:"case_few_shot_limit"`
+	// CaseCacheSize 诊断案例内存缓存上限(语义检索在该缓存内算余弦相似度)。
+	// <=0 回退默认值(2000)。放大可减少历史经验被淘汰的损失,代价仅内存。
+	CaseCacheSize int `koanf:"case_cache_size"`
+	// SemanticRetrieval 控制案例/路由样例的语义向量检索。nil 表示默认开启;仅当
+	// ai.embedding 已配置且可用时生效,否则自动降级关键词匹配(零回归)。
+	SemanticRetrieval *bool `koanf:"semantic_retrieval"`
+	// Replanning 控制动态重规划:取证过程中每隔若干步基于已采集证据修订诊断计划,
+	// 纠正被证据推翻的初始假设。nil/false 表示默认关闭;需 planning 启用方生效。
+	// 任何失败保留当前计划,绝不影响 run(零回归)。
+	Replanning *bool `koanf:"replanning"`
+	// ReplanInterval 两次重规划之间至少要执行的步数(默认 3)。
+	ReplanInterval int `koanf:"replan_interval"`
+	// MaxReplans 每次运行的重规划次数上限(默认 2),控成本、杜绝重规划失控。
+	MaxReplans int `koanf:"max_replans"`
 	// RouteLearning 控制路由置信度学习(记录用户显式选择 Agent 的反馈,并以
 	// few-shot 样例回灌 LLM 路由提示),nil 表示默认开启。
 	RouteLearning *bool `koanf:"route_learning"`
 	// RouteFewShotLimit 路由提示中携带的历史确认样例条数上限。
 	RouteFewShotLimit int `koanf:"route_few_shot_limit"`
+	// RouteCacheSize 路由样例内存缓存上限(默认 256)。与案例缓存对称,语义检索
+	// 在该缓存内算相似度;放大可提升路由 few-shot 召回覆盖面,样例为短文本成本极低。
+	RouteCacheSize int `koanf:"route_cache_size"`
 	// MaxConcurrentRunsPerUser 限制单个用户同时执行的 Agent run 数量,防止单个
 	// 用户瞬间发起大量 run 打爆 LLM 配额与集群 apiserver。0 表示不限(不推荐)。
 	MaxConcurrentRunsPerUser int `koanf:"max_concurrent_runs_per_user"`
@@ -308,8 +352,13 @@ func Default() Config {
 			ToolChoice:               "auto",
 			MaxReflectionSteps:       2,
 			MaxReflections:           1,
+			ReflectionJurors:         3,
+			ReplanInterval:           3,
+			MaxReplans:               2,
 			CaseFewShotLimit:         3,
+			CaseCacheSize:            2000,
 			RouteFewShotLimit:        8,
+			RouteCacheSize:           256,
 			MaxConcurrentRunsPerUser: 3,
 			MaxConcurrentRuns:        50,
 			Prometheus: AgentPrometheusConfig{

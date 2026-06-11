@@ -40,27 +40,34 @@ func (s *Service) planningEnabled() bool {
 }
 
 // generatePlan 在 loop 开始前生成一次显式诊断计划(经 generateJSON 统一施加
-// 单步超时、容错解析与纠偏重试)。返回格式化后的计划文本与累计消耗的 token
-// (解析失败时 token 仍已消耗,须由调用方计入预算)。任何失败由调用方降级为
-// 无计划运行,绝不让 run 失败。
+// 单步超时、容错解析与纠偏重试)。命中诊断剧本时,把剧本的常见根因与排查路径作为
+// 领域先验注入提示,引导模型产出更贴合该类故障的计划。返回解析后的结构化计划、
+// 格式化文本与累计消耗的 token(解析失败时 token 仍已消耗,须由调用方计入预算)。
+// 任何失败由调用方降级为无计划运行,绝不让 run 失败。
 func (s *Service) generatePlan(
 	ctx context.Context,
 	systemHistory []aiapplication.MessageContext,
 	message string,
 	tools []domain.ToolDefinition,
-) (string, int, error) {
+	playbook *diagnosticPlaybook,
+) (runPlan, string, int, error) {
 	history := mergeLeadingSystemPrompt(systemHistory, fmt.Sprintf(planSystemPrompt, toolCatalogLine(tools)))
+	// 剧本先验作为额外的 system 段注入:它列出该类故障的常见根因与典型排查路径,
+	// 让计划器站在专家骨架上产出假设与步骤(命中时;未命中为空串,零回归)。
+	if prior := playbookPriorSection(playbook); prior != "" {
+		history = mergeLeadingSystemPrompt(history, prior)
+	}
 
 	var plan runPlan
 	tokens, err := s.generateJSON(ctx, history, message, &plan)
 	if err != nil {
-		return "", tokens, err
+		return runPlan{}, "", tokens, err
 	}
 	text := formatPlan(plan)
 	if text == "" {
-		return "", tokens, errors.New("计划内容为空")
+		return runPlan{}, "", tokens, errors.New("计划内容为空")
 	}
-	return text, tokens, nil
+	return plan, text, tokens, nil
 }
 
 // formatPlan 把结构化计划编排为注入系统提示的中文文本;假设与步骤全为空时返回 ""。
@@ -85,6 +92,22 @@ func formatPlan(plan runPlan) string {
 		for index, line := range steps {
 			builder.WriteString(fmt.Sprintf("\n%d. %s", index+1, line))
 		}
+	}
+	return truncate(builder.String(), MAX_PLAN_CHARS)
+}
+
+// formatPlanSteps 仅编排计划的验证步骤(不含假设),供启用假设台账时使用——此时
+// 假设由台账独立跟踪与展示,计划文本只保留"接下来怎么查"的步骤,避免假设在台账与
+// 计划里重复注入。步骤为空时返回 ""。
+func formatPlanSteps(plan runPlan) string {
+	steps := compactPlanLines(plan.Steps, MAX_PLAN_STEPS)
+	if len(steps) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("验证步骤(开始取证前生成,可随证据修订,不必拘泥):")
+	for index, line := range steps {
+		builder.WriteString(fmt.Sprintf("\n%d. %s", index+1, line))
 	}
 	return truncate(builder.String(), MAX_PLAN_CHARS)
 }

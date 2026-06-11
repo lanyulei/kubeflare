@@ -23,4 +23,8 @@ func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	agent.POST("/:agentType/run/stream", handler.StreamRun)
 	agent.POST("/run/:runID/cancel", handler.CancelRun)
 	agent.GET("/run/:runID/evidence", handler.ListEvidence)
+	agent.POST("/run/:runID/feedback", handler.SubmitFeedback)
+	// 评估看板独立于 /run/:runID 之下,避免静态段与 :runID 通配在同层冲突
+	// (gin 路由树会在注册期 panic)。
+	agent.GET("/metrics/evaluation", handler.EvaluateRuns)
 }

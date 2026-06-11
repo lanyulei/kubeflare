@@ -10,7 +10,8 @@ import (
 )
 
 // MAX_DIAGNOSIS_CASE_QUERY_LIMIT 限制单次案例查询的返回条数,防御异常入参。
-const MAX_DIAGNOSIS_CASE_QUERY_LIMIT = 200
+// 设为 5000 以支持放大后的内存案例缓存(语义检索预热需一次性加载全部缓存量)。
+const MAX_DIAGNOSIS_CASE_QUERY_LIMIT = 5000
 
 // agentDiagnosisCaseRecord 是诊断案例的存储形态(无软删:案例是只追加的经验
 // 样本,缓存与查询均按 created_at 倒序取最近 N 条)。
@@ -23,6 +24,7 @@ type agentDiagnosisCaseRecord struct {
 	Symptom   string           `gorm:"size:512;not null;default:''"`
 	RootCause string           `gorm:"size:512;not null;default:''"`
 	Tags      dbplatform.JSONB `gorm:"type:jsonb;not null;default:'[]'"`
+	ToolTrace dbplatform.JSONB `gorm:"type:jsonb;not null;default:'[]'"`
 	CreatedAt time.Time        `gorm:"not null;index"`
 }
 
@@ -76,6 +78,26 @@ func (r *AgentRepository) ListRecentDiagnosisCases(ctx context.Context, agentTyp
 	return items, nil
 }
 
+// DeleteDiagnosisCaseByRunID 硬删除某次 run 提取出的全部案例(实现
+// domain.DiagnosisCaseRepository),返回删除行数。案例表无软删,直接物理删除;
+// 复用 run_id 索引,质量门控下架时调用。
+func (r *AgentRepository) DeleteDiagnosisCaseByRunID(ctx context.Context, runID string) (int64, error) {
+	if r.db == nil {
+		return 0, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	result := r.db.WithContext(queryCtx).
+		Where("run_id = ?", runID).
+		Delete(&agentDiagnosisCaseRecord{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 func toDomainDiagnosisCase(record agentDiagnosisCaseRecord) domain.DiagnosisCase {
 	item := domain.DiagnosisCase{
 		ID:        record.ID,
@@ -90,6 +112,9 @@ func toDomainDiagnosisCase(record agentDiagnosisCaseRecord) domain.DiagnosisCase
 	if len(record.Tags) > 0 {
 		_ = json.Unmarshal([]byte(record.Tags), &item.Tags)
 	}
+	if len(record.ToolTrace) > 0 {
+		_ = json.Unmarshal([]byte(record.ToolTrace), &item.ToolTrace)
+	}
 	return item
 }
 
@@ -97,6 +122,10 @@ func fromDomainDiagnosisCase(item domain.DiagnosisCase) agentDiagnosisCaseRecord
 	tagsJSON, _ := json.Marshal(item.Tags)
 	if len(tagsJSON) == 0 || string(tagsJSON) == "null" {
 		tagsJSON = []byte("[]")
+	}
+	traceJSON, _ := json.Marshal(item.ToolTrace)
+	if len(traceJSON) == 0 || string(traceJSON) == "null" {
+		traceJSON = []byte("[]")
 	}
 	return agentDiagnosisCaseRecord{
 		ID:        item.ID,
@@ -107,6 +136,7 @@ func fromDomainDiagnosisCase(item domain.DiagnosisCase) agentDiagnosisCaseRecord
 		Symptom:   item.Symptom,
 		RootCause: item.RootCause,
 		Tags:      dbplatform.NewJSONB(tagsJSON),
+		ToolTrace: dbplatform.NewJSONB(traceJSON),
 		CreatedAt: item.CreatedAt,
 	}
 }

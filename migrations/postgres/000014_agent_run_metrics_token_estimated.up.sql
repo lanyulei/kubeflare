@@ -1,0 +1,1 @@
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS token_estimated BOOLEAN NOT NULL DEFAULT FALSE;

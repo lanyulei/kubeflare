@@ -26,12 +26,12 @@ const (
 )
 
 type AgentRun struct {
-	ID           string     `json:"id"`
-	AgentType    string     `json:"agent_type"`
-	UserID       string     `json:"user_id"`
-	ClusterID    string     `json:"cluster_id"`
-	Input        string     `json:"input"`
-	Scope        AgentScope `json:"scope"`
+	ID          string     `json:"id"`
+	AgentType   string     `json:"agent_type"`
+	UserID      string     `json:"user_id"`
+	ClusterID   string     `json:"cluster_id"`
+	Input       string     `json:"input"`
+	Scope       AgentScope `json:"scope"`
 	Status      string     `json:"status"`
 	Confidence  float64    `json:"confidence"`
 	RouteReason string     `json:"route_reason"`

@@ -198,6 +198,48 @@ func (h *Handler) ListEvidence(c *gin.Context) {
 	response.OKList(c, items)
 }
 
+// SubmitFeedback 记录用户对一次诊断结论的质量反馈(有用/没用 + 可选备注),
+// 按 run 改票覆盖。用于把度量闭环延伸到"准不准"。
+func (h *Handler) SubmitFeedback(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	var req application.SubmitRunFeedbackRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	feedback, err := h.service.SubmitRunFeedback(c.Request.Context(), userID, c.Param("runID"), req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, feedback)
+}
+
+// EvaluateRuns 返回 run 度量的离线评估看板(metrics × feedback 按特性 on/off
+// 对照),供管理员评估各智能特性的真实增益。窗口天数由 days query 指定(缺省/
+// 越界由服务层钳制)。
+func (h *Handler) EvaluateRuns(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	days, _ := strconv.Atoi(strings.TrimSpace(c.Query("days")))
+	evaluation, err := h.service.EvaluateRuns(c.Request.Context(), userID, days)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, evaluation)
+}
+
 func clusterIDFromRequest(c *gin.Context, value string) string {
 	value = strings.TrimSpace(value)
 	if value != "" {

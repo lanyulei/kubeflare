@@ -351,7 +351,8 @@ func (r *AgentRepository) FailStaleRuns(ctx context.Context, before time.Time, e
 }
 
 // MAX_ROUTE_FEEDBACK_QUERY_LIMIT 限制单次反馈查询的返回条数,防御异常入参。
-const MAX_ROUTE_FEEDBACK_QUERY_LIMIT = 100
+// 设为 2000 以支持放大后的路由样例内存缓存(语义检索预热需一次性加载缓存量)。
+const MAX_ROUTE_FEEDBACK_QUERY_LIMIT = 2000
 
 // CreateRouteFeedback 持久化一条路由确认反馈(实现 domain.RouteFeedbackRepository)。
 func (r *AgentRepository) CreateRouteFeedback(ctx context.Context, feedback domain.RouteFeedback) (domain.RouteFeedback, error) {

@@ -11,6 +11,9 @@ const (
 	MAX_DIAGNOSIS_CASE_TEXT_CHARS = 256
 	// MAX_DIAGNOSIS_CASE_TAGS 限制单条案例的检索标签数,超出部分丢弃。
 	MAX_DIAGNOSIS_CASE_TAGS = 6
+	// MAX_DIAGNOSIS_CASE_TRACE_STEPS 限制案例记录的工具调用轨迹步数,约束存储与
+	// 提示注入体积;超出部分丢弃(轨迹仅作经验参考,头部步骤已足够表达排查路径)。
+	MAX_DIAGNOSIS_CASE_TRACE_STEPS = 12
 )
 
 // DiagnosisCase 是一条结构化的历史诊断案例:run 成功结束后由 LLM 从结论中提取
@@ -27,7 +30,11 @@ type DiagnosisCase struct {
 	Symptom   string `json:"symptom"`
 	RootCause string `json:"root_cause"`
 	// Tags 是小写检索关键词(如 "crashloopbackoff"、"oom"),用于相似案例匹配。
-	Tags      []string  `json:"tags"`
+	Tags []string `json:"tags"`
+	// ToolTrace 是该案例对应成功 run 的工具调用序列(去重保序的工具 ID,如
+	// ["cluster.event.list","cluster.pod.get","cluster.pod.log.tail"]),作为
+	// 程序性经验随 few-shot 注入,提示模型"这类问题的典型排查路径"。
+	ToolTrace []string  `json:"tool_trace"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -38,4 +45,7 @@ type DiagnosisCaseRepository interface {
 	// ListRecentDiagnosisCases 按创建时间倒序返回最近案例;agentType 为空表示
 	// 不过滤。
 	ListRecentDiagnosisCases(ctx context.Context, agentType string, limit int) ([]DiagnosisCase, error)
+	// DeleteDiagnosisCaseByRunID 删除某次 run 提取出的全部案例,返回删除行数。
+	// 用于质量门控:用户把诊断结论标记为"没用"时,下架其案例避免污染 few-shot。
+	DeleteDiagnosisCaseByRunID(ctx context.Context, runID string) (int64, error)
 }

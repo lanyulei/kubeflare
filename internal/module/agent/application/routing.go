@@ -57,7 +57,7 @@ func (s *Service) routeWithLLM(ctx context.Context, req RouteAgentRequest) (doma
 	// 未启用学习时逐字节一致)。技能候选段同理:无已启用技能时为空串,零回归。
 	systemContent := llmprompt.WithIdentity(fmt.Sprintf(routeSystemPrompt, agentCatalog(available)))
 	if s.routeLearningEnabled() {
-		systemContent += s.routeFewShotPromptSection()
+		systemContent += s.routeFewShotPromptSection(ctx, req.Message)
 	}
 	systemContent += s.routeSkillPromptSection()
 	prompt := []aiapplication.MessageContext{{

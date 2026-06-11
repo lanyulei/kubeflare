@@ -1,0 +1,1 @@
+ALTER TABLE agent_run_metrics ADD COLUMN IF NOT EXISTS replan_count INT NOT NULL DEFAULT 0;
