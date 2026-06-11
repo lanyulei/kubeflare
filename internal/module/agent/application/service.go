@@ -18,6 +18,7 @@ import (
 	aiapplication "github.com/lanyulei/kubeflare/internal/module/ai/application"
 	aidomain "github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
+	sharedcoord "github.com/lanyulei/kubeflare/internal/shared/coordination"
 	"github.com/lanyulei/kubeflare/internal/shared/ctxutil"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
@@ -71,6 +72,15 @@ const (
 	// Agent 自动路由的最低执行置信度。低于该阈值时返回普通对话助手,
 	// 避免寒暄、身份询问等非诊断输入被硬路由到 diagnostic。
 	MIN_AGENT_ROUTE_CONFIDENCE = 0.7
+
+	RUN_LEASE_TTL              = 90 * time.Second
+	RUN_LEASE_REFRESH_INTERVAL = 30 * time.Second
+	RUN_CANCEL_SIGNAL_TTL      = 2 * time.Hour
+	RUN_CANCEL_POLL_INTERVAL   = 3 * time.Second
+
+	RUNTIME_CONFIG_REFRESH_INTERVAL = 5 * time.Second
+	RUNTIME_CONFIG_CHANGE_TOPIC     = "agent.runtime_config.changed"
+	RUN_CANCEL_TOPIC_PREFIX         = "agent.run.cancel"
 )
 
 type ToolExecutor interface {
@@ -300,6 +310,13 @@ type Options struct {
 	// EmbeddingGenerator 可选。提供后启用语义向量检索(案例/路由样例);为 nil
 	// 或不可用时,所有语义检索自动降级关键词匹配(零回归)。
 	EmbeddingGenerator aiapplication.EmbeddingGenerator
+	// Semaphore 可选。提供后用于 Agent run 的跨实例并发准入;未提供时仅使用
+	// 进程内限流,适用于本地单实例开发。
+	Semaphore sharedcoord.Semaphore
+	// EventBus 可选。提供后用于跨实例取消信号与 runtime config 变更广播。
+	EventBus sharedcoord.EventBus
+	// InstanceID 可选。为空时自动生成;写入 run lease 字段便于多副本排障。
+	InstanceID string
 	// Logger 可选。用于记录持久化失败等旁路错误,为 nil 时不记录。
 	Logger *slog.Logger
 }
@@ -338,8 +355,11 @@ type Service struct {
 	startupOverrides map[string]domain.ToolOverride
 	startupSkills    []domain.SkillDefinition
 	// runLimiter 限制并发执行中的 run 数(per-user + 全局),防止瞬时大量 run
-	// 打爆 LLM 配额与集群 apiserver。
+	// 打爆 LLM 配额与集群 apiserver。仅在未注入分布式 Semaphore 时使用。
 	runLimiter *runLimiter
+	semaphore  sharedcoord.Semaphore
+	eventBus   sharedcoord.EventBus
+	instanceID string
 	// activeRuns 记录正在执行的 runID -> 取消函数,供 CancelRun 主动中断后台
 	// goroutine,停止继续消耗 token 与发起集群查询。
 	activeRuns sync.Map
@@ -361,6 +381,12 @@ type Service struct {
 	// 原子读写)。从用户确认反馈中后台异步重算;路由热路径无锁读取并叠加到基础
 	// 规则得分上(有界 ±ROUTE_CALIBRATION_MAX_DELTA)。恒非 nil(初始为空 map)。
 	routeCalibration atomic.Pointer[map[string]float64]
+	// runtimeVersion / runtimeLastCheckNS 用于跨实例 runtime config 懒加载:
+	// 热路径最多每 RUNTIME_CONFIG_REFRESH_INTERVAL 查一次 DB,Pub/Sub 事件可触发
+	// 立即同步,任一事件丢失也会被下一次懒加载补偿。
+	runtimeVersion     atomic.Int64
+	runtimeLastCheckNS atomic.Int64
+	runtimeRefreshMu   sync.Mutex
 }
 
 func NewService(options Options) *Service {
@@ -390,6 +416,10 @@ func NewService(options Options) *Service {
 	if embeddingGen == nil {
 		embeddingGen = aiapplication.NewUnavailableEmbeddingGenerator()
 	}
+	instanceID := strings.TrimSpace(options.InstanceID)
+	if instanceID == "" {
+		instanceID = newID("agent-instance")
+	}
 
 	service := &Service{
 		repo:               options.Repo,
@@ -413,6 +443,9 @@ func NewService(options Options) *Service {
 		startupOverrides:   cloneOverrides(options.ToolOverrides),
 		startupSkills:      cloneSkills(options.Skills),
 		runLimiter:         newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
+		semaphore:          options.Semaphore,
+		eventBus:           options.EventBus,
+		instanceID:         instanceID,
 		bgLLMSem:           make(chan struct{}, MAX_BACKGROUND_LLM_CONCURRENCY),
 		suppressedCaseRuns: newBoundedStringSet(SUPPRESSED_CASE_RUNS_CAPACITY),
 		logger:             options.Logger,
@@ -472,16 +505,19 @@ func (s *Service) releaseBgLLM() {
 }
 
 // ListTools 返回当前生效的工具定义。
-func (s *Service) ListTools(_ context.Context) []domain.ToolDefinition {
+func (s *Service) ListTools(ctx context.Context) []domain.ToolDefinition {
+	s.refreshRuntimeConfig(ctx, false)
 	return s.toolRegistry.List()
 }
 
 // ListSkills 返回当前生效的技能定义。
-func (s *Service) ListSkills(_ context.Context) []domain.SkillDefinition {
+func (s *Service) ListSkills(ctx context.Context) []domain.SkillDefinition {
+	s.refreshRuntimeConfig(ctx, false)
 	return s.skillRegistry.List()
 }
 
 func (s *Service) Route(ctx context.Context, userID string, req RouteAgentRequest) (domain.AgentRouteResult, error) {
+	s.refreshRuntimeConfig(ctx, false)
 	req.Message = strings.TrimSpace(req.Message)
 	req.SelectedAgent = normalizeAgentType(req.SelectedAgent)
 	req.ClusterID = strings.TrimSpace(req.ClusterID)
@@ -496,6 +532,7 @@ func (s *Service) Route(ctx context.Context, userID string, req RouteAgentReques
 }
 
 func (s *Service) StreamRun(ctx context.Context, userID string, agentType string, req RunAgentRequest) (<-chan domain.AgentRunEvent, error) {
+	s.refreshRuntimeConfig(ctx, false)
 	req.Message = strings.TrimSpace(req.Message)
 	req.SelectedAgent = normalizeAgentType(req.SelectedAgent)
 	req.SessionID = strings.TrimSpace(req.SessionID)
@@ -561,8 +598,12 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 	}
 
 	// 并发准入:超过 per-user 或全局上限时拒绝,避免瞬时大量 run 打爆 LLM
-	// 配额与集群 apiserver。必须在创建 run 记录、启动后台 goroutine 之前判定。
-	release, ok := s.runLimiter.Acquire(normalizedUserID)
+	// 配额与集群 apiserver。分布式协调可用时跨副本全局生效。
+	runID := newID("agent-run")
+	slot, ok, err := s.acquireRunSlot(ctx, normalizedUserID, runID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, &sharedErrors.AppError{
 			Code:    sharedErrors.CodeTooManyRequests,
@@ -572,24 +613,24 @@ func (s *Service) StreamRun(ctx context.Context, userID string, agentType string
 	}
 	chatContext, err := s.prepareRunChatContext(ctx, normalizedUserID, req, agent)
 	if err != nil {
-		release()
+		s.releaseRunSlot(ctx, slot)
 		return nil, err
 	}
 
 	events := make(chan domain.AgentRunEvent, 16)
 	// 预先生成 runID 并登记可取消的 context,使 CancelRun 能在 run 落库前/中
 	// 主动中断后台 goroutine(停止继续消耗 token 与发起集群查询)。
-	runID := newID("agent-run")
 	runCtx, cancelRun := context.WithCancel(ctx)
 	s.activeRuns.Store(runID, cancelRun)
+	s.watchRunCancellation(runCtx, runID, cancelRun)
 	go func() {
 		// Recover 注册为最先入栈的 defer,确保即使 run 内部 panic,release/Delete/
 		// cancelRun 与 run 的 defer close(events) 仍会执行,消费方不会永久阻塞。
 		defer safego.Recover(s.logger, "agent run")
-		defer release()
+		defer s.releaseRunSlot(runCtx, slot)
 		defer s.activeRuns.Delete(runID)
 		defer cancelRun()
-		s.run(runCtx, events, runID, normalizedUserID, agent, req, route, chatContext)
+		s.run(runCtx, events, runID, normalizedUserID, agent, req, route, chatContext, slot.lease, cancelRun)
 	}()
 	return events, nil
 }
@@ -702,6 +743,7 @@ func (s *Service) CancelRun(ctx context.Context, userID string, runID string) (d
 			cancel()
 		}
 	}
+	s.requestRunCancel(ctx, runID)
 
 	if run.Status != domain.RUN_STATUS_RUNNING && run.Status != domain.RUN_STATUS_PENDING {
 		return run, nil
@@ -864,7 +906,7 @@ func (s *Service) rankCandidatesBase(req RouteAgentRequest) []domain.AgentCandid
 	return candidates
 }
 
-func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, runID string, userID string, agent domain.AgentDefinition, req RunAgentRequest, route domain.AgentRouteResult, chatContext runChatContext) {
+func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, runID string, userID string, agent domain.AgentDefinition, req RunAgentRequest, route domain.AgentRouteResult, chatContext runChatContext, lease sharedcoord.Lease, cancelRun context.CancelFunc) {
 	defer close(events)
 
 	// 持久化统一使用不受客户端断连影响的 context,确保 run / 工具调用 / 证据
@@ -875,20 +917,25 @@ func (s *Service) run(ctx context.Context, events chan<- domain.AgentRunEvent, r
 	_ = sendRunEvent(ctx, events, domain.AgentRunEvent{Event: STREAM_EVENT_AGENT_ROUTE_COMPLETED, Route: &route})
 
 	now := time.Now().UTC()
+	leaseExpiresAt := now.Add(RUN_LEASE_TTL)
 	run := domain.AgentRun{
-		ID:          runID,
-		AgentType:   agent.Type,
-		UserID:      userID,
-		ClusterID:   req.ClusterID,
-		Input:       req.Message,
-		Scope:       req.Scope,
-		Status:      domain.RUN_STATUS_RUNNING,
-		Confidence:  route.Confidence,
-		RouteReason: route.Reason,
-		RouteSource: route.Source,
-		CreatedAt:   now,
+		ID:           runID,
+		AgentType:    agent.Type,
+		UserID:       userID,
+		ClusterID:    req.ClusterID,
+		Input:        req.Message,
+		Scope:        req.Scope,
+		Status:       domain.RUN_STATUS_RUNNING,
+		Confidence:   route.Confidence,
+		RouteReason:  route.Reason,
+		RouteSource:  route.Source,
+		HeartbeatAt:  &now,
+		LeaseOwner:   s.instanceID,
+		LeaseExpires: &leaseExpiresAt,
+		CreatedAt:    now,
 	}
 	run = s.createRun(persistCtx, run)
+	s.startRunHeartbeat(ctx, persistCtx, run.ID, lease, cancelRun)
 
 	finalized := false
 	defer func() {

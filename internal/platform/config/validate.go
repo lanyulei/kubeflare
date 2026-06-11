@@ -9,6 +9,7 @@ import (
 )
 
 func Validate(cfg Config) error {
+	production := strings.EqualFold(strings.TrimSpace(cfg.Service.Environment), "production")
 	if cfg.Service.Name == "" {
 		return errors.New("service.name is required")
 	}
@@ -28,7 +29,7 @@ func Validate(cfg Config) error {
 	// 生产环境严禁通配 Origin:exec/attach 代理的跨站防护完全依赖 Origin 白名单
 	// (升级请求是 GET,CSRF 被有意跳过),通配会让任何站点借管理员 Cookie 跨站
 	// 打开 Pod root shell(CSWSH)。本地/开发保留 "*" 以免阻断联调。
-	if strings.EqualFold(strings.TrimSpace(cfg.Service.Environment), "production") {
+	if production {
 		for _, origin := range cfg.HTTP.AllowedOrigins {
 			if strings.TrimSpace(origin) == "*" {
 				return errors.New("http.allowed_origins cannot contain * in production; configure explicit origins")
@@ -37,6 +38,9 @@ func Validate(cfg Config) error {
 	}
 	if err := validateDatabaseConfig(cfg.Database); err != nil {
 		return err
+	}
+	if production && !cfg.Redis.Enabled {
+		return errors.New("redis.enabled is required in production for distributed coordination")
 	}
 	if err := validateRedisConfig(cfg.Redis); err != nil {
 		return err

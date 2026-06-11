@@ -33,6 +33,9 @@ type agentRunRecord struct {
 	RouteSource  string           `gorm:"size:16;not null;default:''"`
 	Summary      string           `gorm:"type:text;not null;default:''"`
 	ErrorMessage string           `gorm:"type:text;not null;default:''"`
+	HeartbeatAt  *time.Time       `gorm:"index"`
+	LeaseOwner   string           `gorm:"size:128;not null;default:'';index"`
+	LeaseExpires *time.Time       `gorm:"column:lease_expires_at;index"`
 	CreatedAt    time.Time        `gorm:"not null;index"`
 	CompletedAt  *time.Time
 	DeletedAt    gorm.DeletedAt `gorm:"index"`
@@ -144,6 +147,9 @@ func (r *AgentRepository) UpdateRun(ctx context.Context, run domain.AgentRun) (d
 	record.RouteSource = run.RouteSource
 	record.Summary = run.Summary
 	record.ErrorMessage = run.ErrorMessage
+	record.HeartbeatAt = run.HeartbeatAt
+	record.LeaseOwner = run.LeaseOwner
+	record.LeaseExpires = run.LeaseExpires
 	record.CompletedAt = run.CompletedAt
 	if scopeJSON, err := json.Marshal(run.Scope); err == nil {
 		record.Scope = dbplatform.NewJSONB(scopeJSON)
@@ -152,6 +158,26 @@ func (r *AgentRepository) UpdateRun(ctx context.Context, run domain.AgentRun) (d
 		return domain.AgentRun{}, err
 	}
 	return toDomainRun(record), nil
+}
+
+func (r *AgentRepository) HeartbeatRun(ctx context.Context, runID string, owner string, heartbeatAt time.Time, leaseExpiresAt time.Time) error {
+	if r.db == nil {
+		return nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	result := r.db.WithContext(queryCtx).
+		Model(&agentRunRecord{}).
+		Where("id = ?", runID).
+		Where("status IN ?", []string{domain.RUN_STATUS_PENDING, domain.RUN_STATUS_RUNNING}).
+		Updates(map[string]any{
+			"heartbeat_at":     heartbeatAt,
+			"lease_owner":      owner,
+			"lease_expires_at": leaseExpiresAt,
+		})
+	return result.Error
 }
 
 // isTerminalRunStatus 判断运行是否已到不可逆终态。
@@ -338,7 +364,7 @@ func (r *AgentRepository) FailStaleRuns(ctx context.Context, before time.Time, e
 	result := r.db.WithContext(queryCtx).
 		Model(&agentRunRecord{}).
 		Where("status IN ?", []string{domain.RUN_STATUS_PENDING, domain.RUN_STATUS_RUNNING}).
-		Where("created_at < ?", before).
+		Where("COALESCE(lease_expires_at, heartbeat_at, created_at) < ?", before).
 		Updates(map[string]any{
 			"status":        domain.RUN_STATUS_FAILED,
 			"error_message": errorMessage,
@@ -411,6 +437,9 @@ func toDomainRun(record agentRunRecord) domain.AgentRun {
 		RouteSource:  record.RouteSource,
 		Summary:      record.Summary,
 		ErrorMessage: record.ErrorMessage,
+		HeartbeatAt:  record.HeartbeatAt,
+		LeaseOwner:   record.LeaseOwner,
+		LeaseExpires: record.LeaseExpires,
 		CreatedAt:    record.CreatedAt,
 		CompletedAt:  record.CompletedAt,
 	}
@@ -439,6 +468,9 @@ func fromDomainRun(run domain.AgentRun) agentRunRecord {
 		RouteSource:  run.RouteSource,
 		Summary:      run.Summary,
 		ErrorMessage: run.ErrorMessage,
+		HeartbeatAt:  run.HeartbeatAt,
+		LeaseOwner:   run.LeaseOwner,
+		LeaseExpires: run.LeaseExpires,
 		CreatedAt:    run.CreatedAt,
 		CompletedAt:  run.CompletedAt,
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/cluster/domain"
 	"github.com/lanyulei/kubeflare/internal/platform/secrets"
+	"github.com/lanyulei/kubeflare/internal/shared/coordination"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 )
 
@@ -21,6 +22,8 @@ const (
 	RUNNING_STATE_AVAILABLE = "available"
 	RUNNING_STATE_UNHEALTHY = "unhealthy"
 	RUNNING_STATE_DISABLED  = "disabled"
+
+	CLUSTER_CACHE_INVALIDATION_TOPIC = "cluster.cache.invalidate"
 )
 
 const MAX_RUNTIME_INSPECTORS = 4
@@ -37,6 +40,7 @@ type Service struct {
 	// invalidators 在集群 kubeconfig 更新/删除后被调用,通知缓存层(如 agent 的
 	// clientset 工厂、代理的 transport 缓存)立即失效对应条目,避免沿用旧凭证。
 	invalidators []func(clusterID string)
+	cacheBus     coordination.EventBus
 }
 
 func NewService(repo domain.Repository, validator *validator.Validate, encryptor secrets.Encryptor, inspector RuntimeInspector) *Service {
@@ -60,11 +64,45 @@ func (s *Service) RegisterCacheInvalidator(fn func(clusterID string)) {
 	s.invalidators = append(s.invalidators, fn)
 }
 
-// invalidateCache 通知所有已注册的缓存层失效指定集群。
-func (s *Service) invalidateCache(clusterID string) {
+func (s *Service) SetCacheInvalidationBus(bus coordination.EventBus) {
+	if s == nil {
+		return
+	}
+	s.cacheBus = bus
+}
+
+func (s *Service) StartCacheInvalidationWatcher(ctx context.Context) {
+	if s == nil || s.cacheBus == nil {
+		return
+	}
+	stop, err := s.cacheBus.Subscribe(ctx, CLUSTER_CACHE_INVALIDATION_TOPIC, func(clusterID string) {
+		s.invalidateLocalCache(clusterID)
+	})
+	if err != nil || stop == nil {
+		return
+	}
+	go func() {
+		<-ctx.Done()
+		_ = stop()
+	}()
+}
+
+// invalidateLocalCache 通知本进程已注册的缓存层失效指定集群。
+func (s *Service) invalidateLocalCache(clusterID string) {
 	for _, fn := range s.invalidators {
 		fn(clusterID)
 	}
+}
+
+// invalidateCache 先清本地缓存,再广播给其他副本。广播失败不影响主事务结果,
+// 远端副本仍会受缓存 TTL 保护,但正常路径可以立即收敛。
+func (s *Service) invalidateCache(ctx context.Context, clusterID string) {
+	clusterID = strings.TrimSpace(clusterID)
+	s.invalidateLocalCache(clusterID)
+	if s.cacheBus == nil || clusterID == "" {
+		return
+	}
+	_ = s.cacheBus.Publish(ctx, CLUSTER_CACHE_INVALIDATION_TOPIC, clusterID)
 }
 
 func (s *Service) List(ctx context.Context) ([]domain.ClusterWithStats, error) {
@@ -165,7 +203,7 @@ func (s *Service) Update(ctx context.Context, id string, req UpdateClusterReques
 		return domain.ClusterWithStats{}, mapRepositoryError(err, "cluster not found")
 	}
 	// kubeconfig 可能已变更,立即失效缓存的 client/transport,避免 TTL 窗口内沿用旧凭证。
-	s.invalidateCache(strings.TrimSpace(id))
+	s.invalidateCache(ctx, strings.TrimSpace(id))
 	return clusterWithSaveStats(updated, kubeconfig, stats, true), nil
 }
 
@@ -177,7 +215,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if err := s.repo.Delete(ctx, clusterID); err != nil {
 		return mapRepositoryError(err, "cluster not found")
 	}
-	s.invalidateCache(strings.TrimSpace(id))
+	s.invalidateCache(ctx, strings.TrimSpace(id))
 	return nil
 }
 

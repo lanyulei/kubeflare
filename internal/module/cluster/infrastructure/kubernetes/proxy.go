@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/lanyulei/kubeflare/internal/shared/coordination"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/middleware"
 	"github.com/lanyulei/kubeflare/internal/shared/response"
@@ -57,6 +58,10 @@ type SecurityOptions struct {
 	// MaxConcurrentSessionsPerUser caps simultaneous upgrade sessions for
 	// the same Principal subject. 0 disables the limit.
 	MaxConcurrentSessionsPerUser int
+	// SessionSemaphore makes upgrade session limiting effective across
+	// replicas. Nil falls back to the process-local limiter for single-instance
+	// development.
+	SessionSemaphore coordination.Semaphore
 }
 
 type ProxyHandler struct {
@@ -96,7 +101,7 @@ func NewProxyHandlerWithSecurity(provider KubeconfigProvider, timeout time.Durat
 		timeout:           timeout,
 		allowedOrigins:    make(map[string]struct{}),
 		blockedNamespaces: make(map[string]struct{}),
-		limiter:           newSessionLimiter(opts.MaxConcurrentSessionsPerUser),
+		limiter:           newSessionLimiter(opts.MaxConcurrentSessionsPerUser, opts.SessionSemaphore),
 		transportCache:    make(map[string]http.RoundTripper),
 	}
 	for _, raw := range opts.AllowedOrigins {
@@ -356,7 +361,15 @@ func (h *ProxyHandler) serveUpgrade(
 	// compromised) account cannot exhaust kube-apiserver connection
 	// quotas or our file descriptors.
 	principal, _ := middleware.PrincipalFromContext(r.Context())
-	release, ok := h.limiter.Acquire(principal.Subject)
+	release, ok, err := h.limiter.Acquire(r.Context(), principal.Subject)
+	if err != nil {
+		writeUpgradeError(w, requestID, http.StatusServiceUnavailable,
+			"terminal session limiter is unavailable", err)
+		logger.Warn("kapi upgrade limiter unavailable",
+			"request_id", requestID, "cluster_id", clusterID,
+			"subject", principal.Subject, "error", err)
+		return
+	}
 	if !ok {
 		writeUpgradeError(w, requestID, http.StatusTooManyRequests,
 			"too many concurrent terminal sessions",

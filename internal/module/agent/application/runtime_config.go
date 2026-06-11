@@ -11,6 +11,7 @@ import (
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
+	"github.com/lanyulei/kubeflare/internal/shared/safego"
 )
 
 const (
@@ -45,6 +46,7 @@ func (s *Service) ReloadTools(ctx context.Context, userID string, req ReloadTool
 	if err := s.validateRequest(req); err != nil {
 		return ReloadToolsResult{}, err
 	}
+	s.refreshRuntimeConfig(ctx, false)
 
 	before := s.currentRuntimeSnapshot()
 	target := before
@@ -77,6 +79,7 @@ func (s *Service) RollbackRuntimeConfigVersion(ctx context.Context, userID strin
 	if err := s.validateRequest(req); err != nil {
 		return ReloadToolsResult{}, err
 	}
+	s.refreshRuntimeConfig(ctx, false)
 	versionID = strings.TrimSpace(versionID)
 	if versionID == "" {
 		return ReloadToolsResult{}, &sharedErrors.AppError{
@@ -177,6 +180,9 @@ func (s *Service) applyAndPersistRuntimeConfig(ctx context.Context, opts runtime
 		s.applyRuntimeSnapshot(before)
 		return ReloadToolsResult{}, err
 	}
+	s.runtimeVersion.Store(int64(version.Version))
+	s.runtimeLastCheckNS.Store(time.Now().UTC().UnixNano())
+	s.publishRuntimeConfigChanged(ctx, version.ID)
 
 	result := s.reloadResult(opts.Reverted)
 	result.Changed = !diff.Empty()
@@ -200,6 +206,73 @@ func (s *Service) loadPersistedRuntimeConfig(ctx context.Context) {
 		return
 	}
 	s.applyRuntimeSnapshot(snapshot)
+	s.runtimeVersion.Store(int64(version.Version))
+	s.runtimeLastCheckNS.Store(time.Now().UTC().UnixNano())
+}
+
+func (s *Service) StartRuntimeConfigWatcher(ctx context.Context) {
+	if s == nil || s.eventBus == nil {
+		return
+	}
+	stop, err := s.eventBus.Subscribe(ctx, RUNTIME_CONFIG_CHANGE_TOPIC, func(string) {
+		s.refreshRuntimeConfig(context.Background(), true)
+	})
+	if err != nil {
+		s.logAgentWarn("subscribe runtime config change", err)
+		return
+	}
+	safego.Go(s.logger, "agent runtime config watcher cleanup", func() {
+		<-ctx.Done()
+		if err := stop(); err != nil {
+			s.logAgentWarn("stop runtime config watcher", err)
+		}
+	})
+}
+
+func (s *Service) refreshRuntimeConfig(ctx context.Context, force bool) {
+	if s == nil || s.runtimeConfigRepository() == nil {
+		return
+	}
+	nowNS := time.Now().UTC().UnixNano()
+	if !force && nowNS-s.runtimeLastCheckNS.Load() < int64(RUNTIME_CONFIG_REFRESH_INTERVAL) {
+		return
+	}
+
+	s.runtimeRefreshMu.Lock()
+	defer s.runtimeRefreshMu.Unlock()
+	nowNS = time.Now().UTC().UnixNano()
+	if !force && nowNS-s.runtimeLastCheckNS.Load() < int64(RUNTIME_CONFIG_REFRESH_INTERVAL) {
+		return
+	}
+
+	repo := s.runtimeConfigRepository()
+	version, err := repo.GetLatestRuntimeConfigVersion(ctx)
+	if err != nil {
+		s.runtimeLastCheckNS.Store(nowNS)
+		return
+	}
+	if int64(version.Version) <= s.runtimeVersion.Load() && !force {
+		s.runtimeLastCheckNS.Store(nowNS)
+		return
+	}
+	snapshot := normalizeRuntimeSnapshot(version.Snapshot)
+	if err := validateReloadSkills(snapshot.Skills); err != nil {
+		s.logAgentWarn("apply runtime config change", err, "version_id", version.ID)
+		s.runtimeLastCheckNS.Store(nowNS)
+		return
+	}
+	s.applyRuntimeSnapshot(snapshot)
+	s.runtimeVersion.Store(int64(version.Version))
+	s.runtimeLastCheckNS.Store(nowNS)
+}
+
+func (s *Service) publishRuntimeConfigChanged(ctx context.Context, versionID string) {
+	if s == nil || s.eventBus == nil {
+		return
+	}
+	if err := s.eventBus.Publish(ctx, RUNTIME_CONFIG_CHANGE_TOPIC, strings.TrimSpace(versionID)); err != nil {
+		s.logAgentWarn("publish runtime config change", err, "version_id", versionID)
+	}
 }
 
 func (s *Service) runtimeConfigRepository() domain.RuntimeConfigRepository {

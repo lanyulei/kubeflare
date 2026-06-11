@@ -8,6 +8,7 @@ import (
 type Repository interface {
 	CreateRun(ctx context.Context, run AgentRun) (AgentRun, error)
 	UpdateRun(ctx context.Context, run AgentRun) (AgentRun, error)
+	HeartbeatRun(ctx context.Context, runID string, owner string, heartbeatAt time.Time, leaseExpiresAt time.Time) error
 	GetRun(ctx context.Context, id string) (AgentRun, error)
 	CreateToolCall(ctx context.Context, call AgentToolCall) (AgentToolCall, error)
 	UpdateToolCall(ctx context.Context, call AgentToolCall) (AgentToolCall, error)

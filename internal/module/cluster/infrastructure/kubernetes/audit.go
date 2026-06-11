@@ -1,37 +1,88 @@
 package kubernetes
 
 import (
+	"context"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/lanyulei/kubeflare/internal/shared/coordination"
+	"github.com/lanyulei/kubeflare/internal/shared/idgen"
 	"github.com/lanyulei/kubeflare/internal/shared/limiter"
 )
 
+const sessionLeaseTTL = 90 * time.Second
+
 // sessionLimiter caps the number of simultaneous upgrade sessions a single
-// authenticated subject may hold open at once. It is a pure in-memory counter;
-// process restart resets it, which is acceptable because every open session
-// also dies when the process dies.
+// authenticated subject may hold open at once. When a distributed semaphore is
+// injected the cap is global across replicas; otherwise it falls back to a
+// process-local counter for single-instance development.
 //
 // It is a thin wrapper over shared/limiter's keyed semaphore, which deletes a
 // subject's counter once it returns to zero — important here because subjects
 // come from external (authenticated) input and would otherwise accumulate
 // unboundedly over the process lifetime.
 type sessionLimiter struct {
-	sem *limiter.KeyedSemaphore
+	sem         *limiter.KeyedSemaphore
+	distributed coordination.Semaphore
+	max         int
 }
 
-func newSessionLimiter(max int) *sessionLimiter {
-	return &sessionLimiter{sem: limiter.NewKeyedSemaphore(max)}
+func newSessionLimiter(max int, distributed coordination.Semaphore) *sessionLimiter {
+	return &sessionLimiter{
+		sem:         limiter.NewKeyedSemaphore(max),
+		distributed: distributed,
+		max:         max,
+	}
 }
 
 // Acquire reserves a session slot for the subject. If the cap is exceeded
 // the returned release func is nil and ok is false. Callers MUST defer
 // release() exactly once when ok is true.
-func (l *sessionLimiter) Acquire(subject string) (release func(), ok bool) {
+func (l *sessionLimiter) Acquire(ctx context.Context, subject string) (release func(), ok bool, err error) {
 	if l == nil {
-		return func() {}, true
+		return func() {}, true, nil
 	}
-	return l.sem.Acquire(subject)
+	if l.distributed != nil {
+		lease, ok, err := l.distributed.Acquire(ctx, idgen.NewID("kapi-session"), sessionLeaseTTL, coordination.SemaphoreLimit{
+			Key:   "kapi:upgrade:user:" + subject,
+			Limit: l.max,
+		})
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		leaseCtx, stopLease := context.WithCancel(context.WithoutCancel(ctx))
+		go refreshSessionLease(leaseCtx, lease)
+		return func() {
+			stopLease()
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer cancel()
+			_ = lease.Release(releaseCtx)
+		}, true, nil
+	}
+	release, ok = l.sem.Acquire(subject)
+	return release, ok, nil
+}
+
+func refreshSessionLease(ctx context.Context, lease coordination.Lease) {
+	if lease == nil {
+		return
+	}
+	ticker := time.NewTicker(sessionLeaseTTL / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			alive, err := lease.Refresh(refreshCtx)
+			cancel()
+			if err != nil || !alive {
+				return
+			}
+		}
+	}
 }
 
 // parseExecTarget extracts namespace / pod / container from an upstream

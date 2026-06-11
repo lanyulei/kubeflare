@@ -2,9 +2,8 @@ package application
 
 import "github.com/lanyulei/kubeflare/internal/shared/limiter"
 
-// runLimiter 限制并发执行中的 Agent run 数量,分两层:每用户上限与全局上限。
-// 它是纯内存计数器,进程重启即归零——这与 run 本身一致:进程退出时所有正在
-// 执行的 run 也随之终止,因此重启后无需保留计数。
+// runLimiter 是未注入分布式协调器时的单实例兜底限流器。生产多副本部署应通过
+// Service.Semaphore 使用 Redis/DB 等共享协调能力,否则上限会按副本数放大。
 //
 // 设计目标:防止单个用户(或脚本)同时发起大量 run,瞬间打爆 LLM provider
 // 配额与集群 apiserver。底层复用 shared/limiter 的信号量原语,per-user 维度在

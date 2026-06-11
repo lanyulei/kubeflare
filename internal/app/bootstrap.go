@@ -44,6 +44,7 @@ import (
 	uploadhttp "github.com/lanyulei/kubeflare/internal/module/upload/interface/http"
 	"github.com/lanyulei/kubeflare/internal/platform/cache"
 	"github.com/lanyulei/kubeflare/internal/platform/config"
+	platformcoord "github.com/lanyulei/kubeflare/internal/platform/coordination"
 	"github.com/lanyulei/kubeflare/internal/platform/db"
 	"github.com/lanyulei/kubeflare/internal/platform/httpx"
 	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
@@ -81,6 +82,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	coordinationClient := platformcoord.NewRedisCoordinator(redisClient, cfg.Service.Name)
 
 	encryptionKey := strings.TrimSpace(cfg.Secrets.EncryptionKey)
 	if encryptionKey == "" {
@@ -150,7 +152,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
+	clusterService.SetCacheInvalidationBus(coordinationClient)
 	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), logger)
+	aiService.SetEventBus(coordinationClient)
 	agentClientFactory := agentkubeclient.NewFactory(clusterService, 0)
 	// 集群 kubeconfig 更新/删除后失效缓存的 clientset,避免 TTL 窗口内沿用旧凭证。
 	clusterService.RegisterCacheInvalidator(agentClientFactory.Invalidate)
@@ -216,12 +220,15 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		ToolOverrides:      resolveAgentToolOverrides(cfg.Agent),
 		Skills:             resolveAgentSkills(cfg.Agent),
 		EmbeddingGenerator: agentEmbeddingGenerator,
+		Semaphore:          coordinationClient,
+		EventBus:           coordinationClient,
 		Logger:             logger,
 	})
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,
 		MaxConcurrentSessionsPerUser: cfg.KAPI.MaxConcurrentSessionsPerUser,
+		SessionSemaphore:             coordinationClient,
 	})
 
 	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService, agentService)
@@ -229,6 +236,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	authCleanupCtx, stopAuthCleanup := context.WithCancel(context.Background())
+	agentService.StartRuntimeConfigWatcher(authCleanupCtx)
+	clusterService.StartCacheInvalidationWatcher(authCleanupCtx)
 	safego.Go(logger, "auth state cleanup", func() { runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore) })
 	safego.Go(logger, "ai state recovery", func() { runAIStateRecovery(authCleanupCtx, logger, aiService, agentService) })
 

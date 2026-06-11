@@ -40,6 +40,9 @@ type AgentRun struct {
 	RouteSource  string     `json:"route_source,omitempty"`
 	Summary      string     `json:"summary"`
 	ErrorMessage string     `json:"error_message,omitempty"`
+	HeartbeatAt  *time.Time `json:"heartbeat_at,omitempty"`
+	LeaseOwner   string     `json:"lease_owner,omitempty"`
+	LeaseExpires *time.Time `json:"lease_expires,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 	DeletedAt    *time.Time `json:"deleted_at,omitempty"`

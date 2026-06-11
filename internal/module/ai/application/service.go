@@ -14,6 +14,7 @@ import (
 	"github.com/lanyulei/kubeflare/internal/module/ai/domain"
 	platformllm "github.com/lanyulei/kubeflare/internal/platform/llm"
 	"github.com/lanyulei/kubeflare/internal/shared/chanutil"
+	sharedcoord "github.com/lanyulei/kubeflare/internal/shared/coordination"
 	sharedErrors "github.com/lanyulei/kubeflare/internal/shared/errors"
 	"github.com/lanyulei/kubeflare/internal/shared/idgen"
 	"github.com/lanyulei/kubeflare/internal/shared/llmprompt"
@@ -44,6 +45,10 @@ const (
 
 	// MAX_TITLE_SOURCE_CHARS 限制送给 LLM 生成标题的用户首条消息长度。
 	MAX_TITLE_SOURCE_CHARS = 500
+
+	MESSAGE_CANCEL_SIGNAL_TTL    = 2 * time.Hour
+	MESSAGE_CANCEL_POLL_INTERVAL = 3 * time.Second
+	MESSAGE_CANCEL_TOPIC_PREFIX  = "ai.message.cancel"
 )
 
 // titleSystemPrompt 指示 LLM 为会话生成简短标题。
@@ -60,6 +65,7 @@ type Service struct {
 	// activeStreams 记录正在进行流式生成的 assistantMessageID -> 取消函数,
 	// 供 CancelMessage 主动中断后台生成,避免取消后仍空跑消耗 token。
 	activeStreams sync.Map
+	eventBus      sharedcoord.EventBus
 }
 
 type StreamMessageEvent struct {
@@ -71,6 +77,13 @@ type StreamMessageEvent struct {
 	MessageID        string              `json:"message_id,omitempty"`
 	Delta            string              `json:"delta,omitempty"`
 	ErrorMessage     string              `json:"error_message,omitempty"`
+}
+
+func (s *Service) SetEventBus(bus sharedcoord.EventBus) {
+	if s == nil {
+		return
+	}
+	s.eventBus = bus
 }
 
 func NewService(repo domain.Repository, validator *validation.Validate, generator AssistantGenerator, systemPrompt string, logger *slog.Logger) *Service {
@@ -395,6 +408,7 @@ func (s *Service) StreamMessage(ctx context.Context, userID string, sessionID st
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	s.activeStreams.Store(assistantMessage.ID, cancelStream)
+	s.watchMessageCancellation(streamCtx, normalizedUserID, assistantMessage.ID, cancelStream)
 	events := make(chan StreamMessageEvent, 16)
 	go func() {
 		defer safego.Recover(s.logger, "ai stream message")
@@ -608,6 +622,7 @@ func (s *Service) CancelMessage(ctx context.Context, userID string, messageID st
 			cancel()
 		}
 	}
+	s.requestMessageCancel(ctx, normalizedMessageID)
 
 	if message.Status == domain.MESSAGE_STATUS_COMPLETED || message.Status == domain.MESSAGE_STATUS_FAILED {
 		return message, nil
