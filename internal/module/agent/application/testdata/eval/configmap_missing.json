@@ -1,0 +1,23 @@
+{
+  "name": "configmap-missing",
+  "question": "Pod config-app 启动失败 CreateContainerConfigError",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "config-app"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod config-app 状态 CreateContainerConfigError;容器 app envFrom configMapRef app-config"
+    },
+    "cluster.configmap.get": {
+      "observation": "namespace default 中不存在名为 app-config 的 ConfigMap(仅有 kube-root-ca.crt)"
+    }
+  },
+  "steps": [
+    {"content": "看 Pod 状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"config-app\"}"}]},
+    {"content": "看引用的 ConfigMap", "tool_calls": [{"tool": "cluster.configmap.get", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\nPod config-app 引用了不存在的 ConfigMap app-config,容器配置无法创建(CreateContainerConfigError)而启动失败 [E1][E2]。\n### 证据\n- [E1] pod.get: CreateContainerConfigError,envFrom configMapRef app-config\n- [E2] configmap.get: 不存在名为 app-config 的 ConfigMap\n### 建议\n- 创建缺失的 ConfigMap app-config,或修正引用名称\n### 准确性提示\n基于当前命名空间快照,建议确认是否应在其他命名空间。",
+  "expected": {
+    "root_cause_keywords": ["ConfigMap", "不存在"],
+    "expected_tools": ["cluster.pod.get", "cluster.configmap.get"],
+    "must_not": ["OOM", "镜像拉取"]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "pvc-pending",
+  "question": "Pod data-0 起不来,挂载的 PVC 一直 Pending",
+  "scope": {"namespace": "default", "resource_kind": "PersistentVolumeClaim", "resource_name": "data-0"},
+  "tool_responses": {
+    "cluster.pvc.get": {
+      "observation": "PVC data-0 状态 Pending;StorageClass fast-ssd;请求 100Gi"
+    },
+    "cluster.event.list": {
+      "observation": "Warning ProvisioningFailed storageclass.storage.k8s.io \"fast-ssd\" not found"
+    }
+  },
+  "steps": [
+    {"content": "看 PVC 状态", "tool_calls": [{"tool": "cluster.pvc.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"data-0\"}"}]},
+    {"content": "看制备事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\nPVC data-0 因引用的 StorageClass fast-ssd 不存在,动态制备失败而持续 Pending,导致 Pod 无法挂载启动 [E1][E2]。\n### 证据\n- [E1] pvc.get: 状态 Pending,StorageClass fast-ssd\n- [E2] event.list: ProvisioningFailed storageclass \"fast-ssd\" not found\n### 建议\n- 创建对应 StorageClass 或改用集群已有的 StorageClass\n### 准确性提示\n基于事件信息,建议确认集群可用 StorageClass 列表。",
+  "expected": {
+    "root_cause_keywords": ["StorageClass", "制备"],
+    "expected_tools": ["cluster.pvc.get", "cluster.event.list"],
+    "must_not": ["OOM", "镜像拉取"]
+  }
+}

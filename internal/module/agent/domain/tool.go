@@ -37,6 +37,13 @@ const (
 const (
 	TOOL_SOURCE_CLUSTER    = "cluster"
 	TOOL_SOURCE_MONITORING = "monitoring"
+	// TOOL_SOURCE_MCP 是所有 MCP 工具执行器的统一数据源键。单个 MCP server 的工具
+	// 其 Source 形如 "mcp:<server>"(见 TOOL_SOURCE_MCP_PREFIX),分发器把该前缀
+	// 归一到本键对应的唯一 mcp 执行器,执行器内部再按 server 名分流到对应连接。
+	TOOL_SOURCE_MCP = "mcp"
+	// TOOL_SOURCE_MCP_PREFIX 是 MCP 工具 Source 的前缀。每个 server 的工具携带
+	// "mcp:<server>" 作为 Source,使其在注册表中可按 server 区分、在分发时统一归并。
+	TOOL_SOURCE_MCP_PREFIX = "mcp:"
 )
 
 // 工具来源(Origin)。标识工具定义从何而来,用于可观测与治理,与数据源

@@ -1,0 +1,27 @@
+{
+  "name": "pending-insufficient-resources",
+  "question": "Pod batch-job 一直 Pending 调度不上去",
+  "scope": {"namespace": "batch", "resource_kind": "Pod", "resource_name": "batch-job"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod batch-job 状态 Pending;未分配 node;requests cpu=8 memory=16Gi"
+    },
+    "cluster.event.list": {
+      "observation": "Warning FailedScheduling 0/5 nodes are available: 5 Insufficient cpu, 5 Insufficient memory"
+    },
+    "cluster.node.list": {
+      "observation": "5 个节点 allocatable 均为 cpu=4 memory=8Gi,无法容纳 cpu=8 的请求"
+    }
+  },
+  "steps": [
+    {"content": "看 Pod 状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"batch\",\"resource_name\":\"batch-job\"}"}]},
+    {"content": "看调度事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"batch\"}"}]},
+    {"content": "看节点容量", "tool_calls": [{"tool": "cluster.node.list", "arguments": "{}"}]}
+  ],
+  "conclusion": "### 结论\nPod batch-job 因请求资源(cpu=8)超过任何单节点 allocatable(cpu=4),调度器找不到可容纳节点而持续 Pending [E1][E2][E3]。\n### 证据\n- [E1] pod.get: requests cpu=8 memory=16Gi 未分配 node\n- [E2] event.list: FailedScheduling Insufficient cpu/memory\n- [E3] node.list: 节点 allocatable cpu=4\n### 建议\n- 下调 Pod 资源请求,或扩容更大规格节点\n### 准确性提示\n基于当前节点容量快照,建议结合实时资源占用确认。",
+  "expected": {
+    "root_cause_keywords": ["调度", "资源"],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list", "cluster.node.list"],
+    "must_not": ["镜像拉取", "OOM"]
+  }
+}

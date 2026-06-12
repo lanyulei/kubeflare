@@ -1,0 +1,23 @@
+{
+  "name": "crashloopbackoff-oom",
+  "question": "Pod payment-7d9 一直 CrashLoopBackOff,帮我看下为什么",
+  "scope": {"namespace": "prod", "resource_kind": "Pod", "resource_name": "payment-7d9"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod payment-7d9 状态 CrashLoopBackOff;容器 app 上次退出码 137 (OOMKilled);重启 14 次;memory limit 256Mi"
+    },
+    "cluster.pod.log.tail": {
+      "observation": "日志结尾: fatal error: runtime: out of memory; signal SIGKILL"
+    }
+  },
+  "steps": [
+    {"content": "先看 Pod 详情", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"prod\",\"resource_name\":\"payment-7d9\"}"}]},
+    {"content": "再看日志确认", "tool_calls": [{"tool": "cluster.pod.log.tail", "arguments": "{\"namespace\":\"prod\",\"resource_name\":\"payment-7d9\"}"}]}
+  ],
+  "conclusion": "### 结论\nPod payment-7d9 因容器内存超过 limit 被 OOMKilled(退出码 137),导致反复 CrashLoopBackOff [E1][E2]。\n### 证据\n- [E1] pod.get: 上次退出码 137 OOMKilled,memory limit 256Mi\n- [E2] log.tail: out of memory, SIGKILL\n### 建议\n- 适当上调内存 limit 或排查内存泄漏\n### 准确性提示\n根因基于退出码与日志,建议结合历史内存曲线确认。",
+  "expected": {
+    "root_cause_keywords": ["OOM", "内存"],
+    "expected_tools": ["cluster.pod.get", "cluster.pod.log.tail"],
+    "must_not": ["镜像拉取", "调度失败"]
+  }
+}

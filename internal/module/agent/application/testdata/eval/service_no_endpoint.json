@@ -1,0 +1,23 @@
+{
+  "name": "service-no-endpoint",
+  "question": "service api-svc 访问不通,curl 一直超时",
+  "scope": {"namespace": "default", "resource_kind": "Service", "resource_name": "api-svc"},
+  "tool_responses": {
+    "cluster.service.get": {
+      "observation": "Service api-svc type ClusterIP port 80->8080 selector app=api;Endpoints: 无就绪地址(0 ready)"
+    },
+    "cluster.pod.list": {
+      "observation": "namespace default 无 label app=api 的 Pod;现有 Pod label 为 app=api-server"
+    }
+  },
+  "steps": [
+    {"content": "看 Service 与 Endpoint", "tool_calls": [{"tool": "cluster.service.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"api-svc\"}"}]},
+    {"content": "看 selector 匹配的 Pod", "tool_calls": [{"tool": "cluster.pod.list", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\nService api-svc 的 selector(app=api)与实际 Pod label(app=api-server)不匹配,导致 Endpoints 为空、流量无后端可达 [E1][E2]。\n### 证据\n- [E1] service.get: Endpoints 0 ready,selector app=api\n- [E2] pod.list: 现有 Pod label 为 app=api-server\n### 建议\n- 修正 Service selector 或 Pod label 使其一致\n### 准确性提示\n基于 label 比对,建议确认是否有其他命名空间的目标 Pod。",
+  "expected": {
+    "root_cause_keywords": ["selector", "Endpoint"],
+    "expected_tools": ["cluster.service.get", "cluster.pod.list"],
+    "must_not": ["OOM", "镜像拉取"]
+  }
+}

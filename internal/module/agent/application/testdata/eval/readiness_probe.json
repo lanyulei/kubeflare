@@ -1,0 +1,27 @@
+{
+  "name": "readiness-probe-failure",
+  "question": "Pod web-api running 但一直 0/1 not ready,流量进不来",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "web-api"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod web-api 状态 Running 但 readiness 0/1;readinessProbe httpGet /healthz:8080"
+    },
+    "cluster.event.list": {
+      "observation": "Warning Unhealthy Readiness probe failed: HTTP probe failed with statuscode: 503"
+    },
+    "cluster.pod.log.tail": {
+      "observation": "日志: /healthz returned 503, dependency database not connected"
+    }
+  },
+  "steps": [
+    {"content": "看 Pod 就绪状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"web-api\"}"}]},
+    {"content": "看探针事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]},
+    {"content": "看日志定位 503 原因", "tool_calls": [{"tool": "cluster.pod.log.tail", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"web-api\"}"}]}
+  ],
+  "conclusion": "### 结论\nPod web-api 的 readiness 探针因 /healthz 返回 503(后端 database 未连接)持续失败,Pod 不就绪故不接收流量 [E1][E2][E3]。\n### 证据\n- [E1] pod.get: Running 但 readiness 0/1\n- [E2] event.list: Readiness probe failed 503\n- [E3] log.tail: /healthz 503 dependency database not connected\n### 建议\n- 排查 database 连接配置与可达性,恢复后探针自动转就绪\n### 准确性提示\n根因指向下游依赖,建议确认 database 服务状态。",
+  "expected": {
+    "root_cause_keywords": ["探针", "就绪"],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list", "cluster.pod.log.tail"],
+    "must_not": ["镜像拉取", "调度失败"]
+  }
+}

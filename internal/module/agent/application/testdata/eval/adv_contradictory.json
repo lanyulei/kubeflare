@@ -1,0 +1,24 @@
+{
+  "name": "adv-contradictory-evidence",
+  "question": "Pod mix-1 报错,是不是内存不够?",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "mix-1"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod mix-1 状态 Running;重启 0 次;memory 使用 30Mi / limit 512Mi(内存充裕)"
+    },
+    "cluster.pod.log.tail": {
+      "observation": "日志: ERROR connect to redis 10.0.0.5:6379 timeout; retrying..."
+    }
+  },
+  "steps": [
+    {"content": "先看内存与状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"mix-1\"}"}]},
+    {"content": "看日志找真实错误", "tool_calls": [{"tool": "cluster.pod.log.tail", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"mix-1\"}"}]}
+  ],
+  "conclusion": "### 结论\n证据不支持内存不足的猜测:内存使用仅 30Mi/512Mi 且 0 重启 [E1]。真实问题是应用无法连接 redis(10.0.0.5:6379 超时)[E2]。\n### 证据\n- [E1] pod.get: 内存 30Mi/512Mi,0 重启,内存充裕\n- [E2] log.tail: connect to redis timeout\n### 建议\n- 排查 redis 服务可达性与网络,而非调整内存\n### 准确性提示\n根因指向下游 redis 依赖,建议确认 redis 服务状态。",
+  "expected": {
+    "root_cause_keywords": ["redis"],
+    "expected_tools": ["cluster.pod.get", "cluster.pod.log.tail"],
+    "must_not": ["内存不足", "OOM", "内存不够"],
+    "must_include": []
+  }
+}

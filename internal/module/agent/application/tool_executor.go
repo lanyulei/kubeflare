@@ -48,11 +48,24 @@ func (d *toolDispatcher) Execute(ctx context.Context, req domain.ToolCallRequest
 	if source == "" {
 		return domain.ToolCallResult{}, fmt.Errorf("tool %s has no data source", req.ToolID)
 	}
-	executor, ok := d.executors[source]
+	executor, ok := d.executorForSource(source)
 	if !ok || executor == nil {
 		return domain.ToolCallResult{}, fmt.Errorf("data source %q is not available", source)
 	}
 	return executor.Execute(ctx, req)
+}
+
+// executorForSource 把工具的 Source 解析到承载它的执行器。除精确匹配外,所有
+// "mcp:<server>" 形式的 Source 都归并到唯一的 mcp 执行器(其 Source() 返回
+// TOOL_SOURCE_MCP),由该执行器内部按 server 名分流到对应连接——否则每个 server
+// 各异的 Source 会在精确查找下全部 miss。新增数据源仍只需注册一个执行器。
+func (d *toolDispatcher) executorForSource(source string) (ToolExecutor, bool) {
+	if strings.HasPrefix(source, domain.TOOL_SOURCE_MCP_PREFIX) {
+		executor, ok := d.executors[domain.TOOL_SOURCE_MCP]
+		return executor, ok
+	}
+	executor, ok := d.executors[source]
+	return executor, ok
 }
 
 func (d *toolDispatcher) sourceForTool(toolID string) string {

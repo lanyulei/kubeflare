@@ -21,6 +21,7 @@ import (
 	agentdomain "github.com/lanyulei/kubeflare/internal/module/agent/domain"
 	agentkubeclient "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubeclient"
 	agentkubernetes "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/kubernetes"
+	agentmcp "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/mcp"
 	agentpostgres "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/postgres"
 	agentprometheus "github.com/lanyulei/kubeflare/internal/module/agent/infrastructure/prometheus"
 	agenthttp "github.com/lanyulei/kubeflare/internal/module/agent/interface/http"
@@ -177,16 +178,27 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 可选 MCP 集成:配置 agent.mcp_servers 后装配外部工具能力。Manager 持有连接
+	// 生命周期,Executor 作为统一 mcp 数据源执行器注入分发器。构造失败(凭证解密)
+	// 视为致命配置错误,与其它 provider 装配一致。
+	mcpManager, mcpExecutor, err := newAgentMCPManager(cfg.Agent, encryptor, logger, metricsRegistry)
+	if err != nil {
+		return nil, err
+	}
+	agentToolExecutors := []agentapplication.SourceToolExecutor{
+		agentKubernetesExecutor,
+		agentPrometheusExecutor,
+	}
+	if mcpExecutor != nil {
+		agentToolExecutors = append(agentToolExecutors, mcpExecutor)
+	}
 	agentService := agentapplication.NewService(agentapplication.Options{
 		Repo:              agentRepo,
 		Validator:         validator,
 		ChatRepo:          aiRepo,
 		AssistantStreamer: aiService,
-		ToolExecutors: []agentapplication.SourceToolExecutor{
-			agentKubernetesExecutor,
-			agentPrometheusExecutor,
-		},
-		Generator: agentGenerator,
+		ToolExecutors:     agentToolExecutors,
+		Generator:         agentGenerator,
 		Loop: agentapplication.LoopConfig{
 			MaxSteps:                 cfg.Agent.MaxSteps,
 			MaxTokenBudget:           cfg.Agent.MaxTokenBudget,
@@ -240,6 +252,21 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	clusterService.StartCacheInvalidationWatcher(authCleanupCtx)
 	safego.Go(logger, "auth state cleanup", func() { runAuthStateCleanup(authCleanupCtx, logger, authStateRepo, captchaStore) })
 	safego.Go(logger, "ai state recovery", func() { runAIStateRecovery(authCleanupCtx, logger, aiService, agentService) })
+
+	// 启动 MCP 连接生命周期(异步,不阻塞启动)并注入工具来源。server 就绪后经
+	// onReady 触发工具注册表增量重载,把其工具补入对外视图。SetToolProviders 先
+	// 行一次聚合加载(此刻多数 server 尚未就绪,加载到的多为降级空集,就绪后由
+	// onReady 补入)。仅在配置了 MCP server 时装配,零配置时零行为变化。
+	//
+	// 刻意不把 MCP server 接入 /readyz:MCP 是增强能力而非核心依赖,外部 server 未
+	// 就绪绝不能让整个服务被判不可用而摘除流量。其连接状态经 kubeflare_mcp_server_state
+	// 指标可观测,运维据此告警,而不阻断主服务就绪。
+	if mcpManager != nil {
+		mcpManager.Start(authCleanupCtx, func(string) {
+			agentService.ReloadToolProviders(authCleanupCtx)
+		})
+		agentService.SetToolProviders(authCleanupCtx, agentmcp.NewProvider(mcpManager))
+	}
 
 	healthManager := health.NewManager(
 		cfg.HTTP.ReadinessTimeout,
@@ -299,6 +326,10 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 				stopAuthCleanup()
 				return nil
 			},
+			// MCP 优雅关闭:停止 supervise goroutine 并回收全部 stdio 子进程 / HTTP
+			// 连接,杜绝僵尸进程。排在 stopAuthCleanup 之后——后者已取消 supervise 的
+			// 维护 ctx,Close 再做连接回收兜底。mcpManager 为 nil(未配置)时安全空操作。
+			func(ctx context.Context) error { return mcpManager.Close(ctx) },
 			traceShutdown,
 			func(context.Context) error { return cache.Close(redisClient) },
 			func(context.Context) error { return db.Close(gormDB) },
@@ -340,6 +371,7 @@ func newAIGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (aiapplica
 			StreamTimeout:      providerConfig.StreamTimeout,
 			Stream:             providerConfig.Stream,
 			Temperature:        providerConfig.Temperature,
+			Seed:               providerConfig.Seed,
 			MaxTokens:          providerConfig.MaxTokens,
 			MaxRetries:         providerConfig.MaxRetries,
 			RetryBackoff:       providerConfig.RetryBackoff,
@@ -351,7 +383,9 @@ func newAIGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (aiapplica
 	if err != nil {
 		return nil, err
 	}
-	return aillm.NewAssistantGenerator(registry), nil
+	// 配置了 fallback_providers 时装配 fallback 链(主+备),消除 LLM 单点;
+	// 空列表时退化为纯默认 client,行为与改造前逐字节一致(零回归)。
+	return aillm.NewAssistantGeneratorWithFallback(registry, cfg.FallbackProviders)
 }
 
 // newAIEmbeddingGenerator 构造可选的 embedding 生成器:未配置 ai.embedding 时
@@ -381,6 +415,82 @@ func newAIEmbeddingGenerator(cfg config.AIConfig, encryptor secrets.Encryptor) (
 		return nil, err
 	}
 	return aillm.NewEmbeddingGenerator(client), nil
+}
+
+// newAgentMCPManager 按 agent.mcp_servers 配置构造 MCP 连接管理器与统一执行器。
+// 未配置任何 server 时返回 (nil, nil, nil),调用方据此跳过 MCP 装配(零行为变化)。
+// 子进程 env 与 http headers 中的凭证走与其它 provider 同一套 enc:v1: 解密体系
+// (明文原样透传);解密失败视为致命配置错误。
+func newAgentMCPManager(
+	cfg config.AgentConfig,
+	encryptor secrets.Encryptor,
+	logger *slog.Logger,
+	metricsRegistry *metrics.Registry,
+) (*agentmcp.Manager, agentapplication.SourceToolExecutor, error) {
+	if len(cfg.McpServers) == 0 {
+		return nil, nil, nil
+	}
+
+	servers := make([]agentmcp.ServerConfig, 0, len(cfg.McpServers))
+	for _, raw := range cfg.McpServers {
+		env, err := decryptStringMap(encryptor, raw.Env)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decrypt env for mcp server %q: %w", raw.Name, err)
+		}
+		headers, err := decryptStringMap(encryptor, raw.Headers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decrypt headers for mcp server %q: %w", raw.Name, err)
+		}
+		trusted := make(map[string]struct{}, len(raw.Trust.AllowTools))
+		for _, tool := range raw.Trust.AllowTools {
+			if name := strings.TrimSpace(tool); name != "" {
+				trusted[name] = struct{}{}
+			}
+		}
+		servers = append(servers, agentmcp.ServerConfig{
+			Name:           raw.Name,
+			Transport:      raw.Transport,
+			Command:        raw.Command,
+			Env:            env,
+			URL:            raw.URL,
+			Headers:        headers,
+			AgentTypes:     raw.AgentTypes,
+			TrustedTools:   trusted,
+			ConnectTimeout: raw.ConnectTimeout,
+			ListTimeout:    raw.ListTimeout,
+			CallTimeout:    raw.CallTimeout,
+			HealthInterval: raw.HealthInterval,
+			MaxConcurrency: raw.MaxConcurrency,
+		})
+	}
+
+	manager := agentmcp.NewManager(agentmcp.ManagerOptions{
+		Servers: servers,
+		Logger:  logger,
+		Metrics: agentmcp.NewMetrics(metricsRegistry),
+	})
+	if !manager.HasServers() {
+		// 所有 server 配置均无效(已各自记日志):不装配 MCP,主服务正常启动。
+		return nil, nil, nil
+	}
+	return manager, agentmcp.NewExecutor(manager), nil
+}
+
+// decryptStringMap 对 map 的每个值执行 Decrypt(明文原样透传),用于 MCP 子进程 env
+// 与 http headers 中的凭证解密。返回新 map,不修改入参;空入参返回 nil。
+func decryptStringMap(encryptor secrets.Encryptor, in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		decrypted, err := encryptor.Decrypt(strings.TrimSpace(value))
+		if err != nil {
+			return nil, err
+		}
+		out[key] = decrypted
+	}
+	return out, nil
 }
 
 // resolveAgentPrompts 解析各 Agent 的 system prompt 覆盖来源:内联 Prompts

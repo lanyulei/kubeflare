@@ -387,6 +387,10 @@ type Service struct {
 	runtimeVersion     atomic.Int64
 	runtimeLastCheckNS atomic.Int64
 	runtimeRefreshMu   sync.Mutex
+	// toolProviders 持有工具来源(内置静态 + 可选外部 MCP),reloadMu 串行化来源
+	// 聚合重载(MCP server 就绪 / 断开触发),避免并发全量重载。详见 tool_providers.go。
+	toolProviders toolProviderSet
+	reloadMu      sync.Mutex
 }
 
 func NewService(options Options) *Service {

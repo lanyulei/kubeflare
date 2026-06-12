@@ -152,6 +152,20 @@ func validateAIConfig(cfg AIConfig) error {
 		}
 	}
 
+	// fallback_providers 必须全部引用已配置的 provider,且不应是默认 provider 自身。
+	for _, name := range cfg.FallbackProviders {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			return errors.New("ai.fallback_providers must not contain empty entries")
+		}
+		if _, ok := cfg.Providers[trimmed]; !ok {
+			return errors.New("ai.fallback_providers." + trimmed + " must reference an entry in ai.providers")
+		}
+		if trimmed == defaultProvider {
+			return errors.New("ai.fallback_providers must not include the default provider")
+		}
+	}
+
 	return nil
 }
 
@@ -217,6 +231,56 @@ func validateAgentConfig(cfg AgentConfig) error {
 		// 触发词与系统提示同时为空的技能既不会被触发、也无提示效果,视为配置错误。
 		if len(skill.Triggers) == 0 && strings.TrimSpace(skill.SystemPrompt) == "" {
 			return fmt.Errorf("agent.skills[%d] (%s) must declare triggers or system_prompt", index, id)
+		}
+	}
+	if err := validateAgentMCPServers(cfg.McpServers); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateAgentMCPServers 校验 MCP server 声明:名称唯一、transport 合法、按 transport
+// 校验必填项(stdio 需 command,http 需合法 url),超时 / 并发不为负。
+func validateAgentMCPServers(servers []AgentMCPServerConfig) error {
+	seen := make(map[string]struct{}, len(servers))
+	for index, server := range servers {
+		name := strings.TrimSpace(server.Name)
+		if name == "" {
+			return fmt.Errorf("agent.mcp_servers[%d].name must not be empty", index)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("agent.mcp_servers[%d].name %q is duplicated", index, name)
+		}
+		seen[name] = struct{}{}
+		// 名称用作工具 ID 段(mcp.<name>.<tool>),禁止点号避免破坏 ID 解析。
+		if strings.ContainsRune(name, '.') {
+			return fmt.Errorf("agent.mcp_servers[%d].name %q must not contain '.'", index, name)
+		}
+		switch strings.TrimSpace(server.Transport) {
+		case "stdio":
+			if len(server.Command) == 0 || strings.TrimSpace(server.Command[0]) == "" {
+				return fmt.Errorf("agent.mcp_servers[%d] (%s): command is required for stdio transport", index, name)
+			}
+		case "http":
+			endpoint := strings.TrimSpace(server.URL)
+			if endpoint == "" {
+				return fmt.Errorf("agent.mcp_servers[%d] (%s): url is required for http transport", index, name)
+			}
+			if parsed, perr := url.Parse(endpoint); perr != nil {
+				return fmt.Errorf("agent.mcp_servers[%d] (%s): url is not a valid URL", index, name)
+			} else if parsed.Scheme != "http" && parsed.Scheme != "https" {
+				return fmt.Errorf("agent.mcp_servers[%d] (%s): url scheme must be http or https", index, name)
+			} else if parsed.Host == "" {
+				return fmt.Errorf("agent.mcp_servers[%d] (%s): url must include a host", index, name)
+			}
+		default:
+			return fmt.Errorf("agent.mcp_servers[%d] (%s): transport must be one of stdio, http", index, name)
+		}
+		if server.ConnectTimeout < 0 || server.ListTimeout < 0 || server.CallTimeout < 0 || server.HealthInterval < 0 {
+			return fmt.Errorf("agent.mcp_servers[%d] (%s): timeouts must not be negative", index, name)
+		}
+		if server.MaxConcurrency < 0 {
+			return fmt.Errorf("agent.mcp_servers[%d] (%s): max_concurrency must not be negative", index, name)
 		}
 	}
 	return nil

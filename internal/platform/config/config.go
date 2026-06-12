@@ -65,6 +65,10 @@ type AIConfig struct {
 	// Kubeflare 智能助手默认自我认知提示词。
 	SystemPrompt string                      `koanf:"system_prompt"`
 	Providers    map[string]AIProviderConfig `koanf:"providers"`
+	// FallbackProviders 是按序的备用 provider 名(均须在 Providers 中存在)。配置后,
+	// 当主 provider 遇到可重试错误(限流/超时/5xx)时自动降级到下一个,消除 LLM 单点。
+	// 空列表表示不启用 fallback,行为与改造前完全一致(零回归)。
+	FallbackProviders []string `koanf:"fallback_providers"`
 	// Embedding 是可选的文本向量化 provider(独立于 chat providers),配置后启用
 	// 语义检索;留空(nil)时语义检索自动降级关键词匹配。
 	Embedding *AIEmbeddingConfig `koanf:"embedding"`
@@ -95,7 +99,10 @@ type AIProviderConfig struct {
 	StreamTimeout time.Duration `koanf:"stream_timeout"`
 	Stream        bool          `koanf:"stream"`
 	Temperature   *float64      `koanf:"temperature"`
-	MaxTokens     int           `koanf:"max_tokens"`
+	// Seed 为可选采样种子:配置后让支持的 provider 在相同输入下尽量返回确定性结果
+	// (诊断推理路径可复现)。nil 表示不下发。建议给诊断用 provider 同时配低温 + seed。
+	Seed      *int `koanf:"seed"`
+	MaxTokens int  `koanf:"max_tokens"`
 	// MaxRetries 是对可重试错误(网络错误/429/5xx)的最大重试次数,0 表示不重试。
 	MaxRetries int `koanf:"max_retries"`
 	// RetryBackoff 是首次重试的退避基数,后续按指数增长。
@@ -190,8 +197,50 @@ type AgentConfig struct {
 	// Skills 是关键字触发的被动技能(命中后收窄工具集 + 追加系统提示),不引入
 	// 额外 LLM 调用。
 	Skills []AgentSkillConfig `koanf:"skills"`
+	// McpServers 声明外部 MCP(Model Context Protocol)server,把 Agent 的工具能力
+	// 从内置 cluster/monitoring 扩展到外部系统。每个 server 的工具默认不可信
+	// (不暴露给模型),仅 trust.allow_tools 显式列入的工具才以只读放行。
+	McpServers []AgentMCPServerConfig `koanf:"mcp_servers"`
 	// Prometheus 配置 Agent 如何经 K8s API Server 代理访问集群内 Prometheus。
 	Prometheus AgentPrometheusConfig `koanf:"prometheus"`
+}
+
+// AgentMCPServerConfig 声明一个外部 MCP server 及其信任策略。
+type AgentMCPServerConfig struct {
+	// Name 是 server 名,用作工具 ID 前缀(mcp.<name>.<tool>)与各维度标识,必填且唯一。
+	Name string `koanf:"name"`
+	// Transport 为 stdio(本地子进程)或 http(Streamable HTTP 远端)。
+	Transport string `koanf:"transport"`
+	// Command 是 stdio server 的启动命令(command[0] 为程序路径)。
+	Command []string `koanf:"command"`
+	// Env 是注入 stdio 子进程的环境变量(凭证用 ${secret:xxx} 占位,装配时解密)。
+	// 子进程不继承宿主环境,仅注入此处声明的白名单变量。
+	Env map[string]string `koanf:"env"`
+	// URL 是 http server 的端点。
+	URL string `koanf:"url"`
+	// Headers 是 http 请求头(鉴权 token 用 ${secret:xxx} 占位,装配时解密)。
+	Headers map[string]string `koanf:"headers"`
+	// AgentTypes 指定这些工具归属哪些 Agent;为空时默认归属 diagnostic。
+	AgentTypes []string `koanf:"agent_types"`
+	// ConnectTimeout / ListTimeout / CallTimeout 是三层超时;<=0 各自回退默认
+	// (10s/15s/30s)。
+	ConnectTimeout time.Duration `koanf:"connect_timeout"`
+	ListTimeout    time.Duration `koanf:"list_timeout"`
+	CallTimeout    time.Duration `koanf:"call_timeout"`
+	// HealthInterval 是就绪后周期健康检查间隔;<=0 回退默认(30s)。
+	HealthInterval time.Duration `koanf:"health_interval"`
+	// MaxConcurrency 是该 server 的并发调用上限;<=0 回退默认(4)。
+	MaxConcurrency int `koanf:"max_concurrency"`
+	// Trust 声明该 server 的信任策略(哪些工具可作为只读工具放行)。
+	Trust AgentMCPTrustConfig `koanf:"trust"`
+}
+
+// AgentMCPTrustConfig 声明 MCP server 的信任策略。安全默认拒绝:未列入 AllowTools
+// 的工具一律不暴露给模型。
+type AgentMCPTrustConfig struct {
+	// AllowTools 是显式放行为只读的工具名(server 内的原始工具名,不含前缀)。
+	// 仅这些工具会被翻译为 ReadOnly=true 暴露给 Agent;其余保持不可信(不暴露)。
+	AllowTools []string `koanf:"allow_tools"`
 }
 
 // AgentSkillConfig 声明一个被动技能。

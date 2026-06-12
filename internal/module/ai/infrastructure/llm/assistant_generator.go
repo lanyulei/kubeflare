@@ -10,7 +10,9 @@ import (
 
 type AssistantGenerator struct {
 	registry *platformllm.Registry
-	// client 为可选的直接客户端覆盖,仅用于测试注入;为 nil 时从 registry 取。
+	// clientOverride 为可选的直接客户端覆盖:设置后 client() 直接返回它而不查
+	// registry。用于(a)测试注入桩客户端,(b)注入预解析的 fallback 链(主+备
+	// provider 组装成的单个 Client)。为 nil 时从 registry 取默认 client。
 	clientOverride platformllm.Client
 }
 
@@ -20,6 +22,17 @@ type clientInfoProvider interface {
 
 func NewAssistantGenerator(registry *platformllm.Registry) *AssistantGenerator {
 	return &AssistantGenerator{registry: registry}
+}
+
+// NewAssistantGeneratorWithFallback 构造一个使用 fallback 链的 generator:把主
+// provider 与按序的备用 provider 解析为单个 fallback Client 并注入。fallbacks 为空
+// 时退化为纯默认 client(零回归)。所有 provider 名都必须已在 registry 中配置。
+func NewAssistantGeneratorWithFallback(registry *platformllm.Registry, fallbacks []string) (*AssistantGenerator, error) {
+	client, err := registry.FallbackClient(fallbacks)
+	if err != nil {
+		return nil, err
+	}
+	return &AssistantGenerator{registry: registry, clientOverride: client}, nil
 }
 
 // newAssistantGeneratorWithClient 构造一个直接使用给定 client 的 generator,

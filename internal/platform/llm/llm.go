@@ -47,7 +47,10 @@ type ProviderConfig struct {
 	StreamTimeout time.Duration
 	Stream        bool
 	Temperature   *float64
-	MaxTokens     int
+	// Seed 为可选的采样种子:非 nil 时下发 seed,让支持的 provider 在相同输入下
+	// 尽量返回确定性结果(诊断推理路径可复现)。nil 表示不下发(交 provider 默认)。
+	Seed      *int
+	MaxTokens int
 	// MaxRetries 是对可重试错误的最大重试次数(0 表示不重试)。
 	MaxRetries int
 	// RetryBackoff 是首次重试的退避基数,nil/<=0 时用默认值。
@@ -164,6 +167,7 @@ type openAIChatRequest struct {
 	Stream        bool              `json:"stream,omitempty"`
 	StreamOptions *openAIStreamOpts `json:"stream_options,omitempty"`
 	Temperature   *float64          `json:"temperature,omitempty"`
+	Seed          *int              `json:"seed,omitempty"`
 	MaxTokens     *int              `json:"max_tokens,omitempty"`
 	Tools         []openAITool      `json:"tools,omitempty"`
 	ToolChoice    string            `json:"tool_choice,omitempty"`
@@ -520,6 +524,11 @@ func (c *openAICompatibleClient) newRequestBody(request ChatRequest, stream bool
 	if c.config.Temperature != nil {
 		temperature := *c.config.Temperature
 		chatRequest.Temperature = &temperature
+	}
+	// Seed 同 Temperature:仅在显式配置时下发,让支持的 provider 输出可复现。
+	if c.config.Seed != nil {
+		seed := *c.config.Seed
+		chatRequest.Seed = &seed
 	}
 	if c.config.MaxTokens > 0 {
 		maxTokens := c.config.MaxTokens

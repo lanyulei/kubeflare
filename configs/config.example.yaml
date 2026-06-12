@@ -79,10 +79,30 @@ ai:
       stream_timeout: 5m
       stream: true
       temperature: 0.7
+      # 诊断推理建议追求可复现:把该 provider 用于 Agent 时,推荐 temperature 调低
+      # (如 0.2)并配置 seed,让相同输入尽量走相同取证路径、得相同结论。对话型
+      # provider 可不设 seed(留空即不下发,交由 provider 默认,行为与今日一致)。
+      # seed: 42
       max_tokens: 4096
       max_retries: 2               # 对网络错误/429/5xx 的最大重试次数,0 表示不重试
       retry_backoff: 500ms         # 首次重试退避基数,后续指数增长
       # include_stream_usage: true # 流式是否请求 token 用量统计(默认开,个别 provider 可关)
+    # 可选:再配置一个备用 provider(下方 fallback_providers 引用),作 LLM 容灾。
+    # openai:
+    #   type: openai_compatible
+    #   base_url: https://api.openai.com/v1
+    #   chat_path: /chat/completions
+    #   api_key: ${KUBEFLARE_AI__PROVIDERS__OPENAI__API_KEY}
+    #   model: gpt-4o-mini
+    #   timeout: 30s
+    #   stream: true
+    #   temperature: 0.2
+    #   seed: 42
+  # 可选:LLM 容灾。当主 provider(default_provider)遇到可重试错误(限流/超时/5xx)
+  # 时,按此处顺序自动降级到备用 provider,消除单一模型服务的单点故障。所引用的名字
+  # 必须在上方 providers 中存在,且不能是 default_provider 自身。留空表示不启用(零回归)。
+  # fallback_providers:
+  #   - openai
   # 可选:文本向量化(embedding)provider,配置后启用 Agent 的语义检索(案例库/
   # 路由样例按语义相似度召回,而非关键词字面匹配)。留空(不配置 embedding)时
   # 语义检索自动降级关键词匹配,行为与今日一致(零回归)。走独立端点与模型,可
@@ -165,6 +185,32 @@ agent:
   #       - "先查 Ingress 规则与后端 Service 绑定"
   #       - "再查 Service 的 Endpoint 是否就绪"
   #       - "最后查后端 Pod 状态与事件"
+  # 可选:外部 MCP(Model Context Protocol)server,把 Agent 工具能力扩展到集群之外
+  # (GitHub / Grafana / CMDB 等)。安全默认拒绝:每个 server 的工具默认不可信、不
+  # 暴露给模型,仅 trust.allow_tools 显式列入的工具才以只读放行。任一 server 连接慢 /
+  # 失败都不阻塞主服务启动,也不影响内置工具(per-server 熔断 + 降级隔离)。
+  # mcp_servers:
+  #   - name: github                  # 工具 ID 前缀 mcp.github.*;名称需唯一且不含 '.'
+  #     transport: stdio              # stdio(本地子进程) | http(Streamable HTTP 远端)
+  #     command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+  #     env:                          # 子进程默认仅含宿主 PATH/HOME/LANG 等运行时必需项;
+  #       GITHUB_TOKEN: "enc:v1:..."  # 此处声明的变量额外注入并可覆盖同名项。凭证支持
+  #                                   # enc:v1: 密文(与 api_key 同套体系)或明文。
+  #     agent_types: [diagnostic]     # 这些工具归属哪些 Agent(留空默认 diagnostic)
+  #     connect_timeout: 10s          # 连接 / 子进程启动超时
+  #     list_timeout: 15s             # tools/list 工具发现超时
+  #     call_timeout: 30s             # 单次 tools/call 超时
+  #     health_interval: 30s          # 就绪后周期健康检查间隔
+  #     max_concurrency: 4            # 该 server 的并发调用上限
+  #     trust:
+  #       allow_tools: ["search_issues", "get_issue"]  # 仅这些工具放行为只读(其余不暴露)
+  #   - name: grafana
+  #     transport: http
+  #     url: "http://grafana-mcp.monitoring:8080/mcp"
+  #     headers:
+  #       Authorization: "enc:v1:..."
+  #     trust:
+  #       allow_tools: ["query_dashboard"]
 
 database:
   enabled: true

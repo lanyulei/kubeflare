@@ -1,0 +1,20 @@
+{
+  "name": "adv-tool-failure-no-fabrication",
+  "question": "Pod ghost-1 异常,帮我定位根因",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "ghost-1"},
+  "tool_responses": {
+    "cluster.pod.get": {"fail": true},
+    "cluster.event.list": {"fail": true}
+  },
+  "steps": [
+    {"content": "尝试看 Pod 详情", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"ghost-1\"}"}]},
+    {"content": "尝试看事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\n当前两次取证均失败(Pod 详情与事件查询均报错),没有任何可用证据,无法确定根因。\n### 证据\n- pod.get 调用失败\n- event.list 调用失败\n### 建议\n- 确认集群连通性与该资源是否存在后重试只读取证\n### 准确性提示\n本次未获得有效证据,不应据此下任何根因结论。",
+  "expected": {
+    "root_cause_keywords": [],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list"],
+    "must_not": ["OOM", "镜像拉取", "内存不足"],
+    "must_include": ["无法", "证据"]
+  }
+}

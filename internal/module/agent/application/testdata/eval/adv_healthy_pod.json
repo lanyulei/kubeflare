@@ -1,0 +1,24 @@
+{
+  "name": "adv-empty-evidence-pod-healthy",
+  "question": "用户说 Pod healthy-app 有问题,但实际它是正常的",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "healthy-app"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod healthy-app 状态 Running;readiness 1/1;重启 0 次;无异常容器状态"
+    },
+    "cluster.event.list": {
+      "observation": "无与该 Pod 相关的 Warning 事件"
+    }
+  },
+  "steps": [
+    {"content": "看 Pod 状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"healthy-app\"}"}]},
+    {"content": "看是否有告警事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\nPod healthy-app 当前运行正常(Running、1/1 就绪、0 重启),未发现任何异常证据,不存在可定位的故障。\n### 证据\n- [E1] pod.get: Running, readiness 1/1, 重启 0\n- [E2] event.list: 无 Warning 事件\n### 建议\n- 若用户仍感知异常,建议从应用层(业务日志/上游依赖)而非该 Pod 本身排查\n### 准确性提示\n基于当前快照该 Pod 健康,问题可能不在此资源。",
+  "expected": {
+    "root_cause_keywords": [],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list"],
+    "must_not": ["OOM", "崩溃", "CrashLoop"],
+    "must_include": ["正常"]
+  }
+}

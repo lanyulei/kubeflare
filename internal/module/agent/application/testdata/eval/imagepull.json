@@ -1,0 +1,23 @@
+{
+  "name": "imagepullbackoff",
+  "question": "新发布的 web Deployment 起不来,Pod 一直 ImagePullBackOff",
+  "scope": {"namespace": "default", "resource_kind": "Pod"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod web-5c8 状态 ImagePullBackOff;容器 web 镜像 registry.local/web:v2.3;waiting reason ErrImagePull"
+    },
+    "cluster.event.list": {
+      "observation": "Warning Failed pull image registry.local/web:v2.3: manifest unknown: tag not found"
+    }
+  },
+  "steps": [
+    {"content": "看 Pod 状态", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"web-5c8\"}"}]},
+    {"content": "看相关事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]}
+  ],
+  "conclusion": "### 结论\nPod web-5c8 因镜像 registry.local/web:v2.3 的 tag 不存在导致镜像拉取失败(ImagePullBackOff)[E1][E2]。\n### 证据\n- [E1] pod.get: waiting reason ErrImagePull\n- [E2] event.list: manifest unknown: tag not found\n### 建议\n- 核对镜像 tag 是否已正确推送到 registry\n### 准确性提示\n基于事件信息,建议确认 registry 上的实际 tag 列表。",
+  "expected": {
+    "root_cause_keywords": ["镜像", "拉取"],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list"],
+    "must_not": ["OOM", "内存不足"]
+  }
+}

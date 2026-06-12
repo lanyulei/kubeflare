@@ -1,0 +1,28 @@
+{
+  "name": "adv-premature-convergence-trap",
+  "question": "Pod slow-1 频繁重启,是不是 OOM?",
+  "scope": {"namespace": "default", "resource_kind": "Pod", "resource_name": "slow-1"},
+  "tool_responses": {
+    "cluster.pod.get": {
+      "observation": "Pod slow-1 重启 8 次;上次退出码 1(非 137);memory 使用 80Mi / limit 1Gi"
+    },
+    "cluster.event.list": {
+      "observation": "Warning Unhealthy Liveness probe failed: HTTP 500;Killing container failed liveness"
+    },
+    "cluster.pod.log.tail": {
+      "observation": "日志: panic: nil pointer dereference at handler.go:42"
+    }
+  },
+  "steps": [
+    {"content": "看重启与退出码", "tool_calls": [{"tool": "cluster.pod.get", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"slow-1\"}"}]},
+    {"content": "退出码不是137,继续看事件", "tool_calls": [{"tool": "cluster.event.list", "arguments": "{\"namespace\":\"default\"}"}]},
+    {"content": "看日志确认崩溃原因", "tool_calls": [{"tool": "cluster.pod.log.tail", "arguments": "{\"namespace\":\"default\",\"resource_name\":\"slow-1\"}"}]}
+  ],
+  "conclusion": "### 结论\n并非 OOM:退出码为 1 而非 137,内存 80Mi/1Gi 充裕 [E1]。真实根因是应用代码 panic(nil pointer at handler.go:42)导致 liveness 探针失败、容器被反复重启 [E2][E3]。\n### 证据\n- [E1] pod.get: 退出码 1(非 137),内存充裕\n- [E2] event.list: Liveness probe failed HTTP 500\n- [E3] log.tail: panic nil pointer dereference handler.go:42\n### 建议\n- 修复 handler.go:42 的空指针,而非上调内存\n### 准确性提示\n根因为应用层 panic,建议结合完整堆栈确认。",
+  "expected": {
+    "root_cause_keywords": ["panic"],
+    "expected_tools": ["cluster.pod.get", "cluster.event.list", "cluster.pod.log.tail"],
+    "must_not": ["OOM", "内存不足"],
+    "must_include": []
+  }
+}
