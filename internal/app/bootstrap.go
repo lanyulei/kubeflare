@@ -236,6 +236,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		EventBus:           coordinationClient,
 		Logger:             logger,
 	})
+	aiService.SetMessageMetadataEnricher(agentService.EnrichChatMessageFeedback)
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
 		AllowedOrigins:               cfg.HTTP.AllowedOrigins,
 		BlockedNamespaces:            cfg.KAPI.BlockedNamespaces,

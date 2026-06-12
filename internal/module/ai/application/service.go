@@ -66,7 +66,12 @@ type Service struct {
 	// 供 CancelMessage 主动中断后台生成,避免取消后仍空跑消耗 token。
 	activeStreams sync.Map
 	eventBus      sharedcoord.EventBus
+	// messageMetadataEnricher 可由上层装配注入,用于把跨模块的消息 metadata
+	// 补齐到读模型中。AI 模块不直接依赖具体业务模块,保持会话能力通用。
+	messageMetadataEnricher MessageMetadataEnricher
 }
+
+type MessageMetadataEnricher func(ctx context.Context, userID string, messages []domain.ChatMessage) ([]domain.ChatMessage, error)
 
 type StreamMessageEvent struct {
 	Event            string              `json:"-"`
@@ -84,6 +89,13 @@ func (s *Service) SetEventBus(bus sharedcoord.EventBus) {
 		return
 	}
 	s.eventBus = bus
+}
+
+func (s *Service) SetMessageMetadataEnricher(enricher MessageMetadataEnricher) {
+	if s == nil {
+		return
+	}
+	s.messageMetadataEnricher = enricher
 }
 
 func NewService(repo domain.Repository, validator *validation.Validate, generator AssistantGenerator, systemPrompt string, logger *slog.Logger) *Service {
@@ -144,6 +156,7 @@ func (s *Service) GetSession(ctx context.Context, userID string, sessionID strin
 	if err != nil {
 		return domain.ChatSessionDetail{}, mapRepositoryError(err, "chat session not found")
 	}
+	messages = s.enrichMessageMetadata(ctx, normalizedUserID, messages)
 
 	return domain.ChatSessionDetail{
 		ChatSession: session,
@@ -251,7 +264,19 @@ func (s *Service) ListMessages(ctx context.Context, userID string, sessionID str
 	if err != nil {
 		return nil, mapRepositoryError(err, "chat session not found")
 	}
-	return messages, nil
+	return s.enrichMessageMetadata(ctx, normalizedUserID, messages), nil
+}
+
+func (s *Service) enrichMessageMetadata(ctx context.Context, userID string, messages []domain.ChatMessage) []domain.ChatMessage {
+	if s == nil || s.messageMetadataEnricher == nil || len(messages) == 0 {
+		return messages
+	}
+	enriched, err := s.messageMetadataEnricher(ctx, userID, messages)
+	if err != nil {
+		s.logger.Warn("enrich chat message metadata", "error", err)
+		return messages
+	}
+	return enriched
 }
 
 func (s *Service) CreateMessage(ctx context.Context, userID string, sessionID string, req CreateMessageRequest) (domain.ChatSessionDetail, error) {

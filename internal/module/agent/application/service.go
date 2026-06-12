@@ -118,6 +118,7 @@ type chatMessageAgentRunSnapshot struct {
 	Route        *domain.AgentRouteResult `json:"route,omitempty"`
 	ToolCalls    []domain.AgentToolCall   `json:"tool_calls,omitempty"`
 	Evidences    []domain.Evidence        `json:"evidences,omitempty"`
+	Feedback     *domain.RunFeedback      `json:"feedback,omitempty"`
 	Status       string                   `json:"status,omitempty"`
 	ErrorMessage string                   `json:"error_message,omitempty"`
 }

@@ -22,7 +22,7 @@ func runFeedbackRepositoryFrom(repo domain.Repository) domain.RunFeedbackReposit
 
 // SubmitRunFeedback 记录用户对一次诊断结论的质量反馈(有用/没用 + 可选备注)。
 // 校验 user 与 run 归属(复用 ListEvidence 的鉴权语义:仅本人可对自己的 run 反馈),
-// 按 run_id upsert(改票覆盖)。仓储不可用时返回 503,与其它需要持久化的端点一致。
+// 每个 run 只允许提交一次反馈。仓储不可用时返回 503,与其它需要持久化的端点一致。
 func (s *Service) SubmitRunFeedback(ctx context.Context, userID string, runID string, req SubmitRunFeedbackRequest) (domain.RunFeedback, error) {
 	if s == nil || s.repo == nil {
 		return domain.RunFeedback{}, &sharedErrors.AppError{
@@ -86,9 +86,14 @@ func (s *Service) SubmitRunFeedback(ctx context.Context, userID string, runID st
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	saved, err := s.runFeedbackRepo.UpsertRunFeedback(ctx, feedback)
+	saved, err := s.runFeedbackRepo.CreateRunFeedback(ctx, feedback)
 	if err != nil {
-		return domain.RunFeedback{}, err
+		return domain.RunFeedback{}, sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
+			NotFoundCode:    sharedErrors.CodeNotFound,
+			NotFoundMessage: "agent run feedback not found",
+			ConflictCode:    sharedErrors.CodeConflict,
+			ConflictMessage: "agent run feedback already exists",
+		})
 	}
 
 	// 质量门控闭环:用户判定"没用"时,下架该 run 提取的案例,避免错误诊断的

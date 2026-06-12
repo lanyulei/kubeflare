@@ -199,7 +199,7 @@ func (h *Handler) ListEvidence(c *gin.Context) {
 }
 
 // SubmitFeedback 记录用户对一次诊断结论的质量反馈(有用/没用 + 可选备注),
-// 按 run 改票覆盖。用于把度量闭环延伸到"准不准"。
+// 每个 run 只允许提交一次。用于把度量闭环延伸到"准不准"。
 func (h *Handler) SubmitFeedback(c *gin.Context) {
 	userID, err := middleware.RequireSubject(c)
 	if err != nil {

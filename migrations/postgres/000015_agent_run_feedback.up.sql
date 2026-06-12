@@ -10,6 +10,6 @@ CREATE TABLE IF NOT EXISTS agent_run_feedback (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- run_id 唯一:一次 run 仅保留一条反馈(用户改票时 upsert 覆盖),便于按 run 直接 join。
+-- run_id 唯一:一次 run 仅允许提交一条反馈,便于按 run 直接 join。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_run_feedback_run_id ON agent_run_feedback(run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_run_feedback_created_at ON agent_run_feedback(created_at DESC);
