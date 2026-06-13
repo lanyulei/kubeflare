@@ -613,6 +613,16 @@ func isGenericDiagnosticClosing(answer string) bool {
 	if strings.Contains(compact, "以上就是") && strings.Contains(compact, "完整诊断") {
 		return true
 	}
+	if !strings.Contains(answer, "###") {
+		if strings.Contains(compact, "已经为您输出完整的诊断结论") ||
+			strings.Contains(compact, "已为您输出完整的诊断结论") ||
+			(strings.Contains(compact, "完整的诊断结论") &&
+				strings.Contains(compact, "证据") &&
+				strings.Contains(compact, "建议") &&
+				strings.Contains(compact, "准确性提示")) {
+			return true
+		}
+	}
 	if strings.Contains(compact, "如果你能提供") && !strings.Contains(answer, "###") {
 		return true
 	}
