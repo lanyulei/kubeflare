@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -423,13 +424,27 @@ func (c *openAICompatibleClient) Generate(ctx context.Context, request ChatReque
 	}
 
 	choice := chatResponse.Choices[0]
+	content := choice.Message.Content
+	toolCalls := fromOpenAIToolCalls(choice.Message.ToolCalls)
+	finishReason := strings.TrimSpace(choice.FinishReason)
+	if len(request.Tools) > 0 {
+		if parsedCalls, cleanedContent, ok := parseDSMLToolCalls(content); ok {
+			content = cleanedContent
+			if len(toolCalls) == 0 {
+				toolCalls = normalizeDSMLToolCalls(parsedCalls, request.Tools)
+				if finishReason == "" || finishReason == "stop" {
+					finishReason = "tool_calls"
+				}
+			}
+		}
+	}
 	return ChatResponse{
-		Content:      choice.Message.Content,
+		Content:      content,
 		Provider:     c.provider,
 		Model:        model,
 		Usage:        toUsage(chatResponse.Usage),
-		ToolCalls:    fromOpenAIToolCalls(choice.Message.ToolCalls),
-		FinishReason: strings.TrimSpace(choice.FinishReason),
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
 	}, nil
 }
 
@@ -471,7 +486,7 @@ func (c *openAICompatibleClient) Stream(ctx context.Context, request ChatRequest
 	events := make(chan StreamEvent, 8)
 	go func() {
 		defer cancel()
-		c.readStream(streamCtx, httpResponse.Body, events)
+		c.readStream(streamCtx, httpResponse.Body, events, request.Tools)
 	}()
 	return events, nil
 }
@@ -557,15 +572,17 @@ func (c *openAICompatibleClient) newHTTPRequest(ctx context.Context, body []byte
 	return request, nil
 }
 
-func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent) {
+func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent, dsmlTools []Tool) {
 	defer close(events)
 	defer body.Close()
 
+	parseDSML := len(dsmlTools) > 0
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	completed := false
 	completedModel := c.config.Model
 	finishReason := ""
+	var dsmlContent strings.Builder
 	// toolAcc 按 index 聚合分片到达的 tool_call(id/name 取首片,arguments 追加)。
 	toolAcc := newToolCallAccumulator()
 	for scanner.Scan() {
@@ -582,7 +599,7 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 			continue
 		}
 		if payload == "[DONE]" {
-			_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: completedModel, ToolCalls: toolAcc.calls(), FinishReason: finishReason})
+			_ = c.sendCompletedStreamEvent(ctx, events, completedModel, toolAcc.calls(), finishReason, dsmlContent.String(), dsmlTools)
 			return
 		}
 
@@ -600,7 +617,9 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 		for _, choice := range response.Choices {
 			model := streamModel(response.Model, c.config.Model)
 			if choice.Delta.Content != "" {
-				if !sendStreamEvent(ctx, events, StreamEvent{Delta: choice.Delta.Content, Provider: c.provider, Model: model}) {
+				if parseDSML {
+					dsmlContent.WriteString(choice.Delta.Content)
+				} else if !sendStreamEvent(ctx, events, StreamEvent{Delta: choice.Delta.Content, Provider: c.provider, Model: model}) {
 					return
 				}
 			}
@@ -625,10 +644,257 @@ func (c *openAICompatibleClient) readStream(ctx context.Context, body io.ReadClo
 		return
 	}
 	if completed {
-		_ = sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: completedModel, ToolCalls: toolAcc.calls(), FinishReason: finishReason})
+		_ = c.sendCompletedStreamEvent(ctx, events, completedModel, toolAcc.calls(), finishReason, dsmlContent.String(), dsmlTools)
 		return
 	}
 	_ = sendStreamEvent(ctx, events, StreamEvent{Err: providerError(c.provider, 0, "llm provider stream ended before completion", nil)})
+}
+
+func (c *openAICompatibleClient) sendCompletedStreamEvent(
+	ctx context.Context,
+	events chan<- StreamEvent,
+	model string,
+	toolCalls []ToolCall,
+	finishReason string,
+	bufferedContent string,
+	dsmlTools []Tool,
+) bool {
+	parseDSML := len(dsmlTools) > 0
+	if parseDSML {
+		if parsedCalls, cleanedContent, ok := parseDSMLToolCalls(bufferedContent); ok {
+			if len(toolCalls) == 0 {
+				toolCalls = normalizeDSMLToolCalls(parsedCalls, dsmlTools)
+				if finishReason == "" || finishReason == "stop" {
+					finishReason = "tool_calls"
+				}
+			}
+			if cleanedContent != "" {
+				if !sendStreamEvent(ctx, events, StreamEvent{Delta: cleanedContent, Provider: c.provider, Model: model}) {
+					return false
+				}
+			}
+		} else if strings.TrimSpace(bufferedContent) != "" {
+			if !sendStreamEvent(ctx, events, StreamEvent{Delta: bufferedContent, Provider: c.provider, Model: model}) {
+				return false
+			}
+		}
+	}
+	return sendStreamEvent(ctx, events, StreamEvent{Done: true, Provider: c.provider, Model: model, ToolCalls: toolCalls, FinishReason: finishReason})
+}
+
+type dsmlMarker struct {
+	index int
+	text  string
+}
+
+var (
+	dsmlToolCallsStartMarkers = []string{"<｜｜DSML｜｜tool_calls>", "<||DSML||tool_calls>"}
+	dsmlToolCallsEndMarkers   = []string{"</｜｜DSML｜｜tool_calls>", "</||DSML||tool_calls>"}
+)
+
+// parseDSMLToolCalls 兼容部分 OpenAI-compatible provider 把工具调用作为 DSML
+// 文本输出的情况。仅调用方确认本次请求下发了 tools 时使用,避免普通对话误解析。
+func parseDSMLToolCalls(content string) ([]ToolCall, string, bool) {
+	if strings.TrimSpace(content) == "" {
+		return nil, "", false
+	}
+
+	var calls []ToolCall
+	var cleaned strings.Builder
+	offset := 0
+	for {
+		start := findDSMLMarker(content[offset:], dsmlToolCallsStartMarkers)
+		if start.index < 0 {
+			cleaned.WriteString(content[offset:])
+			break
+		}
+		startIndex := offset + start.index
+		cleaned.WriteString(content[offset:startIndex])
+
+		bodyStart := startIndex + len(start.text)
+		end := findDSMLMarker(content[bodyStart:], dsmlToolCallsEndMarkers)
+		if end.index < 0 {
+			cleaned.WriteString(content[startIndex:])
+			break
+		}
+		bodyEnd := bodyStart + end.index
+		blockEnd := bodyEnd + len(end.text)
+
+		calls = append(calls, parseDSMLInvokes(content[bodyStart:bodyEnd])...)
+		offset = blockEnd
+	}
+
+	if len(calls) == 0 {
+		return nil, content, false
+	}
+	return calls, strings.TrimSpace(cleaned.String()), true
+}
+
+func findDSMLMarker(content string, markers []string) dsmlMarker {
+	found := dsmlMarker{index: -1}
+	for _, marker := range markers {
+		index := strings.Index(content, marker)
+		if index < 0 {
+			continue
+		}
+		if found.index < 0 || index < found.index {
+			found = dsmlMarker{index: index, text: marker}
+		}
+	}
+	return found
+}
+
+func parseDSMLInvokes(content string) []ToolCall {
+	normalized := normalizeDSMLMarkup(content)
+	var calls []ToolCall
+	offset := 0
+	for {
+		start := strings.Index(normalized[offset:], "<||DSML||invoke")
+		if start < 0 {
+			break
+		}
+		startIndex := offset + start
+		tagEnd := strings.Index(normalized[startIndex:], ">")
+		if tagEnd < 0 {
+			break
+		}
+		tagEnd += startIndex
+		name := dsmlAttribute(normalized[startIndex:tagEnd+1], "name")
+		if name == "" {
+			offset = tagEnd + 1
+			continue
+		}
+
+		bodyStart := tagEnd + 1
+		closeIndex := strings.Index(normalized[bodyStart:], "</||DSML||invoke>")
+		if closeIndex < 0 {
+			break
+		}
+		bodyEnd := bodyStart + closeIndex
+		args := parseDSMLParameters(normalized[bodyStart:bodyEnd])
+		arguments, err := json.Marshal(args)
+		if err != nil {
+			arguments = []byte("{}")
+		}
+		calls = append(calls, ToolCall{
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      name,
+				Arguments: string(arguments),
+			},
+		})
+		offset = bodyEnd + len("</||DSML||invoke>")
+	}
+	return calls
+}
+
+func parseDSMLParameters(content string) map[string]string {
+	params := map[string]string{}
+	offset := 0
+	for {
+		start := strings.Index(content[offset:], "<||DSML||parameter")
+		if start < 0 {
+			break
+		}
+		startIndex := offset + start
+		tagEnd := strings.Index(content[startIndex:], ">")
+		if tagEnd < 0 {
+			break
+		}
+		tagEnd += startIndex
+		name := dsmlAttribute(content[startIndex:tagEnd+1], "name")
+		if name == "" {
+			offset = tagEnd + 1
+			continue
+		}
+
+		valueStart := tagEnd + 1
+		closeIndex := strings.Index(content[valueStart:], "</||DSML||parameter>")
+		if closeIndex < 0 {
+			break
+		}
+		valueEnd := valueStart + closeIndex
+		params[name] = strings.TrimSpace(html.UnescapeString(content[valueStart:valueEnd]))
+		offset = valueEnd + len("</||DSML||parameter>")
+	}
+	return params
+}
+
+func dsmlAttribute(tag string, name string) string {
+	prefix := name + `="`
+	start := strings.Index(tag, prefix)
+	if start < 0 {
+		return ""
+	}
+	start += len(prefix)
+	end := strings.Index(tag[start:], `"`)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(html.UnescapeString(tag[start : start+end]))
+}
+
+func normalizeDSMLMarkup(content string) string {
+	return strings.ReplaceAll(content, "｜", "|")
+}
+
+func normalizeDSMLToolCalls(calls []ToolCall, tools []Tool) []ToolCall {
+	if len(calls) == 0 || len(tools) == 0 {
+		return calls
+	}
+
+	toolNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Function.Name)
+		if name != "" {
+			toolNames[name] = struct{}{}
+		}
+	}
+
+	normalized := make([]ToolCall, len(calls))
+	copy(normalized, calls)
+	for index := range normalized {
+		name := strings.TrimSpace(normalized[index].Function.Name)
+		if _, ok := toolNames[name]; ok {
+			continue
+		}
+		mappedName, mappedArguments, ok := normalizeDSMLDescribeCall(name, normalized[index].Function.Arguments, toolNames)
+		if !ok {
+			continue
+		}
+		normalized[index].Function.Name = mappedName
+		normalized[index].Function.Arguments = mappedArguments
+	}
+	return normalized
+}
+
+func normalizeDSMLDescribeCall(name string, arguments string, toolNames map[string]struct{}) (string, string, bool) {
+	const describeToolName = "cluster_describe"
+	if _, ok := toolNames[describeToolName]; !ok {
+		return "", "", false
+	}
+	if !strings.HasPrefix(name, "cluster_") || !strings.HasSuffix(name, "_describe") {
+		return "", "", false
+	}
+	resourceKind := strings.TrimSuffix(strings.TrimPrefix(name, "cluster_"), "_describe")
+	if resourceKind == "" {
+		return "", "", false
+	}
+
+	values := map[string]any{}
+	if strings.TrimSpace(arguments) != "" {
+		if err := json.Unmarshal([]byte(arguments), &values); err != nil {
+			values = map[string]any{}
+		}
+	}
+	if _, ok := values["resource_kind"]; !ok {
+		values["resource_kind"] = resourceKind
+	}
+	normalizedArguments, err := json.Marshal(values)
+	if err != nil {
+		return describeToolName, arguments, true
+	}
+	return describeToolName, string(normalizedArguments), true
 }
 
 // toolCallAccumulator 把流式分片的 tool_calls 按 index 聚合成完整调用。
