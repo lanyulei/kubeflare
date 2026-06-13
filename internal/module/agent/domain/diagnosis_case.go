@@ -38,6 +38,14 @@ type DiagnosisCase struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type DiagnosisCaseQueryFilter struct {
+	Keyword   string
+	AgentType string
+	ClusterID string
+	Limit     int
+	Offset    int
+}
+
 // DiagnosisCaseRepository 是诊断案例持久化的可选能力接口(与
 // RouteFeedbackRepository 同模式):repo 实现该接口则启用案例库,否则静默关闭。
 type DiagnosisCaseRepository interface {
@@ -48,4 +56,8 @@ type DiagnosisCaseRepository interface {
 	// DeleteDiagnosisCaseByRunID 删除某次 run 提取出的全部案例,返回删除行数。
 	// 用于质量门控:用户把诊断结论标记为"没用"时,下架其案例避免污染 few-shot。
 	DeleteDiagnosisCaseByRunID(ctx context.Context, runID string) (int64, error)
+}
+
+type DiagnosisCaseQueryRepository interface {
+	ListDiagnosisCases(ctx context.Context, filter DiagnosisCaseQueryFilter) ([]DiagnosisCase, int64, error)
 }

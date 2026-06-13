@@ -316,6 +316,12 @@ type Options struct {
 	Semaphore sharedcoord.Semaphore
 	// EventBus 可选。提供后用于跨实例取消信号与 runtime config 变更广播。
 	EventBus sharedcoord.EventBus
+	// MCPStatusProvider 可选。提供后 Runtime 状态页展示 MCP server 动态连接状态。
+	MCPStatusProvider func() []RuntimeMCPServerStatus
+	// PrometheusStatus 展示 Agent Prometheus 工具的集群内访问配置。
+	PrometheusStatus RuntimePrometheusStatus
+	// PrometheusHealthProvider 可选。提供后 Runtime 状态页展示真实健康探测。
+	PrometheusHealthProvider func(ctx context.Context, clusterID string) RuntimePrometheusHealth
 	// InstanceID 可选。为空时自动生成;写入 run lease 字段便于多副本排障。
 	InstanceID string
 	// Logger 可选。用于记录持久化失败等旁路错误,为 nil 时不记录。
@@ -348,6 +354,10 @@ type Service struct {
 	// metricsRepo 是 run 度量的可选仓储(类型断言获取,缺失即关闭):run 收尾后
 	// 异步落库步数/token/检索模式等可观测指标,失败仅告警,绝不影响 run。
 	metricsRepo domain.RunMetricsRepository
+	// runQueryRepo / caseQueryRepo / routeFeedbackQueryRepo 承载运维后台只读查询。
+	runQueryRepo           domain.RunQueryRepository
+	caseQueryRepo          domain.DiagnosisCaseQueryRepository
+	routeFeedbackQueryRepo domain.RouteFeedbackQueryRepository
 	// runFeedbackRepo 是 run 质量反馈的可选仓储(类型断言获取,缺失即关闭):
 	// 收集用户对诊断结论的"有用/没用"评价,与度量 join 后衡量"准不准"。
 	runFeedbackRepo domain.RunFeedbackRepository
@@ -357,10 +367,13 @@ type Service struct {
 	startupSkills    []domain.SkillDefinition
 	// runLimiter 限制并发执行中的 run 数(per-user + 全局),防止瞬时大量 run
 	// 打爆 LLM 配额与集群 apiserver。仅在未注入分布式 Semaphore 时使用。
-	runLimiter *runLimiter
-	semaphore  sharedcoord.Semaphore
-	eventBus   sharedcoord.EventBus
-	instanceID string
+	runLimiter               *runLimiter
+	semaphore                sharedcoord.Semaphore
+	eventBus                 sharedcoord.EventBus
+	instanceID               string
+	mcpStatusProvider        func() []RuntimeMCPServerStatus
+	prometheusStatus         RuntimePrometheusStatus
+	prometheusHealthProvider func(ctx context.Context, clusterID string) RuntimePrometheusHealth
 	// activeRuns 记录正在执行的 runID -> 取消函数,供 CancelRun 主动中断后台
 	// goroutine,停止继续消耗 token 与发起集群查询。
 	activeRuns sync.Map
@@ -427,33 +440,39 @@ func NewService(options Options) *Service {
 	}
 
 	service := &Service{
-		repo:               options.Repo,
-		chatRepo:           options.ChatRepo,
-		assistant:          options.AssistantStreamer,
-		validator:          validator,
-		runtimeRepo:        runtimeConfigRepositoryFrom(options.Repo),
-		agentRegistry:      agentRegistry,
-		toolRegistry:       toolRegistry,
-		skillRegistry:      skillRegistry,
-		toolExecutor:       toolExecutor,
-		generator:          options.Generator,
-		opts:               opts,
-		feedbackRepo:       routeFeedbackRepositoryFrom(options.Repo),
-		feedbackStore:      newRouteFeedbackStore(opts.RouteCacheSize),
-		caseRepo:           diagnosisCaseRepositoryFrom(options.Repo),
-		caseStore:          newDiagnosisCaseStore(opts.CaseCacheSize),
-		embeddingGen:       embeddingGen,
-		metricsRepo:        runMetricsRepositoryFrom(options.Repo),
-		runFeedbackRepo:    runFeedbackRepositoryFrom(options.Repo),
-		startupOverrides:   cloneOverrides(options.ToolOverrides),
-		startupSkills:      cloneSkills(options.Skills),
-		runLimiter:         newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
-		semaphore:          options.Semaphore,
-		eventBus:           options.EventBus,
-		instanceID:         instanceID,
-		bgLLMSem:           make(chan struct{}, MAX_BACKGROUND_LLM_CONCURRENCY),
-		suppressedCaseRuns: newBoundedStringSet(SUPPRESSED_CASE_RUNS_CAPACITY),
-		logger:             options.Logger,
+		repo:                     options.Repo,
+		chatRepo:                 options.ChatRepo,
+		assistant:                options.AssistantStreamer,
+		validator:                validator,
+		runtimeRepo:              runtimeConfigRepositoryFrom(options.Repo),
+		agentRegistry:            agentRegistry,
+		toolRegistry:             toolRegistry,
+		skillRegistry:            skillRegistry,
+		toolExecutor:             toolExecutor,
+		generator:                options.Generator,
+		opts:                     opts,
+		feedbackRepo:             routeFeedbackRepositoryFrom(options.Repo),
+		feedbackStore:            newRouteFeedbackStore(opts.RouteCacheSize),
+		caseRepo:                 diagnosisCaseRepositoryFrom(options.Repo),
+		caseStore:                newDiagnosisCaseStore(opts.CaseCacheSize),
+		embeddingGen:             embeddingGen,
+		metricsRepo:              runMetricsRepositoryFrom(options.Repo),
+		runQueryRepo:             runQueryRepositoryFrom(options.Repo),
+		caseQueryRepo:            diagnosisCaseQueryRepositoryFrom(options.Repo),
+		routeFeedbackQueryRepo:   routeFeedbackQueryRepositoryFrom(options.Repo),
+		runFeedbackRepo:          runFeedbackRepositoryFrom(options.Repo),
+		startupOverrides:         cloneOverrides(options.ToolOverrides),
+		startupSkills:            cloneSkills(options.Skills),
+		runLimiter:               newRunLimiter(options.Loop.MaxConcurrentRunsPerUser, options.Loop.MaxConcurrentRuns),
+		semaphore:                options.Semaphore,
+		eventBus:                 options.EventBus,
+		mcpStatusProvider:        options.MCPStatusProvider,
+		prometheusStatus:         options.PrometheusStatus,
+		prometheusHealthProvider: options.PrometheusHealthProvider,
+		instanceID:               instanceID,
+		bgLLMSem:                 make(chan struct{}, MAX_BACKGROUND_LLM_CONCURRENCY),
+		suppressedCaseRuns:       newBoundedStringSet(SUPPRESSED_CASE_RUNS_CAPACITY),
+		logger:                   options.Logger,
 	}
 	// 路由校准初始化为空 map(恒非 nil),热路径读取无需判空;预热完成后由
 	// recomputeRouteCalibration 原子替换为基于反馈算出的增量。
@@ -740,9 +759,32 @@ func (s *Service) CancelRun(ctx context.Context, userID string, runID string) (d
 			Status:  http.StatusForbidden,
 		}
 	}
+	return s.cancelRun(ctx, run)
+}
 
+func (s *Service) CancelRunForAdmin(ctx context.Context, userID string, runID string) (domain.AgentRun, error) {
+	if s == nil || s.repo == nil {
+		return domain.AgentRun{}, repositoryUnavailable()
+	}
+	if _, err := normalizeUserID(userID); err != nil {
+		return domain.AgentRun{}, err
+	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return domain.AgentRun{}, badRequest("run id is required")
+	}
+
+	run, err := s.repo.GetRun(ctx, runID)
+	if err != nil {
+		return domain.AgentRun{}, notFound(err, "agent run not found")
+	}
+	return s.cancelRun(ctx, run)
+}
+
+func (s *Service) cancelRun(ctx context.Context, run domain.AgentRun) (domain.AgentRun, error) {
 	// 若该运行正在本进程内执行,中断其后台 goroutine,停止继续消耗 token;
 	// 由 run() 的兜底 defer 将其落为 cancelled。
+	runID := run.ID
 	if value, ok := s.activeRuns.Load(runID); ok {
 		if cancel, isCancel := value.(context.CancelFunc); isCancel {
 			cancel()

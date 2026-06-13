@@ -424,6 +424,23 @@ func (r *AgentRepository) ListRecentRouteFeedback(ctx context.Context, limit int
 	return items, nil
 }
 
+func (r *AgentRepository) DeleteRouteFeedback(ctx context.Context, id string) (int64, error) {
+	if r.db == nil {
+		return 0, nil
+	}
+
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	result := r.db.WithContext(queryCtx).
+		Where("id = ?", id).
+		Delete(&agentRouteFeedbackRecord{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 func toDomainRun(record agentRunRecord) domain.AgentRun {
 	run := domain.AgentRun{
 		ID:           record.ID,

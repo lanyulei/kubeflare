@@ -86,8 +86,8 @@ const (
 // AggregateRunMetrics 在单条查询内统计 since 之后已完成 run 的总览及各特性 on/off
 // 对照(实现 domain.RunMetricsRepository)。各桶共享同一组聚合表达式,仅 WHERE
 // 条件不同,经 UNION ALL 一次取回,避免多次往返。r.db 为 nil 时返回零值结果。
-func (r *AgentRepository) AggregateRunMetrics(ctx context.Context, since time.Time) (domain.RunMetricsEvaluation, error) {
-	result := domain.RunMetricsEvaluation{Since: since}
+func (r *AgentRepository) AggregateRunMetrics(ctx context.Context, filter domain.RunMetricsEvaluationFilter) (domain.RunMetricsEvaluation, error) {
+	result := domain.RunMetricsEvaluation{Since: filter.Since}
 	if r.db == nil {
 		return result, nil
 	}
@@ -109,14 +109,27 @@ func (r *AgentRepository) AggregateRunMetrics(ctx context.Context, since time.Ti
 		{bucketReplanOn, "m.replan_count > 0"},
 		{bucketReplanOff, "m.replan_count = 0"},
 		{bucketSemanticOn, "m.case_retrieval_mode = 'semantic'"},
-		{bucketSemanticOff, "m.case_retrieval_mode <> 'semantic'"},
+		{bucketSemanticOff, "(m.case_retrieval_mode IS NULL OR m.case_retrieval_mode <> 'semantic')"},
 		{bucketCaseHitOn, "m.case_hit_count > 0"},
 		{bucketCaseHitOff, "m.case_hit_count = 0"},
 	}
 
+	baseConditions := []string{"m.created_at >= ?", "m.status = ?"}
+	baseArgs := []any{filter.Since, domain.RUN_STATUS_COMPLETED}
+	if value := strings.TrimSpace(filter.AgentType); value != "" {
+		baseConditions = append(baseConditions, "m.agent_type = ?")
+		baseArgs = append(baseArgs, value)
+	}
+	if value := strings.TrimSpace(filter.ClusterID); value != "" {
+		baseConditions = append(baseConditions, "m.cluster_id = ?")
+		baseArgs = append(baseArgs, value)
+	}
+	baseWhere := strings.Join(baseConditions, " AND ")
+
 	// 共享聚合表达式:质量信号(反馈/有用计数)来自 LEFT JOIN 的 feedback 行,
 	// 成本信号(均值)来自 metrics 列。窗口与"已完成"过滤对所有桶一致。
 	selects := make([]string, 0, len(buckets))
+	args := make([]any, 0, len(buckets)*(len(baseArgs)))
 	for _, bucket := range buckets {
 		selects = append(selects, fmt.Sprintf(`SELECT
   '%s' AS bucket,
@@ -129,15 +142,10 @@ func (r *AgentRepository) AggregateRunMetrics(ctx context.Context, since time.Ti
   AVG(m.duration_ms) AS avg_duration_ms
 FROM agent_run_metrics m
 LEFT JOIN agent_run_feedback f ON f.run_id = m.run_id
-WHERE m.created_at >= ? AND m.status = ? AND (%s)`, bucket.name, bucket.condition))
+WHERE %s AND (%s)`, bucket.name, baseWhere, bucket.condition))
+		args = append(args, baseArgs...)
 	}
 	query := strings.Join(selects, "\nUNION ALL\n")
-
-	// since 与 status 对每个桶各出现一次,按 buckets 顺序展开占位参数。
-	args := make([]any, 0, len(buckets)*2)
-	for range buckets {
-		args = append(args, since, domain.RUN_STATUS_COMPLETED)
-	}
 
 	var rows []bucketAggregateRow
 	if err := r.db.WithContext(queryCtx).Raw(query, args...).Scan(&rows).Error; err != nil {

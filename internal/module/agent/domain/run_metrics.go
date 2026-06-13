@@ -52,7 +52,13 @@ type RunMetricsRepository interface {
 	// AggregateRunMetrics 把 agent_run_metrics 与 agent_run_feedback 按 run_id
 	// 关联,统计 since 之后已完成 run 的总览及各增强特性 on/off 的对照桶,用于
 	// 评估特性对诊断质量(useful_pct)与成本(步数/token/耗时)的真实影响。
-	AggregateRunMetrics(ctx context.Context, since time.Time) (RunMetricsEvaluation, error)
+	AggregateRunMetrics(ctx context.Context, filter RunMetricsEvaluationFilter) (RunMetricsEvaluation, error)
+}
+
+type RunMetricsEvaluationFilter struct {
+	Since     time.Time
+	AgentType string
+	ClusterID string
 }
 
 // FeatureBucket 是一组 run 的聚合统计:既含质量信号(有反馈的占比与有用占比),

@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lanyulei/kubeflare/internal/module/agent/domain"
@@ -17,11 +18,17 @@ const (
 	MAX_EVALUATION_WINDOW_DAYS = 365
 )
 
+type RunMetricsEvaluationRequest struct {
+	Days      int
+	AgentType string
+	ClusterID string
+}
+
 // EvaluateRuns 返回 run 度量的离线评估看板:把 agent_run_metrics 与 run 质量反馈
 // 关联,按各增强特性 on/off 对照统计有用率与成本。纯只读分析,不触及执行路径。
 // days<=0 回退默认窗口,超过上限则钳制。度量仓储不可用时返回 503(语义对齐
 // SubmitRunFeedback 的"功能暂不可用")。
-func (s *Service) EvaluateRuns(ctx context.Context, userID string, days int) (domain.RunMetricsEvaluation, error) {
+func (s *Service) EvaluateRuns(ctx context.Context, userID string, req RunMetricsEvaluationRequest) (domain.RunMetricsEvaluation, error) {
 	if s == nil || s.repo == nil {
 		return domain.RunMetricsEvaluation{}, &sharedErrors.AppError{
 			Code:    sharedErrors.CodeInternal,
@@ -40,9 +47,13 @@ func (s *Service) EvaluateRuns(ctx context.Context, userID string, days int) (do
 		}
 	}
 
-	days = normalizeEvaluationWindow(days)
+	days := normalizeEvaluationWindow(req.Days)
 	since := time.Now().UTC().AddDate(0, 0, -days)
-	evaluation, err := s.metricsRepo.AggregateRunMetrics(ctx, since)
+	evaluation, err := s.metricsRepo.AggregateRunMetrics(ctx, domain.RunMetricsEvaluationFilter{
+		Since:     since,
+		AgentType: strings.TrimSpace(req.AgentType),
+		ClusterID: strings.TrimSpace(req.ClusterID),
+	})
 	if err != nil {
 		return domain.RunMetricsEvaluation{}, err
 	}

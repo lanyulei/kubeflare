@@ -47,6 +47,21 @@ func (h *Handler) ListSkill(c *gin.Context) {
 	response.OKList(c, h.service.ListSkills(c.Request.Context()))
 }
 
+func (h *Handler) GetRuntimeStatus(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	status, err := h.service.GetRuntimeStatus(c.Request.Context(), userID, clusterIDFromRequest(c, ""))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, status)
+}
+
 // Reload 在运行时热重载工具覆盖与技能。空请求体表示回滚到启动配置,因此容忍
 // EOF(空 body);仅在 body 非空但非法时报错。
 func (h *Handler) Reload(c *gin.Context) {
@@ -175,12 +190,51 @@ func (h *Handler) CancelRun(c *gin.Context) {
 		return
 	}
 
-	run, err := h.service.CancelRun(c.Request.Context(), userID, c.Param("runID"))
+	run, err := h.service.CancelRunForAdmin(c.Request.Context(), userID, c.Param("runID"))
 	if err != nil {
 		response.Error(c, err)
 		return
 	}
 	response.OK(c, http.StatusOK, run)
+}
+
+func (h *Handler) ListRun(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.ListRuns(c.Request.Context(), userID, application.AgentRunListRequest{
+		Keyword:   c.Query("keyword"),
+		AgentType: c.Query("agent_type"),
+		ClusterID: c.Query("cluster_id"),
+		Status:    c.Query("status"),
+		UserID:    c.Query("user_id"),
+		Days:      queryInt(c, "days"),
+		Limit:     queryInt(c, "limit"),
+		Offset:    queryInt(c, "offset"),
+	})
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
+func (h *Handler) GetRun(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	detail, err := h.service.GetRunDetail(c.Request.Context(), userID, c.Param("runID"))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, detail)
 }
 
 func (h *Handler) ListEvidence(c *gin.Context) {
@@ -221,6 +275,29 @@ func (h *Handler) SubmitFeedback(c *gin.Context) {
 	response.OK(c, http.StatusOK, feedback)
 }
 
+func (h *Handler) ListRunMetricsSample(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.ListRunMetricsSamples(c.Request.Context(), userID, application.AgentRunMetricsSampleRequest{
+		Days:      queryInt(c, "days"),
+		Feature:   c.Query("feature"),
+		Enabled:   queryBoolPtr(c, "enabled"),
+		AgentType: c.Query("agent_type"),
+		ClusterID: c.Query("cluster_id"),
+		Limit:     queryInt(c, "limit"),
+		Offset:    queryInt(c, "offset"),
+	})
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
 // EvaluateRuns 返回 run 度量的离线评估看板(metrics × feedback 按特性 on/off
 // 对照),供管理员评估各智能特性的真实增益。窗口天数由 days query 指定(缺省/
 // 越界由服务层钳制)。
@@ -231,13 +308,88 @@ func (h *Handler) EvaluateRuns(c *gin.Context) {
 		return
 	}
 
-	days, _ := strconv.Atoi(strings.TrimSpace(c.Query("days")))
-	evaluation, err := h.service.EvaluateRuns(c.Request.Context(), userID, days)
+	evaluation, err := h.service.EvaluateRuns(c.Request.Context(), userID, application.RunMetricsEvaluationRequest{
+		Days:      queryInt(c, "days"),
+		AgentType: c.Query("agent_type"),
+		ClusterID: c.Query("cluster_id"),
+	})
 	if err != nil {
 		response.Error(c, err)
 		return
 	}
 	response.OK(c, http.StatusOK, evaluation)
+}
+
+func (h *Handler) ListDiagnosisCase(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.ListDiagnosisCases(c.Request.Context(), userID, application.AgentDiagnosisCaseListRequest{
+		Keyword:   c.Query("keyword"),
+		AgentType: c.Query("agent_type"),
+		ClusterID: c.Query("cluster_id"),
+		Limit:     queryInt(c, "limit"),
+		Offset:    queryInt(c, "offset"),
+	})
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
+func (h *Handler) DeleteDiagnosisCaseByRunID(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.DeleteDiagnosisCaseByRunID(c.Request.Context(), userID, c.Param("runID"))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
+func (h *Handler) ListRouteFeedback(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.ListRouteFeedback(c.Request.Context(), userID, application.AgentRouteFeedbackListRequest{
+		Keyword:           c.Query("keyword"),
+		SelectedAgentType: c.Query("selected_agent_type"),
+		Matched:           queryBoolPtr(c, "matched"),
+		Limit:             queryInt(c, "limit"),
+		Offset:            queryInt(c, "offset"),
+	})
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
+}
+
+func (h *Handler) DeleteRouteFeedback(c *gin.Context) {
+	userID, err := middleware.RequireSubject(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	result, err := h.service.DeleteRouteFeedback(c.Request.Context(), userID, c.Param("feedbackID"))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, http.StatusOK, result)
 }
 
 func clusterIDFromRequest(c *gin.Context, value string) string {
@@ -249,6 +401,22 @@ func clusterIDFromRequest(c *gin.Context, value string) string {
 }
 
 func runtimeConfigLimit(c *gin.Context) int {
-	limit, _ := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
-	return limit
+	return queryInt(c, "limit")
+}
+
+func queryInt(c *gin.Context, key string) int {
+	value, _ := strconv.Atoi(strings.TrimSpace(c.Query(key)))
+	return value
+}
+
+func queryBoolPtr(c *gin.Context, key string) *bool {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil
+	}
+	return &value
 }

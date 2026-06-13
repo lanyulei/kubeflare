@@ -228,13 +228,23 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 			MaxConcurrentRunsPerUser: cfg.Agent.MaxConcurrentRunsPerUser,
 			MaxConcurrentRuns:        cfg.Agent.MaxConcurrentRuns,
 		},
-		SystemPrompts:      resolveAgentPrompts(cfg.Agent, logger),
-		ToolOverrides:      resolveAgentToolOverrides(cfg.Agent),
-		Skills:             resolveAgentSkills(cfg.Agent),
-		EmbeddingGenerator: agentEmbeddingGenerator,
-		Semaphore:          coordinationClient,
-		EventBus:           coordinationClient,
-		Logger:             logger,
+		SystemPrompts:            resolveAgentPrompts(cfg.Agent, logger),
+		ToolOverrides:            resolveAgentToolOverrides(cfg.Agent),
+		Skills:                   resolveAgentSkills(cfg.Agent),
+		EmbeddingGenerator:       agentEmbeddingGenerator,
+		Semaphore:                coordinationClient,
+		EventBus:                 coordinationClient,
+		MCPStatusProvider:        newAgentMCPStatusProvider(mcpManager),
+		PrometheusHealthProvider: newAgentPrometheusHealthProvider(agentPrometheusExecutor),
+		PrometheusStatus: agentapplication.RuntimePrometheusStatus{
+			Enabled:        strings.TrimSpace(cfg.Agent.Prometheus.Service) != "",
+			Namespace:      cfg.Agent.Prometheus.Namespace,
+			Service:        cfg.Agent.Prometheus.Service,
+			Port:           cfg.Agent.Prometheus.Port,
+			Scheme:         cfg.Agent.Prometheus.Scheme,
+			QueryTimeoutMS: cfg.Agent.Prometheus.QueryTimeout.Milliseconds(),
+		},
+		Logger: logger,
 	})
 	aiService.SetMessageMetadataEnricher(agentService.EnrichChatMessageFeedback)
 	kapiHandler := newKAPIHandler(clusterService, authenticator, cfg.HTTP.APIRequestTimeout, clusterkubernetes.SecurityOptions{
@@ -572,6 +582,45 @@ func resolveAgentSkills(cfg config.AgentConfig) []agentdomain.SkillDefinition {
 		})
 	}
 	return skills
+}
+
+func newAgentMCPStatusProvider(manager *agentmcp.Manager) func() []agentapplication.RuntimeMCPServerStatus {
+	if manager == nil {
+		return nil
+	}
+	return func() []agentapplication.RuntimeMCPServerStatus {
+		statuses := manager.Statuses()
+		items := make([]agentapplication.RuntimeMCPServerStatus, 0, len(statuses))
+		for _, status := range statuses {
+			items = append(items, agentapplication.RuntimeMCPServerStatus{
+				Name:             status.Name,
+				Transport:        status.Transport,
+				State:            status.State,
+				Ready:            status.Ready,
+				ToolCount:        status.ToolCount,
+				TrustedToolCount: status.TrustedToolCount,
+				MaxConcurrency:   status.MaxConcurrency,
+				HealthIntervalMS: status.HealthInterval.Milliseconds(),
+				CallTimeoutMS:    status.CallTimeout.Milliseconds(),
+			})
+		}
+		return items
+	}
+}
+
+func newAgentPrometheusHealthProvider(executor *agentprometheus.ToolExecutor) func(context.Context, string) agentapplication.RuntimePrometheusHealth {
+	if executor == nil {
+		return nil
+	}
+	return func(ctx context.Context, clusterID string) agentapplication.RuntimePrometheusHealth {
+		status := executor.Health(ctx, clusterID)
+		return agentapplication.RuntimePrometheusHealth{
+			Healthy:       status.Healthy,
+			LastError:     status.LastError,
+			LatencyMS:     status.Latency.Milliseconds(),
+			LastCheckedAt: status.LastCheckedAt,
+		}
+	}
 }
 
 func newAPIHandler(

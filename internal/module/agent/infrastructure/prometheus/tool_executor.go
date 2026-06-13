@@ -55,11 +55,47 @@ type ToolExecutor struct {
 	config        Config
 }
 
+type HealthStatus struct {
+	Healthy       bool
+	LastError     string
+	Latency       time.Duration
+	LastCheckedAt time.Time
+}
+
 func NewToolExecutor(clientFactory *kubeclient.Factory, config Config) *ToolExecutor {
 	return &ToolExecutor{
 		clientFactory: clientFactory,
 		config:        config.withDefaults(),
 	}
+}
+
+func (e *ToolExecutor) Health(ctx context.Context, clusterID string) HealthStatus {
+	status := HealthStatus{LastCheckedAt: time.Now().UTC()}
+	if e == nil || e.clientFactory == nil {
+		status.LastError = "prometheus tool executor is unavailable"
+		return status
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	if clusterID == "" {
+		status.LastError = "cluster id is required"
+		return status
+	}
+
+	clientset, err := e.clientFactory.Clientset(ctx, clusterID)
+	if err != nil {
+		status.LastError = err.Error()
+		return status
+	}
+
+	startedAt := time.Now()
+	_, err = e.proxyGet(ctx, clientset, "/api/v1/query", map[string]string{"query": "up"})
+	status.Latency = time.Since(startedAt)
+	if err != nil {
+		status.LastError = err.Error()
+		return status
+	}
+	status.Healthy = true
+	return status
 }
 
 // Source 标识该执行器归属的工具数据源。

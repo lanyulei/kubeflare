@@ -34,6 +34,14 @@ type RouteFeedback struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type RouteFeedbackQueryFilter struct {
+	Keyword           string
+	SelectedAgentType string
+	Matched           *bool
+	Limit             int
+	Offset            int
+}
+
 // RouteFeedbackRepository 是路由反馈持久化的可选能力接口(与
 // RuntimeConfigRepository 同模式):由具体仓储按需实现,Service 经类型断言获取,
 // 缺失时路由学习自动静默关闭,不影响既有装配与测试。
@@ -41,4 +49,9 @@ type RouteFeedbackRepository interface {
 	CreateRouteFeedback(ctx context.Context, feedback RouteFeedback) (RouteFeedback, error)
 	// ListRecentRouteFeedback 按创建时间倒序返回最近的反馈记录。
 	ListRecentRouteFeedback(ctx context.Context, limit int) ([]RouteFeedback, error)
+	DeleteRouteFeedback(ctx context.Context, id string) (int64, error)
+}
+
+type RouteFeedbackQueryRepository interface {
+	ListRouteFeedback(ctx context.Context, filter RouteFeedbackQueryFilter) ([]RouteFeedback, int64, error)
 }

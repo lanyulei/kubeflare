@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,6 +105,18 @@ type ManagerOptions struct {
 	Servers []ServerConfig
 	Logger  *slog.Logger
 	Metrics *Metrics
+}
+
+type ServerStatus struct {
+	Name             string
+	Transport        string
+	State            string
+	Ready            bool
+	ToolCount        int
+	TrustedToolCount int
+	MaxConcurrency   int
+	HealthInterval   time.Duration
+	CallTimeout      time.Duration
 }
 
 // NewManager 按配置构造 Manager(尚未发起连接,调用 Start 才开始)。无法建连函数化
@@ -357,6 +370,38 @@ func (m *Manager) AllTools() []domain.ToolDefinition {
 	return out
 }
 
+func (m *Manager) Statuses() []ServerStatus {
+	if m == nil {
+		return []ServerStatus{}
+	}
+	items := make([]ServerStatus, 0, len(m.servers))
+	for _, managed := range m.servers {
+		tools, _ := managed.snapshotTools()
+		trusted := 0
+		for _, tool := range tools {
+			if tool.ReadOnly {
+				trusted++
+			}
+		}
+		state := managed.getState()
+		items = append(items, ServerStatus{
+			Name:             managed.config.Name,
+			Transport:        managed.config.Transport,
+			State:            connStateName(state),
+			Ready:            state == stateReady,
+			ToolCount:        len(tools),
+			TrustedToolCount: trusted,
+			MaxConcurrency:   managed.config.MaxConcurrency,
+			HealthInterval:   managed.config.HealthInterval,
+			CallTimeout:      managed.config.CallTimeout,
+		})
+	}
+	sort.Slice(items, func(first, second int) bool {
+		return items[first].Name < items[second].Name
+	})
+	return items
+}
+
 // acquire 为一次工具调用申请执行许可:先占并发名额,再过熔断闸。返回 ok=true 时
 // 调用方必须调用一次 done(success) 释放名额并回报熔断结果;ok=false 时 reason 说明
 // 拒绝原因(供回喂模型)。先限流后熔断的顺序保证:限流拒绝时不触碰熔断状态(否则
@@ -389,6 +434,19 @@ func (m *Manager) acquire(server string) (managed *managedServer, done func(succ
 func (m *Manager) setServerState(server *managedServer, state int) {
 	server.setState(connState(state))
 	m.metrics.setState(server.config.Name, state)
+}
+
+func connStateName(state connState) string {
+	switch state {
+	case stateConnecting:
+		return "connecting"
+	case stateReady:
+		return "ready"
+	case stateFailed:
+		return "failed"
+	default:
+		return "disconnected"
+	}
 }
 
 func (m *Manager) recoverSupervise(name string) {

@@ -30,3 +30,36 @@ type RuntimeConfigRepository interface {
 	ListRuntimeConfigVersions(ctx context.Context, limit int) ([]RuntimeConfigVersion, error)
 	ListRuntimeConfigAudits(ctx context.Context, versionID string, limit int) ([]RuntimeConfigAudit, error)
 }
+
+type RunQueryFilter struct {
+	Keyword   string
+	AgentType string
+	ClusterID string
+	Status    string
+	UserID    string
+	Since     *time.Time
+	Limit     int
+	Offset    int
+}
+
+type RunMetricsSampleFilter struct {
+	Since     *time.Time
+	Feature   string
+	Enabled   *bool
+	AgentType string
+	ClusterID string
+	Limit     int
+	Offset    int
+}
+
+type RunMetricsSample struct {
+	Run      AgentRun         `json:"run"`
+	Metrics  *AgentRunMetrics `json:"metrics,omitempty"`
+	Feedback *RunFeedback     `json:"feedback,omitempty"`
+}
+
+type RunQueryRepository interface {
+	ListRuns(ctx context.Context, filter RunQueryFilter) ([]AgentRun, int64, error)
+	ListRunMetricsSamples(ctx context.Context, filter RunMetricsSampleFilter) ([]RunMetricsSample, int64, error)
+	GetRunMetricsByRunIDs(ctx context.Context, runIDs []string) (map[string]AgentRunMetrics, error)
+}
