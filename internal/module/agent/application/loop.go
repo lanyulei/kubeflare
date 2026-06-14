@@ -14,6 +14,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var genericDiagnosticCompletionPhrases = []string{
+	"已经为您输出完整的诊断结论",
+	"已为您输出完整的诊断结论",
+	"已完整输出上述诊断",
+	"完整输出上述诊断",
+	"上述诊断已完整输出",
+	"您的问题已就绪",
+	"问题已就绪",
+}
+
 const (
 	// MAX_OBSERVE_CHARS 限制单步回喂给 LLM 的观察文本总长度,防止证据正文
 	// 撑爆上下文(完整 RawJSON 仍照常落库,仅不回喂给模型)。
@@ -572,6 +582,7 @@ func (s *Service) streamFinalAnswer(
 	if answer == "" {
 		return "", true, fmt.Errorf("AI 未能基于已采集证据形成结论")
 	}
+	answer = finalDiagnosticAnswer(content, priorTurns, draft, answer)
 	return answer, true, nil
 }
 
@@ -614,12 +625,7 @@ func isGenericDiagnosticClosing(answer string) bool {
 		return true
 	}
 	if !strings.Contains(answer, "###") {
-		if strings.Contains(compact, "已经为您输出完整的诊断结论") ||
-			strings.Contains(compact, "已为您输出完整的诊断结论") ||
-			(strings.Contains(compact, "完整的诊断结论") &&
-				strings.Contains(compact, "证据") &&
-				strings.Contains(compact, "建议") &&
-				strings.Contains(compact, "准确性提示")) {
+		if hasGenericDiagnosticCompletionPhrase(compact) {
 			return true
 		}
 	}
@@ -627,6 +633,36 @@ func isGenericDiagnosticClosing(answer string) bool {
 		return true
 	}
 	return false
+}
+
+func hasGenericDiagnosticCompletionPhrase(compact string) bool {
+	for _, phrase := range genericDiagnosticCompletionPhrases {
+		if strings.Contains(compact, phrase) {
+			return true
+		}
+	}
+
+	if (strings.Contains(compact, "已完整输出") || strings.Contains(compact, "完整输出")) &&
+		(strings.Contains(compact, "诊断") || strings.Contains(compact, "结论")) {
+		return true
+	}
+	return strings.Contains(compact, "完整的诊断结论") &&
+		strings.Contains(compact, "证据") &&
+		strings.Contains(compact, "建议") &&
+		strings.Contains(compact, "准确性提示")
+}
+
+func finalDiagnosticAnswer(content string, priorTurns []aiapplication.ToolCallTurn, draft string, answer string) string {
+	answer = strings.TrimSpace(answer)
+	if !isGenericDiagnosticClosing(answer) {
+		return answer
+	}
+
+	draft = strings.TrimSpace(draft)
+	if isSubstantiveDiagnosticAnswer(draft, priorTurns) {
+		return draft
+	}
+	return fallbackDiagnosticAnswer(content, priorTurns)
 }
 
 func hasToolResultEvidence(priorTurns []aiapplication.ToolCallTurn) bool {
@@ -644,7 +680,7 @@ func diagnosticAnswerRewriteInstruction(previousAnswer string) string {
 	previousAnswer = strings.TrimSpace(previousAnswer)
 	var builder strings.Builder
 	builder.WriteString("上一轮最终诊断正文不合格:内容过短、缺少证据展开或只是泛化收尾。")
-	builder.WriteString("请基于已经采集到的工具结果重新输出完整诊断,不要只说\"以上就是完整诊断\"。")
+	builder.WriteString("请基于已经采集到的工具结果重新输出完整诊断,不要只说\"以上就是完整诊断\"、\"已完整输出上述诊断\"或\"您的问题已就绪\"。")
 	builder.WriteString("必须使用中文 Markdown 四段:### 结论、### 证据、### 建议、### 准确性提示。")
 	builder.WriteString("证据段必须列出具体工具返回的信息并使用 [E1]、[E2] 编号;证据不足时也要明确列出已获得的证据和不足。")
 	builder.WriteString("建议段只能给只读视角的排查建议,不要给会修改集群的命令。")
@@ -659,7 +695,7 @@ func finalAnswerStreamInstruction(draft string) string {
 	var builder strings.Builder
 	builder.WriteString("现在进入最终回答阶段:禁止再调用工具,直接基于已采集工具结果输出完整诊断。")
 	builder.WriteString("必须用中文 Markdown 四段:### 结论、### 证据、### 建议、### 准确性提示。")
-	builder.WriteString("证据段必须展开具体证据并使用 [E1]、[E2] 编号;不要只说\"以上就是完整诊断\"或要求用户再提供信息后才分析。")
+	builder.WriteString("证据段必须展开具体证据并使用 [E1]、[E2] 编号;不要只说\"以上就是完整诊断\"、\"已完整输出上述诊断\"、\"您的问题已就绪\"或要求用户再提供信息后才分析。")
 	builder.WriteString("建议段保持只读视角,不要给会修改集群的命令。")
 	if strings.TrimSpace(draft) != "" {
 		builder.WriteString("\n可参考但必须补全格式和证据展开的候选结论:\n")
