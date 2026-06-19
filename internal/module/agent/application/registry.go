@@ -353,8 +353,12 @@ func defaultAgents() []domain.AgentDefinition {
 				domain.TOOL_ID_POD_LOG_TAIL,
 				domain.TOOL_ID_NODE_LIST,
 				domain.TOOL_ID_NODE_GET,
-				domain.TOOL_ID_WORKLOAD_GET,
-				domain.TOOL_ID_WORKLOAD_PODS,
+				domain.TOOL_ID_DEPLOYMENT_GET,
+				domain.TOOL_ID_DEPLOYMENT_PODS,
+				domain.TOOL_ID_STATEFULSET_GET,
+				domain.TOOL_ID_STATEFULSET_PODS,
+				domain.TOOL_ID_DAEMONSET_GET,
+				domain.TOOL_ID_DAEMONSET_PODS,
 				domain.TOOL_ID_CONFIGMAP_GET,
 				domain.TOOL_ID_SERVICE_GET,
 				domain.TOOL_ID_INGRESS_GET,
@@ -418,8 +422,14 @@ func defaultTools() []domain.ToolDefinition {
 		withObserveMaxChars(newDiagnosticTool(domain.TOOL_ID_POD_LOG_TAIL, "Pod 日志尾部", "log", "读取容器日志尾部。", schemaPodLogTail), 8000),
 		newDiagnosticTool(domain.TOOL_ID_NODE_LIST, "Node 列表", "node", "读取 Node 列表。", schemaNodeList),
 		newDiagnosticTool(domain.TOOL_ID_NODE_GET, "Node 详情", "node", "读取指定 Node 详情。", schemaNodeGet),
-		newDiagnosticTool(domain.TOOL_ID_WORKLOAD_GET, "Workload 详情", "workload", "读取工作负载详情。", schemaWorkloadGet),
-		newDiagnosticTool(domain.TOOL_ID_WORKLOAD_PODS, "Workload Pod", "workload", "读取工作负载关联 Pod。", schemaWorkloadPod),
+		newDiagnosticTool(domain.TOOL_ID_DEPLOYMENT_GET, "Deployment", "deployment", "读取 Deployment(留空名称则列出)。", schemaDeploymentGet),
+		newDiagnosticTool(domain.TOOL_ID_DEPLOYMENT_PODS, "Deployment Pod", "deployment", "读取 Deployment 关联 Pod。", schemaDeploymentPod),
+		newDiagnosticTool(domain.TOOL_ID_STATEFULSET_GET, "StatefulSet", "statefulset", "读取 StatefulSet(留空名称则列出)。", schemaStatefulSetGet),
+		newDiagnosticTool(domain.TOOL_ID_STATEFULSET_PODS, "StatefulSet Pod", "statefulset", "读取 StatefulSet 关联 Pod。", schemaStatefulSetPod),
+		newDiagnosticTool(domain.TOOL_ID_DAEMONSET_GET, "DaemonSet", "daemonset", "读取 DaemonSet(留空名称则列出)。", schemaDaemonSetGet),
+		newDiagnosticTool(domain.TOOL_ID_DAEMONSET_PODS, "DaemonSet Pod", "daemonset", "读取 DaemonSet 关联 Pod。", schemaDaemonSetPod),
+		withDisabled(newDiagnosticTool(domain.TOOL_ID_WORKLOAD_GET, "Workload 详情(兼容)", "workload", "兼容旧工作负载详情工具;新调用优先使用 Deployment/StatefulSet/DaemonSet 细粒度工具。", schemaWorkloadGet)),
+		withDisabled(newDiagnosticTool(domain.TOOL_ID_WORKLOAD_PODS, "Workload Pod(兼容)", "workload", "兼容旧工作负载 Pod 工具;新调用优先使用 Deployment/StatefulSet/DaemonSet 细粒度工具。", schemaWorkloadPod)),
 		newDiagnosticTool(domain.TOOL_ID_CONFIGMAP_GET, "ConfigMap", "configmap", "读取 ConfigMap(留空名称则列出);仅返回键名,不回喂取值,避免泄露敏感配置。", schemaConfigMap),
 		newDiagnosticTool(domain.TOOL_ID_SERVICE_GET, "Service", "service", "读取 Service(留空名称则列出):类型、ClusterIP、端口、选择器、Endpoint 就绪情况。", schemaService),
 		newDiagnosticTool(domain.TOOL_ID_INGRESS_GET, "Ingress", "ingress", "读取 Ingress(留空名称则列出):规则、后端 Service、TLS 与负载均衡地址。", schemaIngress),
@@ -435,6 +445,12 @@ func defaultTools() []domain.ToolDefinition {
 // withObserveMaxChars 设置工具的观察回喂预算,供内置定义按工具类型分级。
 func withObserveMaxChars(tool domain.ToolDefinition, chars int) domain.ToolDefinition {
 	tool.ObserveMaxChars = chars
+	return tool
+}
+
+// withDisabled 保留兼容工具定义但不暴露给 LLM 默认工具清单。
+func withDisabled(tool domain.ToolDefinition) domain.ToolDefinition {
+	tool.Enabled = false
 	return tool
 }
 
@@ -487,7 +503,7 @@ const diagnosticSystemPrompt = `当前角色: Kubernetes 集群只读诊断助�
 工作原则:
 1. 只读:你只能调用提供的只读工具,绝不执行任何写操作或给出会修改集群的指令。
 2. 自主多步取证:根据用户问题和已获得的证据,决定下一步调用哪个工具、传什么参数。例如先列出 Pod 发现异常,再深入查看该 Pod 详情与日志、相关事件。
-3. 善用资源工具:除 Pod/Node/Workload 外,你还可读取 Service、Ingress、PVC、HPA、ConfigMap、RBAC 等资源辅助定位(如访问不通查 Service/Ingress/Endpoint,存储异常查 PVC,副本不伸缩查 HPA,权限报错查 RBAC)。排查单个资源故障时,优先用 describe 工具一次性获取其关键状态与关联事件,再按需下钻。
+3. 善用资源工具:除 Pod/Node/Deployment/StatefulSet/DaemonSet 外,你还可读取 Service、Ingress、PVC、HPA、ConfigMap、RBAC 等资源辅助定位(如访问不通查 Service/Ingress/Endpoint,存储异常查 PVC,副本不伸缩查 HPA,权限报错查 RBAC)。排查单个资源故障时,优先用 describe 工具一次性获取其关键状态与关联事件,再按需下钻。
 4. 善用指标:除 Kubernetes API 工具外,你还可用 Prometheus 指标查询工具按需获取 CPU、内存、重启次数、OOM、资源饱和度等量化证据。需自行构造 PromQL,并尽量用 namespace、pod 等标签精确过滤;排查趋势性问题(如内存缓慢上涨)优先用区间查询。
 5. 基于证据:结论必须基于已采集的证据,使用 [E1]、[E2] 形式引用具体证据,不要臆测。
 6. 避免重复:不要用相同参数重复调用同一工具;已获得的信息直接复用。

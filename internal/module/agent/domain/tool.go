@@ -6,17 +6,23 @@ import (
 )
 
 const (
-	TOOL_ID_EVENT_LIST    = "cluster.event.list"
-	TOOL_ID_POD_LIST      = "cluster.pod.list"
-	TOOL_ID_POD_GET       = "cluster.pod.get"
-	TOOL_ID_POD_LOG_TAIL  = "cluster.pod.log.tail"
-	TOOL_ID_NODE_LIST     = "cluster.node.list"
-	TOOL_ID_NODE_GET      = "cluster.node.get"
-	TOOL_ID_WORKLOAD_GET  = "cluster.workload.get"
-	TOOL_ID_WORKLOAD_PODS = "cluster.workload.pods"
+	TOOL_ID_EVENT_LIST       = "cluster.event.list"
+	TOOL_ID_POD_LIST         = "cluster.pod.list"
+	TOOL_ID_POD_GET          = "cluster.pod.get"
+	TOOL_ID_POD_LOG_TAIL     = "cluster.pod.log.tail"
+	TOOL_ID_NODE_LIST        = "cluster.node.list"
+	TOOL_ID_NODE_GET         = "cluster.node.get"
+	TOOL_ID_DEPLOYMENT_GET   = "cluster.deployment.get"
+	TOOL_ID_DEPLOYMENT_PODS  = "cluster.deployment.pods"
+	TOOL_ID_STATEFULSET_GET  = "cluster.statefulset.get"
+	TOOL_ID_STATEFULSET_PODS = "cluster.statefulset.pods"
+	TOOL_ID_DAEMONSET_GET    = "cluster.daemonset.get"
+	TOOL_ID_DAEMONSET_PODS   = "cluster.daemonset.pods"
+	TOOL_ID_WORKLOAD_GET     = "cluster.workload.get"
+	TOOL_ID_WORKLOAD_PODS    = "cluster.workload.pods"
 
 	// 资源类只读工具。统一遵循"无 resource_name 则列表、有则详情"的合并语义,
-	// 与 cluster.workload.get 一致,避免 list/get 拆成两个工具放大模型选择负担。
+	// 与资源 get 工具一致,避免 list/get 拆成两个工具放大模型选择负担。
 	TOOL_ID_CONFIGMAP_GET = "cluster.configmap.get"
 	TOOL_ID_SERVICE_GET   = "cluster.service.get"
 	TOOL_ID_INGRESS_GET   = "cluster.ingress.get"

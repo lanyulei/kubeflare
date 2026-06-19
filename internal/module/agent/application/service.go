@@ -899,7 +899,7 @@ func (s *Service) rankCandidatesBase(req RouteAgentRequest) []domain.AgentCandid
 		switch agent.Type {
 		case domain.AGENT_TYPE_DIAGNOSTIC:
 			confidence = 0.55
-			if containsAny(message, []string{"pod", "node", "workload", "event", "log", "重启", "异常", "pending", "notready", "crashloopbackoff", "调度", "日志"}) {
+			if containsAny(message, []string{"pod", "node", "workload", "deployment", "statefulset", "daemonset", "deploy", "sts", "event", "log", "重启", "异常", "pending", "notready", "crashloopbackoff", "调度", "日志"}) {
 				confidence = 0.88
 				reason = "用户问题匹配集群运行时诊断。"
 			}

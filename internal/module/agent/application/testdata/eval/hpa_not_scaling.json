@@ -6,18 +6,18 @@
     "cluster.hpa.get": {
       "observation": "HPA web-hpa 当前副本 2 / 期望 2,min=2 max=10;目标 cpu 80%;current cpu: <unknown>;condition ScalingActive=False reason FailedGetResourceMetric"
     },
-    "cluster.workload.get": {
+    "cluster.deployment.get": {
       "observation": "Deployment web 容器未设置 resources.requests.cpu"
     }
   },
   "steps": [
     {"content": "看 HPA 状态", "tool_calls": [{"tool": "cluster.hpa.get", "arguments": "{\"namespace\":\"prod\",\"resource_name\":\"web-hpa\"}"}]},
-    {"content": "看目标 Workload 配置", "tool_calls": [{"tool": "cluster.workload.get", "arguments": "{\"namespace\":\"prod\",\"resource_name\":\"web\"}"}]}
+    {"content": "看目标 Deployment 配置", "tool_calls": [{"tool": "cluster.deployment.get", "arguments": "{\"namespace\":\"prod\",\"resource_name\":\"web\"}"}]}
   ],
-  "conclusion": "### 结论\nHPA web-hpa 因目标 Deployment 未设置 cpu requests,无法获取 cpu 指标计算利用率(FailedGetResourceMetric),ScalingActive=False,因此不扩容 [E1][E2]。\n### 证据\n- [E1] hpa.get: condition ScalingActive=False reason FailedGetResourceMetric,current cpu unknown,无法获取指标\n- [E2] workload.get: 容器未设置 resources.requests.cpu\n### 建议\n- 为容器补充 resources.requests.cpu 使 HPA 能计算利用率\n### 准确性提示\n基于 HPA condition,建议确认 metrics-server 是否正常。",
+  "conclusion": "### 结论\nHPA web-hpa 因目标 Deployment 未设置 cpu requests,无法获取 cpu 指标计算利用率(FailedGetResourceMetric),ScalingActive=False,因此不扩容 [E1][E2]。\n### 证据\n- [E1] hpa.get: condition ScalingActive=False reason FailedGetResourceMetric,current cpu unknown,无法获取指标\n- [E2] deployment.get: 容器未设置 resources.requests.cpu\n### 建议\n- 为容器补充 resources.requests.cpu 使 HPA 能计算利用率\n### 准确性提示\n基于 HPA condition,建议确认 metrics-server 是否正常。",
   "expected": {
     "root_cause_keywords": ["requests", "指标"],
-    "expected_tools": ["cluster.hpa.get", "cluster.workload.get"],
+    "expected_tools": ["cluster.hpa.get", "cluster.deployment.get"],
     "must_not": ["镜像拉取", "OOM"]
   }
 }

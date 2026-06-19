@@ -128,6 +128,18 @@ func (e *ToolExecutor) Execute(ctx context.Context, req domain.ToolCallRequest) 
 		return e.listNodes(ctx, clientset)
 	case domain.TOOL_ID_NODE_GET:
 		return e.getNode(ctx, clientset, scope)
+	case domain.TOOL_ID_DEPLOYMENT_GET:
+		return e.getTypedWorkload(ctx, clientset, scope, "deployment")
+	case domain.TOOL_ID_DEPLOYMENT_PODS:
+		return e.listTypedWorkloadPods(ctx, clientset, scope, "deployment")
+	case domain.TOOL_ID_STATEFULSET_GET:
+		return e.getTypedWorkload(ctx, clientset, scope, "statefulset")
+	case domain.TOOL_ID_STATEFULSET_PODS:
+		return e.listTypedWorkloadPods(ctx, clientset, scope, "statefulset")
+	case domain.TOOL_ID_DAEMONSET_GET:
+		return e.getTypedWorkload(ctx, clientset, scope, "daemonset")
+	case domain.TOOL_ID_DAEMONSET_PODS:
+		return e.listTypedWorkloadPods(ctx, clientset, scope, "daemonset")
 	case domain.TOOL_ID_WORKLOAD_GET:
 		return e.getWorkload(ctx, clientset, scope)
 	case domain.TOOL_ID_WORKLOAD_PODS:
@@ -564,9 +576,21 @@ func buildNodeObservation(node corev1.Node, status string) string {
 
 func (e *ToolExecutor) getWorkload(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
 	kind := normalizeWorkloadKind(scope.ResourceKind)
+	return e.getWorkloadByKind(ctx, clientset, scope, kind, true)
+}
+
+func (e *ToolExecutor) getTypedWorkload(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, kind string) (domain.ToolCallResult, error) {
+	kind = normalizeWorkloadKind(kind)
+	return e.getWorkloadByKind(ctx, clientset, withWorkloadKind(scope, kind), kind, false)
+}
+
+func (e *ToolExecutor) getWorkloadByKind(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, kind string, listAllOnEmpty bool) (domain.ToolCallResult, error) {
 	namespace := namespaceOrDefault(scope.Namespace)
 	name := strings.TrimSpace(scope.ResourceName)
 	if name == "" {
+		if !listAllOnEmpty {
+			return e.listWorkloadsByKind(ctx, clientset, scope, kind)
+		}
 		return e.listWorkloads(ctx, clientset, scope)
 	}
 
@@ -574,7 +598,11 @@ func (e *ToolExecutor) getWorkload(ctx context.Context, clientset *kubernetes.Cl
 	if err != nil {
 		return domain.ToolCallResult{}, err
 	}
-	evidence := objectEvidence("workload", "apps", "v1", info.eventKind, namespace, name, info.meta.GetResourceVersion(), info.summary, info.object, false)
+	sourceKind := "workload"
+	if !listAllOnEmpty {
+		sourceKind = kind
+	}
+	evidence := objectEvidence(sourceKind, "apps", "v1", info.eventKind, namespace, name, info.meta.GetResourceVersion(), info.summary, info.object, false)
 	return resultWithEvidence(info.summary, evidence), nil
 }
 
@@ -620,56 +648,78 @@ func (e *ToolExecutor) listWorkloads(ctx context.Context, clientset *kubernetes.
 	items := make([]evidenceSummary, 0)
 	anyTruncated := false
 
-	deployTrunc, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
-		deployments, err := clientset.AppsV1().Deployments(namespace).List(ctx, opts)
+	for _, kind := range []string{"deployment", "statefulset", "daemonset"} {
+		kindItems, truncated, err := listWorkloadSummaries(ctx, clientset, namespace, kind)
 		if err != nil {
-			return 0, "", fmt.Errorf("failed to list deployments: %w", err)
+			return domain.ToolCallResult{}, err
 		}
-		for _, item := range deployments.Items {
-			items = append(items, workloadListSummary("Deployment", item.Namespace, item.Name, item.Status.ReadyReplicas, item.Status.Replicas))
-		}
-		return len(deployments.Items), deployments.Continue, nil
-	})
-	if err != nil {
-		return domain.ToolCallResult{}, err
+		items = append(items, kindItems...)
+		anyTruncated = anyTruncated || truncated
 	}
-	anyTruncated = anyTruncated || deployTrunc
-
-	stsTrunc, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
-		statefulSets, err := clientset.AppsV1().StatefulSets(namespace).List(ctx, opts)
-		if err != nil {
-			return 0, "", fmt.Errorf("failed to list statefulsets: %w", err)
-		}
-		for _, item := range statefulSets.Items {
-			items = append(items, workloadListSummary("StatefulSet", item.Namespace, item.Name, item.Status.ReadyReplicas, item.Status.Replicas))
-		}
-		return len(statefulSets.Items), statefulSets.Continue, nil
-	})
-	if err != nil {
-		return domain.ToolCallResult{}, err
-	}
-	anyTruncated = anyTruncated || stsTrunc
-
-	dsTrunc, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
-		daemonSets, err := clientset.AppsV1().DaemonSets(namespace).List(ctx, opts)
-		if err != nil {
-			return 0, "", fmt.Errorf("failed to list daemonsets: %w", err)
-		}
-		for _, item := range daemonSets.Items {
-			items = append(items, workloadListSummary("DaemonSet", item.Namespace, item.Name, item.Status.NumberReady, item.Status.DesiredNumberScheduled))
-		}
-		return len(daemonSets.Items), daemonSets.Continue, nil
-	})
-	if err != nil {
-		return domain.ToolCallResult{}, err
-	}
-	anyTruncated = anyTruncated || dsTrunc
 
 	summary := fmt.Sprintf("读取到 %d 个工作负载。", len(items)) + truncationNote(anyTruncated)
 	return listResult(summary, items, "workload", "apps", "v1", "Workload", scope.Namespace, "workload-list"), nil
 }
 
+func (e *ToolExecutor) listWorkloadsByKind(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, kind string) (domain.ToolCallResult, error) {
+	kind = normalizeWorkloadKind(kind)
+	namespace := namespaceOrAll(scope.Namespace)
+	items, truncated, err := listWorkloadSummaries(ctx, clientset, namespace, kind)
+	if err != nil {
+		return domain.ToolCallResult{}, err
+	}
+
+	resourceKind := workloadKindToEventKind(kind)
+	summary := fmt.Sprintf("读取到 %d 个 %s。", len(items), resourceKind) + truncationNote(truncated)
+	return listResult(summary, items, kind, "apps", "v1", resourceKind, scope.Namespace, kind+"-list"), nil
+}
+
+func listWorkloadSummaries(ctx context.Context, clientset *kubernetes.Clientset, namespace string, kind string) ([]evidenceSummary, bool, error) {
+	items := make([]evidenceSummary, 0)
+	switch normalizeWorkloadKind(kind) {
+	case "deployment":
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			deployments, err := clientset.AppsV1().Deployments(namespace).List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list deployments: %w", err)
+			}
+			for _, item := range deployments.Items {
+				items = append(items, workloadListSummary("Deployment", item.Namespace, item.Name, item.Status.ReadyReplicas, item.Status.Replicas))
+			}
+			return len(deployments.Items), deployments.Continue, nil
+		})
+		return items, truncated, err
+	case "statefulset":
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			statefulSets, err := clientset.AppsV1().StatefulSets(namespace).List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list statefulsets: %w", err)
+			}
+			for _, item := range statefulSets.Items {
+				items = append(items, workloadListSummary("StatefulSet", item.Namespace, item.Name, item.Status.ReadyReplicas, item.Status.Replicas))
+			}
+			return len(statefulSets.Items), statefulSets.Continue, nil
+		})
+		return items, truncated, err
+	case "daemonset":
+		truncated, err := paginate(ctx, func(ctx context.Context, opts metav1.ListOptions) (int, string, error) {
+			daemonSets, err := clientset.AppsV1().DaemonSets(namespace).List(ctx, opts)
+			if err != nil {
+				return 0, "", fmt.Errorf("failed to list daemonsets: %w", err)
+			}
+			for _, item := range daemonSets.Items {
+				items = append(items, workloadListSummary("DaemonSet", item.Namespace, item.Name, item.Status.NumberReady, item.Status.DesiredNumberScheduled))
+			}
+			return len(daemonSets.Items), daemonSets.Continue, nil
+		})
+		return items, truncated, err
+	default:
+		return nil, false, fmt.Errorf("unsupported workload kind %s", kind)
+	}
+}
+
 func (e *ToolExecutor) listWorkloadPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (domain.ToolCallResult, error) {
+	resourceKind := workloadPodSummaryKind(scope.ResourceKind)
 	selector, namespace, err := e.workloadSelector(ctx, clientset, scope)
 	if err != nil {
 		return domain.ToolCallResult{}, err
@@ -707,9 +757,13 @@ func (e *ToolExecutor) listWorkloadPods(ctx context.Context, clientset *kubernet
 		return domain.ToolCallResult{}, err
 	}
 
-	summary := fmt.Sprintf("读取到工作负载关联 Pod %d 个，其中 %d 个可能异常。", len(items), unhealthy) + truncationNote(truncated)
+	summary := fmt.Sprintf("读取到 %s 关联 Pod %d 个，其中 %d 个可能异常。", resourceKind, len(items), unhealthy) + truncationNote(truncated)
 	observation := buildPodObservation(items, unhealthy) + truncationNote(truncated)
 	return resultWithObservation(summary, observation, listEvidence("pod", "", "v1", "Pod", namespace, "workload-pod-list", summary, items, false)), nil
+}
+
+func (e *ToolExecutor) listTypedWorkloadPods(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope, kind string) (domain.ToolCallResult, error) {
+	return e.listWorkloadPods(ctx, clientset, withWorkloadKind(scope, kind))
 }
 
 func (e *ToolExecutor) workloadSelector(ctx context.Context, clientset *kubernetes.Clientset, scope domain.AgentScope) (labels.Selector, string, error) {
@@ -885,6 +939,11 @@ func namespacedName(scope domain.AgentScope, kind string) (string, string, error
 	return namespace, name, nil
 }
 
+func withWorkloadKind(scope domain.AgentScope, kind string) domain.AgentScope {
+	scope.ResourceKind = normalizeWorkloadKind(kind)
+	return scope
+}
+
 func normalizeWorkloadKind(kind string) string {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	switch kind {
@@ -897,6 +956,14 @@ func normalizeWorkloadKind(kind string) string {
 	default:
 		return kind
 	}
+}
+
+func workloadPodSummaryKind(kind string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(kind))
+	if trimmed == "" || trimmed == "workload" || trimmed == "workloads" {
+		return "工作负载"
+	}
+	return workloadKindToEventKind(normalizeWorkloadKind(trimmed))
 }
 
 func eventMatchesScope(event eventsapi.Event, scope domain.AgentScope) bool {
