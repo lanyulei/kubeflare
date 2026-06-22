@@ -33,6 +33,10 @@ import (
 	clusterkubernetes "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/kubernetes"
 	clusterpostgres "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/postgres"
 	clusterhttp "github.com/lanyulei/kubeflare/internal/module/cluster/interface/http"
+	gitopsapplication "github.com/lanyulei/kubeflare/internal/module/gitops/application"
+	gitopsgitlab "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/gitlab"
+	gitopspostgres "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/postgres"
+	gitopshttp "github.com/lanyulei/kubeflare/internal/module/gitops/interface/http"
 	iamapplication "github.com/lanyulei/kubeflare/internal/module/iam/application"
 	iamdomain "github.com/lanyulei/kubeflare/internal/module/iam/domain"
 	iamauthstate "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/authstate"
@@ -121,6 +125,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	clusterInspector := clusterkubernetes.NewInspector(cfg.Database.QueryTimeout)
 	aiRepo := aipostgres.NewChatRepository(gormDB, cfg.Database.QueryTimeout)
 	agentRepo := agentpostgres.NewAgentRepository(gormDB, cfg.Database.QueryTimeout)
+	gitopsRepo := gitopspostgres.NewRepository(gormDB, cfg.Database.QueryTimeout)
 
 	tokenManager := middleware.NewSignedTokenManagerWithOptions(authSigningKey, cfg.Auth.TokenTTL, cfg.Auth.RefreshTokenTTL, authStateStore)
 	authenticator := middleware.NewSignedTokenAuthenticator(tokenManager, userPrincipalResolver{repo: userRepo})
@@ -154,6 +159,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	uploadService := uploadapplication.NewService(uploadRepo, validator, "/api/v1/upload")
 	clusterService := clusterapplication.NewService(clusterRepo, validator, encryptor, clusterInspector)
 	clusterService.SetCacheInvalidationBus(coordinationClient)
+	gitopsService := gitopsapplication.NewService(gitopsRepo, validator, encryptor, gitopsgitlab.NewChecker(cfg.Database.QueryTimeout))
 	aiService := aiapplication.NewService(aiRepo, validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), logger)
 	aiService.SetEventBus(coordinationClient)
 	agentClientFactory := agentkubeclient.NewFactory(clusterService, 0)
@@ -254,7 +260,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		SessionSemaphore:             coordinationClient,
 	})
 
-	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService, agentService)
+	apiHandler, err := newAPIHandler(cfg, logger, authenticator, iamService, oidcService, uploadService, clusterService, aiService, agentService, gitopsService)
 	if err != nil {
 		return nil, err
 	}
@@ -633,6 +639,7 @@ func newAPIHandler(
 	clusterService *clusterapplication.Service,
 	aiService *aiapplication.Service,
 	agentService *agentapplication.Service,
+	gitopsService *gitopsapplication.Service,
 ) (http.Handler, error) {
 	if cfg.Service.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -684,6 +691,8 @@ func newAPIHandler(
 	aihttp.RegisterRoutes(protectedAPI, aiHandler)
 	agentHandler := agenthttp.NewHandler(agentService)
 	agenthttp.RegisterRoutes(protectedAPI, agentHandler)
+	gitopsHandler := gitopshttp.NewHandler(gitopsService)
+	gitopshttp.RegisterRoutes(protectedAPI, gitopsHandler)
 
 	var handler http.Handler = engine
 	if cfg.HTTP.APIRequestTimeout > 0 {
