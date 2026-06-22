@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS gitops_audit;
+DROP TABLE IF EXISTS gitops_policy_report;
+DROP TABLE IF EXISTS gitops_sync_record;
+DROP TABLE IF EXISTS gitops_release_approval;
+DROP TABLE IF EXISTS gitops_release;
+DROP TABLE IF EXISTS gitops_environment;
+DROP TABLE IF EXISTS gitops_application;
+DROP TABLE IF EXISTS gitops_repository;
+DROP TABLE IF EXISTS gitops_git_provider;
