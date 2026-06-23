@@ -9,6 +9,7 @@ type Config struct {
 	KAPI          KAPIConfig          `koanf:"kapi"`
 	AI            AIConfig            `koanf:"ai"`
 	Agent         AgentConfig         `koanf:"agent"`
+	GitOps        GitOpsConfig        `koanf:"gitops"`
 	Database      DatabaseConfig      `koanf:"database"`
 	Redis         RedisConfig         `koanf:"redis"`
 	Secrets       SecretsConfig       `koanf:"secrets"`
@@ -56,6 +57,30 @@ type KAPIConfig struct {
 	// SPDY upgrade sessions a single authenticated subject may hold open.
 	// 0 disables the cap (not recommended).
 	MaxConcurrentSessionsPerUser int `koanf:"max_concurrent_sessions_per_user"`
+}
+
+// GitOpsConfig 控制 GitOps 模块的后台行为。
+type GitOpsConfig struct {
+	// Actuator 配置"审批通过后写 Git(创建 MR)"的后台执行器。
+	Actuator GitOpsActuatorConfig `koanf:"actuator"`
+	// Webhook 配置 Flux 状态回流入口。
+	Webhook GitOpsWebhookConfig `koanf:"webhook"`
+}
+
+// GitOpsWebhookConfig 控制 Flux notification-controller 的状态回流 webhook。
+type GitOpsWebhookConfig struct {
+	// Secret 是 webhook 的 HMAC-SHA256 验签密钥。为空时 webhook 端点拒绝一切请求
+	// (fail-closed),不影响其余功能。
+	Secret string `koanf:"secret"`
+}
+
+// GitOpsActuatorConfig 控制把已审批(approved)发布单落地为 GitLab MR 的后台 worker。
+type GitOpsActuatorConfig struct {
+	// Enabled 为 true 时启动后台 actuator;默认关闭,关闭时已审批发布单停留在 approved,
+	// 无任何外部副作用(零配置零行为变化)。
+	Enabled bool `koanf:"enabled"`
+	// Interval 是 actuator 扫描 approved 发布单的周期。<=0 时回退到默认值。
+	Interval time.Duration `koanf:"interval"`
 }
 
 type AIConfig struct {
@@ -416,6 +441,12 @@ func Default() Config {
 				Port:         "9090",
 				Scheme:       "http",
 				QueryTimeout: 15 * time.Second,
+			},
+		},
+		GitOps: GitOpsConfig{
+			Actuator: GitOpsActuatorConfig{
+				Enabled:  false,
+				Interval: 30 * time.Second,
 			},
 		},
 		Auth: AuthConfig{

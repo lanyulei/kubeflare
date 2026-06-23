@@ -52,3 +52,11 @@ func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	gitops.GET("/policy-report", handler.ListPolicyReport)
 	gitops.GET("/audit", handler.ListAudit)
 }
+
+// RegisterPublicRoutes 注册无需登录/CSRF 的公开路由。Flux notification-controller 经此
+// 上报调和事件,改用全局 webhook 密钥做 HMAC 验签(在 handler 内部完成),因此不挂任何
+// 认证中间件。
+func RegisterPublicRoutes(group *gin.RouterGroup, handler *Handler) {
+	gitops := group.Group("/gitops")
+	gitops.POST("/webhook/flux", handler.FluxWebhook)
+}

@@ -1,0 +1,2 @@
+ALTER TABLE gitops_environment
+    ADD COLUMN IF NOT EXISTS allow_self_approve BOOLEAN NOT NULL DEFAULT FALSE;

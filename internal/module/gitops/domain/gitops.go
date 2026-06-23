@@ -17,11 +17,35 @@ const (
 const (
 	RELEASE_STATUS_DRAFT            = "draft"
 	RELEASE_STATUS_WAITING_APPROVAL = "waiting_approval"
-	RELEASE_STATUS_SYNCING          = "syncing"
-	RELEASE_STATUS_SUCCEEDED        = "succeeded"
-	RELEASE_STATUS_FAILED           = "failed"
-	RELEASE_STATUS_REJECTED         = "rejected"
-	RELEASE_STATUS_ROLLED_BACK      = "rolled_back"
+	// RELEASE_STATUS_APPROVED 是审批通过后、实际写入 Git(创建 MR)之前的中间态。
+	// 审批事务仅把发布单推进到该状态;真正调用 GitLab API 由后台 actuator 异步完成,
+	// 成功后再推进到 syncing,避免把外部 IO 放进持有行级锁的审批事务。
+	RELEASE_STATUS_APPROVED    = "approved"
+	RELEASE_STATUS_SYNCING     = "syncing"
+	RELEASE_STATUS_SUCCEEDED   = "succeeded"
+	RELEASE_STATUS_FAILED      = "failed"
+	RELEASE_STATUS_REJECTED    = "rejected"
+	RELEASE_STATUS_ROLLED_BACK = "rolled_back"
+)
+
+// 发布单状态机的合法前置状态集合。仓储层在事务内对发布单加行级锁后,仅当当前状态命中
+// 对应集合才允许推进,从而在并发场景下拒绝非法/重复的状态跃迁(如对已拒绝单再次审批、
+// 对草稿单回滚)。集中定义便于 service 与仓储共享同一套规则。
+var (
+	// ReleaseSubmitFrom 允许提交的源状态:仅草稿。提交只负责把草稿推进到待审批,
+	// 不直接进入同步——进入同步(syncing)的唯一入口是审批通过(ApproveRelease),
+	// 以此杜绝提交绕过审批人的越权同步。
+	ReleaseSubmitFrom = []string{RELEASE_STATUS_DRAFT}
+	// ReleaseApprovalFrom 允许审批(通过/拒绝)的源状态:仅待审批。
+	ReleaseApprovalFrom = []string{RELEASE_STATUS_WAITING_APPROVAL}
+	// ReleaseActuateFrom 允许 actuator 推进的源状态:仅已审批。后台 actuator 创建 MR
+	// 成功后据此把 approved 推进到 syncing,行级锁 + 该集合保证多副本下只推进一次。
+	ReleaseActuateFrom = []string{RELEASE_STATUS_APPROVED}
+	// ReleaseFinalizeFrom 允许 Flux 状态回流推进终态的源状态:仅同步中。webhook 据此把
+	// syncing 推进到 succeeded/failed,行级锁 + 该集合保证同一事件重复投递只落库一次。
+	ReleaseFinalizeFrom = []string{RELEASE_STATUS_SYNCING}
+	// ReleaseRollbackFrom 允许回滚的源状态:已审批(待写 Git)或已进入/完成同步的发布单。
+	ReleaseRollbackFrom = []string{RELEASE_STATUS_APPROVED, RELEASE_STATUS_SYNCING, RELEASE_STATUS_SUCCEEDED, RELEASE_STATUS_FAILED}
 )
 
 const (
@@ -53,6 +77,18 @@ const (
 	AUDIT_ACTION_ROLLBACK = "rollback"
 	AUDIT_ACTION_TEST     = "test"
 )
+
+// 审计/同步记录中的资源类型,集中定义避免散落的字符串字面量导致 typo 后审计查询漏数据。
+const (
+	RESOURCE_TYPE_PROVIDER    = "provider"
+	RESOURCE_TYPE_REPOSITORY  = "repository"
+	RESOURCE_TYPE_APPLICATION = "application"
+	RESOURCE_TYPE_ENVIRONMENT = "environment"
+	RESOURCE_TYPE_RELEASE     = "release"
+)
+
+// SYNC_PROVIDER_FLUX 标记同步记录由 Flux 执行,当前仅支持 Flux 一种 GitOps 引擎。
+const SYNC_PROVIDER_FLUX = "flux"
 
 type Provider struct {
 	ID            string     `json:"id"`
@@ -117,6 +153,7 @@ type Environment struct {
 	FluxKustomization  string       `json:"flux_kustomization,omitempty"`
 	FluxHelmRelease    string       `json:"flux_helm_release,omitempty"`
 	AutoApprove        bool         `json:"auto_approve"`
+	AllowSelfApprove   bool         `json:"allow_self_approve"`
 	RequireSignedImage bool         `json:"require_signed_image"`
 	Status             int          `json:"status"`
 	CreatedAt          time.Time    `json:"created_at"`

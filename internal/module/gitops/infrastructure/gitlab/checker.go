@@ -2,6 +2,8 @@ package gitlab
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,7 +17,8 @@ import (
 const defaultCheckTimeout = 8 * time.Second
 
 type Checker struct {
-	client *http.Client
+	client  *http.Client
+	timeout time.Duration
 }
 
 type versionResponse struct {
@@ -27,16 +30,25 @@ func NewChecker(timeout time.Duration) *Checker {
 		timeout = defaultCheckTimeout
 	}
 	return &Checker{
-		client: &http.Client{Timeout: timeout},
+		client:  &http.Client{Timeout: timeout},
+		timeout: timeout,
 	}
 }
 
-func (c *Checker) Check(ctx context.Context, baseURL string, token string) (application.ProviderTestResult, error) {
+func (c *Checker) Check(ctx context.Context, baseURL string, token string, caBundle string) (application.ProviderTestResult, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	parsed, err := url.Parse(baseURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return application.ProviderTestResult{Reachable: false, Message: "GitLab 地址无效"}, fmt.Errorf("invalid gitlab base url")
 	}
+
+	// 提供了自定义 CA 时按需构造带该信任根的客户端,使自签证书的 GitLab 连接测试可用;
+	// 未提供则复用默认客户端。
+	client, err := c.clientFor(caBundle)
+	if err != nil {
+		return application.ProviderTestResult{Reachable: false, Message: err.Error()}, err
+	}
+
 	endpoint := baseURL + "/api/v4/version"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -46,7 +58,7 @@ func (c *Checker) Check(ctx context.Context, baseURL string, token string) (appl
 		req.Header.Set("PRIVATE-TOKEN", strings.TrimSpace(token))
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return application.ProviderTestResult{Reachable: false, Message: err.Error()}, err
 	}
@@ -67,5 +79,29 @@ func (c *Checker) Check(ctx context.Context, baseURL string, token string) (appl
 		Reachable: true,
 		Message:   message,
 		Version:   strings.TrimSpace(version.Version),
+	}, nil
+}
+
+// clientFor 在提供自定义 CA 证书时返回信任该 CA 的临时客户端,否则复用默认客户端。
+func (c *Checker) clientFor(caBundle string) (*http.Client, error) {
+	return clientForCABundle(c.client, c.timeout, caBundle)
+}
+
+// clientForCABundle 是 Checker/MergeRequester 共享的客户端选择逻辑:无自定义 CA 时复用
+// 传入的默认客户端,否则构造一个信任该 CA 的临时客户端(用于自签证书的 GitLab)。
+func clientForCABundle(defaultClient *http.Client, timeout time.Duration, caBundle string) (*http.Client, error) {
+	caBundle = strings.TrimSpace(caBundle)
+	if caBundle == "" {
+		return defaultClient, nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(caBundle)) {
+		return nil, fmt.Errorf("invalid CA bundle")
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
 	}, nil
 }

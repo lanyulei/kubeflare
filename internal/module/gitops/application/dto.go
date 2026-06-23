@@ -1,5 +1,12 @@
 package application
 
+// Page 是各列表接口的统一分页结果:Items 为当前页数据,Total 为符合过滤条件的总数。
+// 复用同一结构,避免在多个 service/handler 重复定义列表返回形态。
+type Page[T any] struct {
+	Items []T   `json:"items"`
+	Total int64 `json:"total"`
+}
+
 type ListQuery struct {
 	Keyword       string `form:"keyword"`
 	ProviderID    string `form:"provider_id"`
@@ -69,6 +76,7 @@ type CreateEnvironmentRequest struct {
 	FluxKustomization  string `json:"flux_kustomization" validate:"omitempty,max=128"`
 	FluxHelmRelease    string `json:"flux_helm_release" validate:"omitempty,max=128"`
 	AutoApprove        bool   `json:"auto_approve"`
+	AllowSelfApprove   bool   `json:"allow_self_approve"`
 	RequireSignedImage bool   `json:"require_signed_image"`
 	Status             *int   `json:"status" validate:"omitempty,oneof=0 1"`
 }
