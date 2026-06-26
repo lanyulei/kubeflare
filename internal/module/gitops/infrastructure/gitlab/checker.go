@@ -30,9 +30,34 @@ func NewChecker(timeout time.Duration) *Checker {
 		timeout = defaultCheckTimeout
 	}
 	return &Checker{
-		client:  &http.Client{Timeout: timeout},
+		client:  newGitLabClient(timeout),
 		timeout: timeout,
 	}
+}
+
+// newGitLabClient 构造对外访问 GitLab 的 HTTP 客户端,统一禁止跨主机重定向:即便创建时
+// 校验过的 baseURL 合法,GitLab 一个 302 跳到云厂商元数据端点(或 DNS rebinding)也会被
+// 这里拦下,收敛 SSRF 面。同源重定向(如尾斜杠归一)仍放行。
+func newGitLabClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: rejectCrossHostRedirect,
+	}
+}
+
+// rejectCrossHostRedirect 仅允许目标主机与上一跳相同的重定向,跨主机一律拒绝。
+func rejectCrossHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if !strings.EqualFold(req.URL.Hostname(), via[len(via)-1].URL.Hostname()) {
+		return fmt.Errorf("cross-host redirect to %q is not allowed", req.URL.Hostname())
+	}
+	// 沿用标准库默认的 10 跳上限,避免重定向环。
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	return nil
 }
 
 func (c *Checker) Check(ctx context.Context, baseURL string, token string, caBundle string) (application.ProviderTestResult, error) {
@@ -99,7 +124,8 @@ func clientForCABundle(defaultClient *http.Client, timeout time.Duration, caBund
 		return nil, fmt.Errorf("invalid CA bundle")
 	}
 	return &http.Client{
-		Timeout: timeout,
+		Timeout:       timeout,
+		CheckRedirect: rejectCrossHostRedirect,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 		},

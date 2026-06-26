@@ -56,9 +56,15 @@ type Service struct {
 	checker   ProviderChecker
 
 	// 以下为可选依赖,经 SetXxx 注入(保持 NewService 签名稳定);未注入时相关能力降级。
-	actuator  ReleaseActuator       // 写 Git(创建 MR)执行器;nil 时 actuator worker 跳过处理。
-	semaphore sharedcoord.Semaphore // 跨实例准入,保证同一发布单只被一个副本 actuate。
-	logger    *slog.Logger          // actuator 后台流程日志。
+	actuator   ReleaseActuator       // 写 Git(创建 MR)执行器;nil 时 actuator worker 跳过处理。
+	semaphore  sharedcoord.Semaphore // 跨实例准入,保证同一发布单只被一个副本 actuate。
+	logger     *slog.Logger          // actuator 后台流程日志。
+	signatureV SignatureVerifier     // 镜像签名校验器;nil 时按未启用降级(仅校验 digest 格式)。
+	policyGate PolicyGate            // 策略门禁;nil 时按未启用降级(放行)。
+
+	// actuator 卡死清理的超时阈值,经 SetActuatorTimeouts 注入;<=0 表示不启用对应扫描。
+	mergePendingTimeout time.Duration
+	syncingTimeout      time.Duration
 }
 
 func NewService(repo domain.Repository, validator *validator.Validate, encryptor secrets.Encryptor, checker ProviderChecker) *Service {
@@ -86,6 +92,22 @@ func (s *Service) SetSemaphore(semaphore sharedcoord.Semaphore) {
 // SetLogger 注入日志器,供后台 actuator 流程记录告警/进度。
 func (s *Service) SetLogger(logger *slog.Logger) {
 	s.logger = logger
+}
+
+// SetSignatureVerifier 注入镜像签名校验器。未注入时签名校验降级为仅校验 digest 格式。
+func (s *Service) SetSignatureVerifier(verifier SignatureVerifier) {
+	s.signatureV = verifier
+}
+
+// SetPolicyGate 注入策略门禁。未注入时策略评估降级为放行(不阻断发布)。
+func (s *Service) SetPolicyGate(gate PolicyGate) {
+	s.policyGate = gate
+}
+
+// SetActuatorTimeouts 注入卡死清理的超时阈值。<=0 表示不启用对应状态的清理。
+func (s *Service) SetActuatorTimeouts(mergePending time.Duration, syncing time.Duration) {
+	s.mergePendingTimeout = mergePending
+	s.syncingTimeout = syncing
 }
 
 func (s *Service) Dashboard(ctx context.Context) (domain.DashboardStats, error) {
@@ -160,12 +182,18 @@ func (s *Service) UpdateProvider(ctx context.Context, id string, req UpdateProvi
 	if err != nil {
 		return domain.Provider{}, mapRepositoryError(err, "git provider not found")
 	}
-
-	existing.Name = strings.TrimSpace(req.Name)
-	existing.BaseURL = normalizeURL(req.BaseURL)
-	existing.CABundle = strings.TrimSpace(req.CABundle)
-	existing.Status = normalizeStatus(req.Status, existing.Status)
-	existing.Remarks = strings.TrimSpace(req.Remarks)
+	// 读出时的 updated_at 作为乐观锁期望值,落库前若被并发改动则返回 409。
+	expectedUpdatedAt := existing.UpdatedAt
+	diff := newDiff()
+	diff.applyString("name", &existing.Name, req.Name)
+	diff.applyString("base_url", &existing.BaseURL, normalizeURL(req.BaseURL))
+	// CA bundle 非敏感凭证但体积大,diff 仅记是否变更(掩码比较),不落明文。
+	if maskSecret(existing.CABundle) != maskSecret(strings.TrimSpace(req.CABundle)) {
+		diff.changed("ca_bundle")
+		existing.CABundle = strings.TrimSpace(req.CABundle)
+	}
+	diff.applyInt("status", &existing.Status, normalizeStatus(req.Status, existing.Status))
+	diff.applyString("remarks", &existing.Remarks, req.Remarks)
 	existing.UpdatedAt = time.Now().UTC()
 
 	if strings.TrimSpace(req.Token) != "" {
@@ -173,15 +201,17 @@ func (s *Service) UpdateProvider(ctx context.Context, id string, req UpdateProvi
 		if err != nil {
 			return domain.Provider{}, err
 		}
+		diff.changed("token")
 	}
 	if strings.TrimSpace(req.WebhookSecret) != "" {
 		existing.WebhookSecret, err = s.encryptSecret(req.WebhookSecret)
 		if err != nil {
 			return domain.Provider{}, err
 		}
+		diff.changed("webhook_secret")
 	}
 
-	updated, _, err := s.repo.UpdateProvider(ctx, existing, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_PROVIDER, providerID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitLab Provider", nil))
+	updated, _, err := s.repo.UpdateProvider(ctx, existing, expectedUpdatedAt, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_PROVIDER, providerID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitLab Provider", diff.result()))
 	if err != nil {
 		return domain.Provider{}, mapRepositoryError(err, "git provider not found")
 	}
@@ -249,7 +279,8 @@ func (s *Service) TestProvider(ctx context.Context, id string, operatorID string
 		auditResult = AUDIT_RESULT_FAILED
 	}
 	// 仅写库失败才作为 error 上抛:此时连通性结果仍有效,但持久化未成功,需让调用方感知。
-	if _, _, err := s.repo.UpdateProvider(ctx, provider, newAudit(domain.AUDIT_ACTION_TEST, domain.RESOURCE_TYPE_PROVIDER, providerID, operatorID, auditResult, result.Message, nil)); err != nil {
+	// 传零值期望时间跳过乐观锁:本次仅回填 last_check_*,与配置编辑并发也不应互相阻断。
+	if _, _, err := s.repo.UpdateProvider(ctx, provider, time.Time{}, newAudit(domain.AUDIT_ACTION_TEST, domain.RESOURCE_TYPE_PROVIDER, providerID, operatorID, auditResult, result.Message, nil)); err != nil {
 		return result, mapRepositoryError(err, "git provider not found")
 	}
 	return result, nil
@@ -295,16 +326,18 @@ func (s *Service) UpdateGitRepository(ctx context.Context, id string, req Update
 	if err != nil {
 		return domain.GitRepository{}, mapRepositoryError(err, "git repository not found")
 	}
-	repository.ProviderID = strings.TrimSpace(req.ProviderID)
-	repository.ProjectID = strings.TrimSpace(req.ProjectID)
-	repository.Name = strings.TrimSpace(req.Name)
-	repository.Path = strings.TrimSpace(req.Path)
-	repository.DefaultRef = strings.TrimSpace(req.DefaultRef)
-	repository.WebURL = strings.TrimSpace(req.WebURL)
-	repository.Status = normalizeStatus(req.Status, repository.Status)
-	repository.Remarks = strings.TrimSpace(req.Remarks)
+	expectedUpdatedAt := repository.UpdatedAt
+	diff := newDiff()
+	diff.applyString("provider_id", &repository.ProviderID, req.ProviderID)
+	diff.applyString("project_id", &repository.ProjectID, req.ProjectID)
+	diff.applyString("name", &repository.Name, req.Name)
+	diff.applyString("path", &repository.Path, req.Path)
+	diff.applyString("default_ref", &repository.DefaultRef, req.DefaultRef)
+	diff.applyString("web_url", &repository.WebURL, req.WebURL)
+	diff.applyInt("status", &repository.Status, normalizeStatus(req.Status, repository.Status))
+	diff.applyString("remarks", &repository.Remarks, req.Remarks)
 	repository.UpdatedAt = time.Now().UTC()
-	updated, _, err := s.repo.UpdateGitRepository(ctx, repository, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_REPOSITORY, repositoryID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 仓库", nil))
+	updated, _, err := s.repo.UpdateGitRepository(ctx, repository, expectedUpdatedAt, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_REPOSITORY, repositoryID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 仓库", diff.result()))
 	if err != nil {
 		return domain.GitRepository{}, mapRepositoryError(err, "git repository not found")
 	}
@@ -381,17 +414,19 @@ func (s *Service) UpdateApplication(ctx context.Context, id string, req UpdateAp
 	if err != nil {
 		return domain.Application{}, mapRepositoryError(err, "application not found")
 	}
-	application.RepositoryID = strings.TrimSpace(req.RepositoryID)
-	application.Name = strings.TrimSpace(req.Name)
-	application.DisplayName = strings.TrimSpace(req.DisplayName)
-	application.Description = strings.TrimSpace(req.Description)
-	application.Owner = strings.TrimSpace(req.Owner)
-	application.ManifestPath = strings.TrimSpace(req.ManifestPath)
-	application.ImageRepo = strings.TrimSpace(req.ImageRepo)
-	application.RenderType = strings.TrimSpace(req.RenderType)
-	application.Status = normalizeStatus(req.Status, application.Status)
+	expectedUpdatedAt := application.UpdatedAt
+	diff := newDiff()
+	diff.applyString("repository_id", &application.RepositoryID, req.RepositoryID)
+	diff.applyString("name", &application.Name, req.Name)
+	diff.applyString("display_name", &application.DisplayName, req.DisplayName)
+	diff.applyString("description", &application.Description, req.Description)
+	diff.applyString("owner", &application.Owner, req.Owner)
+	diff.applyString("manifest_path", &application.ManifestPath, req.ManifestPath)
+	diff.applyString("image_repo", &application.ImageRepo, req.ImageRepo)
+	diff.applyString("render_type", &application.RenderType, req.RenderType)
+	diff.applyInt("status", &application.Status, normalizeStatus(req.Status, application.Status))
 	application.UpdatedAt = time.Now().UTC()
-	updated, _, err := s.repo.UpdateApplication(ctx, application, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_APPLICATION, applicationID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 应用", nil))
+	updated, _, err := s.repo.UpdateApplication(ctx, application, expectedUpdatedAt, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_APPLICATION, applicationID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 应用", diff.result()))
 	if err != nil {
 		return domain.Application{}, mapRepositoryError(err, "application not found")
 	}
@@ -463,21 +498,23 @@ func (s *Service) UpdateEnvironment(ctx context.Context, id string, req UpdateEn
 	if err != nil {
 		return domain.Environment{}, mapRepositoryError(err, "environment not found")
 	}
-	environment.ApplicationID = strings.TrimSpace(req.ApplicationID)
-	environment.Name = strings.TrimSpace(req.Name)
-	environment.Tier = strings.TrimSpace(req.Tier)
-	environment.ClusterID = strings.TrimSpace(req.ClusterID)
-	environment.Namespace = strings.TrimSpace(req.Namespace)
-	environment.OverlayPath = strings.TrimSpace(req.OverlayPath)
-	environment.FluxNamespace = strings.TrimSpace(req.FluxNamespace)
-	environment.FluxKustomization = strings.TrimSpace(req.FluxKustomization)
-	environment.FluxHelmRelease = strings.TrimSpace(req.FluxHelmRelease)
-	environment.AutoApprove = req.AutoApprove
-	environment.AllowSelfApprove = req.AllowSelfApprove
-	environment.RequireSignedImage = req.RequireSignedImage
-	environment.Status = normalizeStatus(req.Status, environment.Status)
+	expectedUpdatedAt := environment.UpdatedAt
+	diff := newDiff()
+	diff.applyString("application_id", &environment.ApplicationID, req.ApplicationID)
+	diff.applyString("name", &environment.Name, req.Name)
+	diff.applyString("tier", &environment.Tier, req.Tier)
+	diff.applyString("cluster_id", &environment.ClusterID, req.ClusterID)
+	diff.applyString("namespace", &environment.Namespace, req.Namespace)
+	diff.applyString("overlay_path", &environment.OverlayPath, req.OverlayPath)
+	diff.applyString("flux_namespace", &environment.FluxNamespace, req.FluxNamespace)
+	diff.applyString("flux_kustomization", &environment.FluxKustomization, req.FluxKustomization)
+	diff.applyString("flux_helm_release", &environment.FluxHelmRelease, req.FluxHelmRelease)
+	diff.applyBool("auto_approve", &environment.AutoApprove, req.AutoApprove)
+	diff.applyBool("allow_self_approve", &environment.AllowSelfApprove, req.AllowSelfApprove)
+	diff.applyBool("require_signed_image", &environment.RequireSignedImage, req.RequireSignedImage)
+	diff.applyInt("status", &environment.Status, normalizeStatus(req.Status, environment.Status))
 	environment.UpdatedAt = time.Now().UTC()
-	updated, _, err := s.repo.UpdateEnvironment(ctx, environment, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_ENVIRONMENT, environmentID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 环境", nil))
+	updated, _, err := s.repo.UpdateEnvironment(ctx, environment, expectedUpdatedAt, newAudit(domain.AUDIT_ACTION_UPDATE, domain.RESOURCE_TYPE_ENVIRONMENT, environmentID, operatorID, AUDIT_RESULT_SUCCESS, "更新 GitOps 环境", diff.result()))
 	if err != nil {
 		return domain.Environment{}, mapRepositoryError(err, "environment not found")
 	}
@@ -498,218 +535,6 @@ func (s *Service) DeleteEnvironment(ctx context.Context, id string, operatorID s
 		return mapRepositoryError(err, "environment not found")
 	}
 	return nil
-}
-
-func (s *Service) ListReleases(ctx context.Context, query ListQuery) (Page[domain.Release], error) {
-	return toPage(s.repo.ListReleases(ctx, toListOptions(query)))
-}
-
-func (s *Service) GetRelease(ctx context.Context, id string) (domain.Release, error) {
-	release, err := s.repo.GetRelease(ctx, strings.TrimSpace(id))
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return release, nil
-}
-
-func (s *Service) CreateRelease(ctx context.Context, req CreateReleaseRequest, operatorID string) (domain.Release, error) {
-	if err := s.validator.Struct(req); err != nil {
-		return domain.Release{}, err
-	}
-	application, err := s.repo.GetApplication(ctx, strings.TrimSpace(req.ApplicationID))
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "application not found")
-	}
-	environment, err := s.repo.GetEnvironment(ctx, strings.TrimSpace(req.EnvironmentID))
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "environment not found")
-	}
-	if environment.ApplicationID != application.ID {
-		return domain.Release{}, badRequest("environment does not belong to application")
-	}
-	// 禁用的应用/环境不允许发起发布,避免对已下线目标产生变更。
-	if application.Status == domain.STATUS_DISABLED {
-		return domain.Release{}, conflict("application is disabled")
-	}
-	if environment.Status == domain.STATUS_DISABLED {
-		return domain.Release{}, conflict("environment is disabled")
-	}
-
-	now := time.Now().UTC()
-	// 普通路径创建为草稿,需经 SubmitRelease 提交、ApproveRelease 审批后方可进入同步,
-	// 让 draft → waiting_approval → syncing 三段式状态机各环节都不可跳过。
-	status := domain.RELEASE_STATUS_DRAFT
-	message := "发布单已创建（草稿），等待提交审批"
-	if environment.AutoApprove {
-		// 自动审批同样进入 approved 中间态,统一由后台 actuator 创建 MR 后再推进 syncing,
-		// 让"写 Git"只有一条路径(避免自动/人工两套同步入口)。
-		status = domain.RELEASE_STATUS_APPROVED
-		message = "环境启用自动审批，等待创建 MR"
-	}
-	releaseID := newID("gitops-release")
-	audits := []domain.Audit{newAudit(domain.AUDIT_ACTION_CREATE, domain.RESOURCE_TYPE_RELEASE, releaseID, operatorID, AUDIT_RESULT_SUCCESS, "创建 GitOps 发布单", nil)}
-
-	// 自动审批时补记一条系统审批与审计,保证「谁批准」可追溯,避免审批链路断档。
-	var approval *domain.ReleaseApproval
-	if environment.AutoApprove {
-		approval = &domain.ReleaseApproval{
-			ID:         newID("gitops-approval"),
-			ReleaseID:  releaseID,
-			ApproverID: AUTO_APPROVER_ID,
-			Status:     domain.APPROVAL_STATUS_APPROVED,
-			Comment:    "环境启用自动审批，系统自动通过",
-			CreatedAt:  now,
-		}
-		audits = append(audits, newAudit(domain.AUDIT_ACTION_APPROVE, domain.RESOURCE_TYPE_RELEASE, releaseID, AUTO_APPROVER_ID, AUDIT_RESULT_SUCCESS, "自动审批通过 GitOps 发布单", nil))
-	}
-
-	release, _, err := s.repo.CreateRelease(ctx, domain.Release{
-		ID:             releaseID,
-		ApplicationID:  application.ID,
-		EnvironmentID:  environment.ID,
-		Title:          strings.TrimSpace(req.Title),
-		SourceRef:      strings.TrimSpace(req.SourceRef),
-		TargetRevision: strings.TrimSpace(req.TargetRevision),
-		ImageDigest:    strings.TrimSpace(req.ImageDigest),
-		Status:         status,
-		Reason:         strings.TrimSpace(req.Reason),
-		OperatorID:     strings.TrimSpace(operatorID),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}, domain.SyncRecord{
-		ID:                newID("gitops-sync"),
-		ApplicationID:     application.ID,
-		EnvironmentID:     environment.ID,
-		ReleaseID:         releaseID,
-		Provider:          domain.SYNC_PROVIDER_FLUX,
-		ResourceNamespace: environment.FluxNamespace,
-		ResourceName:      syncResourceName(environment),
-		Revision:          strings.TrimSpace(req.TargetRevision),
-		Status:            domain.SYNC_STATUS_PENDING,
-		Message:           message,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}, approval, audits)
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return release, nil
-}
-
-func (s *Service) SubmitRelease(ctx context.Context, id string, operatorID string) (domain.Release, error) {
-	return s.moveRelease(ctx, id, operatorID, domain.AUDIT_ACTION_SUBMIT, domain.RELEASE_STATUS_WAITING_APPROVAL, domain.ReleaseSubmitFrom, "发布单已提交，等待审批")
-}
-
-func (s *Service) ApproveRelease(ctx context.Context, id string, req ReleaseActionRequest, operatorID string) (domain.ReleaseApproval, domain.Release, error) {
-	if err := s.validator.Struct(req); err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, err
-	}
-	releaseID := strings.TrimSpace(id)
-	release, err := s.repo.GetRelease(ctx, releaseID)
-	if err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	if release.Status != domain.RELEASE_STATUS_WAITING_APPROVAL {
-		return domain.ReleaseApproval{}, domain.Release{}, badRequest("release is not waiting approval")
-	}
-	// 四眼原则:默认禁止发布单创建者审批自己的发布单,除非所属环境显式放行
-	// (AllowSelfApprove)。读取环境失败不阻断——降级为不做自审批校验,避免审批被
-	// 环境查询故障连带阻塞;环境正常时严格执行。
-	if approverID := strings.TrimSpace(operatorID); approverID != "" && approverID == strings.TrimSpace(release.OperatorID) {
-		if environment, envErr := s.repo.GetEnvironment(ctx, release.EnvironmentID); envErr == nil && !environment.AllowSelfApprove {
-			return domain.ReleaseApproval{}, domain.Release{}, forbidden("approver cannot approve own release")
-		}
-	}
-	now := time.Now().UTC()
-	// 审批仅推进到 approved 中间态;真正写 Git(创建 MR)由后台 actuator 异步完成,
-	// 成功后再推进 syncing,避免把外部 GitLab 调用放进持有行级锁的审批事务。
-	release.Status = domain.RELEASE_STATUS_APPROVED
-	release.UpdatedAt = now
-	approval, updated, _, err := s.repo.CreateReleaseApproval(ctx, domain.ReleaseApproval{
-		ID:         newID("gitops-approval"),
-		ReleaseID:  releaseID,
-		ApproverID: strings.TrimSpace(operatorID),
-		Status:     domain.APPROVAL_STATUS_APPROVED,
-		Comment:    strings.TrimSpace(req.Comment),
-		CreatedAt:  now,
-	}, release, domain.SyncRecord{
-		ID:            newID("gitops-sync"),
-		ApplicationID: release.ApplicationID,
-		EnvironmentID: release.EnvironmentID,
-		ReleaseID:     release.ID,
-		Provider:      domain.SYNC_PROVIDER_FLUX,
-		Revision:      release.TargetRevision,
-		Status:        domain.SYNC_STATUS_PENDING,
-		Message:       "审批通过，等待创建 MR",
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}, domain.ReleaseApprovalFrom, newAudit(domain.AUDIT_ACTION_APPROVE, domain.RESOURCE_TYPE_RELEASE, releaseID, operatorID, AUDIT_RESULT_SUCCESS, "审批通过 GitOps 发布单", nil))
-	if err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return approval, updated, nil
-}
-
-func (s *Service) RejectRelease(ctx context.Context, id string, req ReleaseActionRequest, operatorID string) (domain.ReleaseApproval, domain.Release, error) {
-	if err := s.validator.Struct(req); err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, err
-	}
-	releaseID := strings.TrimSpace(id)
-	release, err := s.repo.GetRelease(ctx, releaseID)
-	if err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	if release.Status != domain.RELEASE_STATUS_WAITING_APPROVAL {
-		return domain.ReleaseApproval{}, domain.Release{}, badRequest("release is not waiting approval")
-	}
-	now := time.Now().UTC()
-	release.Status = domain.RELEASE_STATUS_REJECTED
-	release.UpdatedAt = now
-	release.CompletedAt = &now
-	approval, updated, _, err := s.repo.CreateReleaseApproval(ctx, domain.ReleaseApproval{
-		ID:         newID("gitops-approval"),
-		ReleaseID:  releaseID,
-		ApproverID: strings.TrimSpace(operatorID),
-		Status:     domain.APPROVAL_STATUS_REJECTED,
-		Comment:    strings.TrimSpace(req.Comment),
-		CreatedAt:  now,
-	}, release, domain.SyncRecord{
-		ID:            newID("gitops-sync"),
-		ApplicationID: release.ApplicationID,
-		EnvironmentID: release.EnvironmentID,
-		ReleaseID:     release.ID,
-		Provider:      domain.SYNC_PROVIDER_FLUX,
-		Revision:      release.TargetRevision,
-		Status:        domain.SYNC_STATUS_FAILED,
-		Message:       "发布审批已拒绝",
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}, domain.ReleaseApprovalFrom, newAudit(domain.AUDIT_ACTION_REJECT, domain.RESOURCE_TYPE_RELEASE, releaseID, operatorID, AUDIT_RESULT_SUCCESS, "拒绝 GitOps 发布单", nil))
-	if err != nil {
-		return domain.ReleaseApproval{}, domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return approval, updated, nil
-}
-
-func (s *Service) RollbackRelease(ctx context.Context, id string, req RollbackReleaseRequest, operatorID string) (domain.Release, error) {
-	if err := s.validator.Struct(req); err != nil {
-		return domain.Release{}, err
-	}
-	releaseID := strings.TrimSpace(id)
-	release, err := s.repo.GetRelease(ctx, releaseID)
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	now := time.Now().UTC()
-	release.Status = domain.RELEASE_STATUS_ROLLED_BACK
-	release.Reason = strings.TrimSpace(req.Reason)
-	release.UpdatedAt = now
-	release.CompletedAt = &now
-	updated, err := s.repo.UpdateRelease(ctx, release, domain.ReleaseRollbackFrom, newAudit(domain.AUDIT_ACTION_ROLLBACK, domain.RESOURCE_TYPE_RELEASE, releaseID, operatorID, AUDIT_RESULT_SUCCESS, "创建回滚记录", nil))
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return updated, nil
 }
 
 func (s *Service) ListSyncRecords(ctx context.Context, query ListQuery) (Page[domain.SyncRecord], error) {
@@ -744,21 +569,6 @@ func (s *Service) ensureNoChildren(ctx context.Context, checks ...childCheck) er
 		}
 	}
 	return nil
-}
-
-func (s *Service) moveRelease(ctx context.Context, id string, operatorID string, action string, status string, expect []string, message string) (domain.Release, error) {
-	releaseID := strings.TrimSpace(id)
-	release, err := s.repo.GetRelease(ctx, releaseID)
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	release.Status = status
-	release.UpdatedAt = time.Now().UTC()
-	updated, err := s.repo.UpdateRelease(ctx, release, expect, newAudit(action, domain.RESOURCE_TYPE_RELEASE, releaseID, operatorID, AUDIT_RESULT_SUCCESS, message, nil))
-	if err != nil {
-		return domain.Release{}, mapRepositoryError(err, "release not found")
-	}
-	return updated, nil
 }
 
 // toPage 把仓储层 (items, total, err) 三元组收敛为统一的 Page 结果,消除各列表方法的重复包装。
@@ -886,6 +696,70 @@ func (s *Service) decryptSecret(value string) (string, error) {
 	return decrypted, nil
 }
 
+// auditDiff 累积一次更新的字段级前后变更,落入审计 Diff(jsonb),使配置变更可追溯到字段。
+// 敏感字段不记明文,改用 changed(field) 仅标记"已变更"。
+type auditDiff struct {
+	changes map[string]any
+}
+
+func newDiff() *auditDiff {
+	return &auditDiff{changes: map[string]any{}}
+}
+
+// changed 标记敏感字段已变更但不记录其值(token/secret/ca 等)。
+func (d *auditDiff) changed(field string) {
+	d.changes[field] = map[string]any{"changed": true}
+}
+
+// applyString 记录字段变更并就地更新目标:把 *target 与 next(去空白)比较,不同则记入 diff
+// 并赋值。返回是否发生变更。把"记录 diff + 字段赋值"两行样板收敛为一次调用,消除各
+// UpdateXxx 方法里成对重复的字段维护代码。
+func (d *auditDiff) applyString(field string, target *string, next string) bool {
+	next = strings.TrimSpace(next)
+	if *target == next {
+		return false
+	}
+	d.changes[field] = map[string]any{"old": *target, "new": next}
+	*target = next
+	return true
+}
+
+// applyInt 同 applyString,用于 int 标量字段(如 status)。
+func (d *auditDiff) applyInt(field string, target *int, next int) bool {
+	if *target == next {
+		return false
+	}
+	d.changes[field] = map[string]any{"old": *target, "new": next}
+	*target = next
+	return true
+}
+
+// applyBool 同 applyString,用于 bool 标量字段(如 auto_approve)。
+func (d *auditDiff) applyBool(field string, target *bool, next bool) bool {
+	if *target == next {
+		return false
+	}
+	d.changes[field] = map[string]any{"old": *target, "new": next}
+	*target = next
+	return true
+}
+
+// result 返回累积的变更;无变更时返回 nil(domain 层 omitempty 省略)。
+func (d *auditDiff) result() map[string]any {
+	if len(d.changes) == 0 {
+		return nil
+	}
+	return d.changes
+}
+
+// maskSecret 把敏感值归一为是否非空的占位标记,避免明文进入审计 diff;仅用于 diff 比较。
+func maskSecret(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return "***"
+}
+
 func newAudit(action string, resourceType string, resourceID string, operatorID string, result string, message string, diff map[string]any) domain.Audit {
 	return domain.Audit{
 		ID:           newID("gitops-audit"),
@@ -934,6 +808,10 @@ func mapRepositoryError(err error, notFoundMessage string) error {
 	// 并发状态冲突优先映射为 409,避免被通用规则吞掉。
 	if errors.Is(err, domain.ErrReleaseStatusConflict) {
 		return conflict("release state changed, please retry")
+	}
+	// 配置实体乐观锁冲突同样映射为 409,提示调用方基于最新数据重试。
+	if errors.Is(err, domain.ErrOptimisticConflict) {
+		return conflict("resource was modified by another request, please retry")
 	}
 	return sharedErrors.MapRepository(err, sharedErrors.RepositoryErrorOptions{
 		NotFoundMessage: notFoundMessage,

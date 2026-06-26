@@ -43,7 +43,7 @@ func (s *Service) HandleFluxEvent(ctx context.Context, event FluxEvent) error {
 		return nil
 	}
 
-	environment, err := s.repo.FindEnvironmentByFluxResource(ctx, namespace, name)
+	environment, err := s.repo.FindEnvironmentByFluxResource(ctx, namespace, name, event.Kind)
 	if err != nil {
 		// 关联不到环境(资源与本系统无关)→ ack,不回流。
 		return nil
@@ -52,7 +52,7 @@ func (s *Service) HandleFluxEvent(ctx context.Context, event FluxEvent) error {
 	releases, _, err := s.repo.ListReleases(ctx, domain.ListOptions{
 		EnvironmentID: environment.ID,
 		Status:        domain.RELEASE_STATUS_SYNCING,
-		Limit:         1,
+		Limit:         DEFAULT_LIST_LIMIT,
 	})
 	if err != nil {
 		return err
@@ -61,9 +61,27 @@ func (s *Service) HandleFluxEvent(ctx context.Context, event FluxEvent) error {
 		// 该环境当前没有同步中的发布单(可能已完成或尚未发起)→ ack。
 		return nil
 	}
-	release := releases[0]
 	now := time.Now().UTC()
 	revision := strings.TrimSpace(event.Revision)
+
+	// 优先用事件 revision 精确匹配发布单(commit/target/flux 任一命中),避免同环境多发布单
+	// 并发时把旧 commit 的事件安到最新单上。匹配不到时的回退策略按"是否唯一在飞"区分:
+	//   - 环境内仅 1 个 syncing 单:无歧义,回退到该单(兼容 Flux 不带 revision 的事件);
+	//   - 环境内多个 syncing 单:回退会安错单,故不改状态、记 warn 后 ack(留待精确匹配的
+	//     后续事件或 reaper 处理),宁可漏一次也不误推进错误发布单。
+	release, matched := matchReleaseByRevision(releases, revision)
+	if !matched {
+		if len(releases) > 1 {
+			s.logActuateWarn("flux event revision did not match any of multiple syncing releases; skipping to avoid mis-association",
+				nil, "environment_id", environment.ID, "revision", revision, "syncing_count", len(releases))
+			return nil
+		}
+		release = releases[0]
+		if revision != "" {
+			s.logActuateWarn("flux event revision did not match the sole syncing release; falling back to it",
+				nil, "environment_id", environment.ID, "revision", revision, "release_id", release.ID)
+		}
+	}
 
 	// drift 事件:只更新同步记录,不改变发布单生命周期(drift 是持续巡检信号,非终态)。
 	if isDriftEvent(event) {
@@ -74,6 +92,36 @@ func (s *Service) HandleFluxEvent(ctx context.Context, event FluxEvent) error {
 		return s.finalizeRelease(ctx, release, environment, event, domain.RELEASE_STATUS_FAILED, domain.SYNC_STATUS_FAILED, revision, now)
 	}
 	return s.finalizeRelease(ctx, release, environment, event, domain.RELEASE_STATUS_SUCCEEDED, domain.SYNC_STATUS_SUCCEEDED, revision, now)
+}
+
+// matchReleaseByRevision 在候选发布单中找 revision 与其 CommitSHA/TargetRevision/FluxRevision
+// 任一相等的一条。revision 为空或无命中时返回 (零值,false)。
+func matchReleaseByRevision(releases []domain.Release, revision string) (domain.Release, bool) {
+	if strings.TrimSpace(revision) == "" {
+		return domain.Release{}, false
+	}
+	for index := range releases {
+		release := releases[index]
+		if revisionMatches(revision, release.CommitSHA) ||
+			revisionMatches(revision, release.TargetRevision) ||
+			revisionMatches(revision, release.FluxRevision) {
+			return release, true
+		}
+	}
+	return domain.Release{}, false
+}
+
+// revisionMatches 判断 Flux 上报的 revision 是否与发布单某个 commit 引用一致。Flux 的
+// revision 常带前缀(如 "main@sha1:abcd..." 或 "sha256:..."),故同时支持后缀包含匹配。
+func revisionMatches(eventRevision string, releaseRef string) bool {
+	eventRevision = strings.TrimSpace(eventRevision)
+	releaseRef = strings.TrimSpace(releaseRef)
+	if eventRevision == "" || releaseRef == "" {
+		return false
+	}
+	return eventRevision == releaseRef ||
+		strings.HasSuffix(eventRevision, releaseRef) ||
+		strings.Contains(eventRevision, releaseRef)
 }
 
 // finalizeRelease 把发布单从 syncing 推进到终态(succeeded/failed),并写同步记录与审计。
@@ -91,7 +139,7 @@ func (s *Service) finalizeRelease(ctx context.Context, release domain.Release, e
 		release.ErrorMessage = message
 	}
 
-	audit := newAudit(domain.AUDIT_ACTION_SUBMIT, domain.RESOURCE_TYPE_RELEASE, release.ID, AUTO_APPROVER_ID, auditResult, message, nil)
+	audit := newAudit(domain.AUDIT_ACTION_SYNC, domain.RESOURCE_TYPE_RELEASE, release.ID, AUTO_APPROVER_ID, auditResult, message, nil)
 	if _, err := s.repo.UpdateRelease(ctx, release, domain.ReleaseFinalizeFrom, audit); err != nil {
 		// 重复投递:发布单已被先到的同一事件推进过,行级锁前置校验拦截 → 视为已处理(ack)。
 		if errors.Is(err, domain.ErrReleaseStatusConflict) {

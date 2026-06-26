@@ -38,6 +38,7 @@ import (
 	gitopsapplication "github.com/lanyulei/kubeflare/internal/module/gitops/application"
 	gitopsgitlab "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/gitlab"
 	gitopspostgres "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/postgres"
+	gitopsverify "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/verify"
 	gitopshttp "github.com/lanyulei/kubeflare/internal/module/gitops/interface/http"
 	iamapplication "github.com/lanyulei/kubeflare/internal/module/iam/application"
 	iamdomain "github.com/lanyulei/kubeflare/internal/module/iam/domain"
@@ -374,6 +375,25 @@ func newCoreServices(cfg config.Config, plat *platform, repos *repositories) (*c
 	gitopsService.SetActuator(gitopsgitlab.NewMergeRequester(cfg.Database.QueryTimeout))
 	gitopsService.SetSemaphore(plat.coordinationClient)
 	gitopsService.SetLogger(plat.logger)
+	// 注入卡死清理超时阈值。
+	gitopsService.SetActuatorTimeouts(cfg.GitOps.Actuator.MergePendingTimeout, cfg.GitOps.Actuator.SyncingTimeout)
+	// 镜像签名校验:启用时用外部命令(如 cosign)做真实验签,否则退化为仅校验 digest 格式
+	// 并打印告警,避免 RequireSignedImage 给出"已强制验签"的安全错觉。
+	if cfg.GitOps.Signature.Enabled {
+		gitopsService.SetSignatureVerifier(gitopsverify.NewCommandSignatureVerifier(
+			cfg.GitOps.Signature.Command, cfg.GitOps.Signature.Args, cfg.GitOps.Signature.Timeout))
+	} else {
+		gitopsService.SetSignatureVerifier(gitopsapplication.NoopSignatureVerifier{})
+		plat.logger.Warn("gitops 镜像签名校验未启用(format-only):RequireSignedImage 仅校验 digest 格式,不做真实验签。生产环境请配置 gitops.signature")
+	}
+	// 策略门禁:启用时用外部命令(如 conftest/opa)做真实评估,否则恒放行并打印告警。
+	if cfg.GitOps.Policy.Enabled {
+		gitopsService.SetPolicyGate(gitopsverify.NewCommandPolicyGate(
+			cfg.GitOps.Policy.Command, cfg.GitOps.Policy.Args, cfg.GitOps.Policy.Timeout))
+	} else {
+		gitopsService.SetPolicyGate(gitopsapplication.NoopPolicyGate{})
+		plat.logger.Warn("gitops 策略门禁未启用:发布不做策略评估,一律放行。生产环境请配置 gitops.policy")
+	}
 	// AI service 处理会话、消息流和系统提示词。
 	aiService := aiapplication.NewService(repos.ai, plat.validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), plat.logger)
 	// 注入事件总线，用于跨实例广播 AI 状态变化。
@@ -1051,6 +1071,8 @@ func newAPIHandler(
 	gitopsHandler := gitopshttp.NewHandler(gitopsService)
 	// 注入 Flux 状态回流 webhook 的验签密钥(为空时 webhook 端点 fail-closed)。
 	gitopsHandler.SetWebhookSecret(cfg.GitOps.Webhook.Secret)
+	// 注入 GitLab MR webhook 的 X-Gitlab-Token 验签密钥(为空时 fail-closed)。
+	gitopsHandler.SetGitLabWebhookSecret(cfg.GitOps.Webhook.GitLabSecret)
 	// 注册 GitOps 受保护路由。
 	gitopshttp.RegisterRoutes(protectedAPI, gitopsHandler)
 	// 注册 GitOps 公开路由(Flux 回流 webhook,CSRF 豁免,自带 HMAC 验签)。

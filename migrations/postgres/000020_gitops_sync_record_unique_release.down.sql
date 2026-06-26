@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_gitops_sync_record_release_active;

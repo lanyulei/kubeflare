@@ -19,13 +19,22 @@ const (
 	RELEASE_STATUS_WAITING_APPROVAL = "waiting_approval"
 	// RELEASE_STATUS_APPROVED 是审批通过后、实际写入 Git(创建 MR)之前的中间态。
 	// 审批事务仅把发布单推进到该状态;真正调用 GitLab API 由后台 actuator 异步完成,
-	// 成功后再推进到 syncing,避免把外部 IO 放进持有行级锁的审批事务。
-	RELEASE_STATUS_APPROVED    = "approved"
-	RELEASE_STATUS_SYNCING     = "syncing"
-	RELEASE_STATUS_SUCCEEDED   = "succeeded"
-	RELEASE_STATUS_FAILED      = "failed"
-	RELEASE_STATUS_REJECTED    = "rejected"
-	RELEASE_STATUS_ROLLED_BACK = "rolled_back"
+	// 成功后再推进到 merge_pending,避免把外部 IO 放进持有行级锁的审批事务。
+	RELEASE_STATUS_APPROVED = "approved"
+	// RELEASE_STATUS_MERGE_PENDING 是 actuator 已创建 MR、等待人工/CI 合并的中间态。
+	// MR 只是"创建"并未"合并",Flux 只会在 MR 合并进默认分支后才调和;因此把"等待合并"
+	// 与"正在调和(syncing)"拆成两个状态,避免发布单在 MR 未合并时就显示为同步中。
+	// 由 GitLab MR webhook(action=merge)推进到 syncing。
+	RELEASE_STATUS_MERGE_PENDING = "merge_pending"
+	RELEASE_STATUS_SYNCING       = "syncing"
+	RELEASE_STATUS_SUCCEEDED     = "succeeded"
+	RELEASE_STATUS_FAILED        = "failed"
+	RELEASE_STATUS_REJECTED      = "rejected"
+	// RELEASE_STATUS_ROLLING_BACK 是回滚已发起、等待 actuator 创建 revert MR 的中间态。
+	// 回滚同样不在请求事务里调用 GitLab,而是置该状态后由后台 actuator 异步建 revert MR,
+	// 成功后推进到 rolled_back 终态。
+	RELEASE_STATUS_ROLLING_BACK = "rolling_back"
+	RELEASE_STATUS_ROLLED_BACK  = "rolled_back"
 )
 
 // 发布单状态机的合法前置状态集合。仓储层在事务内对发布单加行级锁后,仅当当前状态命中
@@ -38,15 +47,51 @@ var (
 	ReleaseSubmitFrom = []string{RELEASE_STATUS_DRAFT}
 	// ReleaseApprovalFrom 允许审批(通过/拒绝)的源状态:仅待审批。
 	ReleaseApprovalFrom = []string{RELEASE_STATUS_WAITING_APPROVAL}
-	// ReleaseActuateFrom 允许 actuator 推进的源状态:仅已审批。后台 actuator 创建 MR
-	// 成功后据此把 approved 推进到 syncing,行级锁 + 该集合保证多副本下只推进一次。
-	ReleaseActuateFrom = []string{RELEASE_STATUS_APPROVED}
+	// ReleaseActuateFrom 允许 actuator 推进的源状态:已审批(创建正向 MR)或回滚中
+	// (创建 revert MR)。后台 actuator 据此把 approved → merge_pending、
+	// rolling_back → rolled_back,行级锁 + 该集合保证多副本下只推进一次。
+	ReleaseActuateFrom = []string{RELEASE_STATUS_APPROVED, RELEASE_STATUS_ROLLING_BACK}
+	// ReleaseMergeFrom 允许 GitLab MR webhook 推进的源状态:仅等待合并。webhook 收到
+	// MR merge 事件后据此把 merge_pending 推进到 syncing,行级锁 + 该集合保证同一事件
+	// 重复投递只落库一次。
+	ReleaseMergeFrom = []string{RELEASE_STATUS_MERGE_PENDING}
 	// ReleaseFinalizeFrom 允许 Flux 状态回流推进终态的源状态:仅同步中。webhook 据此把
 	// syncing 推进到 succeeded/failed,行级锁 + 该集合保证同一事件重复投递只落库一次。
 	ReleaseFinalizeFrom = []string{RELEASE_STATUS_SYNCING}
-	// ReleaseRollbackFrom 允许回滚的源状态:已审批(待写 Git)或已进入/完成同步的发布单。
-	ReleaseRollbackFrom = []string{RELEASE_STATUS_APPROVED, RELEASE_STATUS_SYNCING, RELEASE_STATUS_SUCCEEDED, RELEASE_STATUS_FAILED}
+	// ReleaseRollbackFrom 允许回滚的源状态:仅已部署过的发布单(同步成功或失败)。回滚
+	// 通过创建 revert MR 撤销已落地的变更,因此对尚未真正写入集群的 approved/merge_pending/
+	// syncing 不开放回滚(它们应走拒绝/超时失败路径)。
+	ReleaseRollbackFrom = []string{RELEASE_STATUS_SUCCEEDED, RELEASE_STATUS_FAILED}
 )
+
+// ReleaseTransitions 是发布单状态机的集中事实来源:键为目标状态,值为允许跃迁到该状态的
+// 合法源状态集合。各业务路径(submit/approve/actuate/merge/finalize/rollback)使用上面的
+// ReleaseXxxFrom 切片做前置校验,本表把它们汇总为一张完整状态图,便于审阅与新增状态时不
+// 遗漏分支。仓储层在行级锁内据对应源集合校验,拒绝非法/重复跃迁。
+//
+// 状态流转全貌:
+//
+//	draft ──submit──▶ waiting_approval ──approve──▶ approved ──open_mr──▶ merge_pending
+//	                        │                                                  │
+//	                        └──reject──▶ rejected                       (GitLab merge webhook)
+//	                                                                            ▼
+//	  succeeded/failed ◀──flux 回流──── syncing ◀───────────────────────────────┘
+//	        │
+//	        └──rollback──▶ rolling_back ──open revert MR──▶ rolled_back
+//
+// 另有兜底:approved/merge_pending/syncing 超时由后台 reaper 推进到 failed(见 actuate.go
+// 的 reapStatus,以各自当前状态为合法源),不在本正向状态表内单列。
+var ReleaseTransitions = map[string][]string{
+	RELEASE_STATUS_WAITING_APPROVAL: ReleaseSubmitFrom,
+	RELEASE_STATUS_APPROVED:         ReleaseApprovalFrom,
+	RELEASE_STATUS_REJECTED:         ReleaseApprovalFrom,
+	RELEASE_STATUS_MERGE_PENDING:    {RELEASE_STATUS_APPROVED},
+	RELEASE_STATUS_SYNCING:          ReleaseMergeFrom,
+	RELEASE_STATUS_SUCCEEDED:        ReleaseFinalizeFrom,
+	RELEASE_STATUS_FAILED:           ReleaseFinalizeFrom,
+	RELEASE_STATUS_ROLLING_BACK:     ReleaseRollbackFrom,
+	RELEASE_STATUS_ROLLED_BACK:      {RELEASE_STATUS_ROLLING_BACK},
+}
 
 const (
 	APPROVAL_STATUS_APPROVED = "approved"
@@ -76,6 +121,11 @@ const (
 	AUDIT_ACTION_REJECT   = "reject"
 	AUDIT_ACTION_ROLLBACK = "rollback"
 	AUDIT_ACTION_TEST     = "test"
+	// 以下细分发布单生命周期的后台动作,取代此前对 submit 的过载复用,使审计可按动作精确检索:
+	AUDIT_ACTION_OPEN_MR = "open_mr" // actuator 创建正向/回滚 MR。
+	AUDIT_ACTION_MERGE   = "merge"   // GitLab webhook 报告 MR 已合并,推进 syncing。
+	AUDIT_ACTION_SYNC    = "sync"    // Flux 状态回流推进 succeeded/failed。
+	AUDIT_ACTION_FAIL    = "fail"    // actuator 因永久错误/超时把发布单标记为 failed。
 )
 
 // 审计/同步记录中的资源类型,集中定义避免散落的字符串字面量导致 typo 后审计查询漏数据。
@@ -173,7 +223,9 @@ type Release struct {
 	Status         string       `json:"status"`
 	Reason         string       `json:"reason,omitempty"`
 	OperatorID     string       `json:"operator_id,omitempty"`
+	ProjectID      string       `json:"project_id,omitempty"`
 	MRURL          string       `json:"mr_url,omitempty"`
+	MRIID          int          `json:"mr_iid,omitempty"`
 	PipelineURL    string       `json:"pipeline_url,omitempty"`
 	CommitSHA      string       `json:"commit_sha,omitempty"`
 	FluxRevision   string       `json:"flux_revision,omitempty"`
@@ -247,6 +299,7 @@ type DashboardStats struct {
 	EnvironmentCount     int64 `json:"environment_count"`
 	ReleaseCount         int64 `json:"release_count"`
 	WaitingApprovalCount int64 `json:"waiting_approval_count"`
+	ApprovedReleaseCount int64 `json:"approved_release_count"`
 	SyncingReleaseCount  int64 `json:"syncing_release_count"`
 	FailedReleaseCount   int64 `json:"failed_release_count"`
 	DriftedSyncCount     int64 `json:"drifted_sync_count"`

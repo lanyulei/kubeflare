@@ -65,13 +65,48 @@ type GitOpsConfig struct {
 	Actuator GitOpsActuatorConfig `koanf:"actuator"`
 	// Webhook 配置 Flux 状态回流入口。
 	Webhook GitOpsWebhookConfig `koanf:"webhook"`
+	// Signature 配置镜像签名校验。未启用时退化为仅校验 digest 格式(format-only),
+	// 此时 Environment.RequireSignedImage 不构成真正的验签强约束。
+	Signature GitOpsSignatureConfig `koanf:"signature"`
+	// Policy 配置发布前策略门禁(OPA/conftest 等)。未启用时一律放行。
+	Policy GitOpsPolicyConfig `koanf:"policy"`
+}
+
+// GitOpsSignatureConfig 控制镜像签名校验的外部命令(如 cosign verify)。Enabled 为 false 时
+// 使用内置 Noop 实现(仅校验 sha256 digest 格式),并在启动时打印 format-only 告警。
+type GitOpsSignatureConfig struct {
+	// Enabled 为 true 时用外部命令做真实验签;false 时退化为仅校验 digest 格式。
+	Enabled bool `koanf:"enabled"`
+	// Command 是验签命令可执行文件,如 "cosign"。Enabled 时必填。
+	Command string `koanf:"command"`
+	// Args 是命令参数模板,支持占位符 {image} 与 {digest},运行时替换为实际镜像/摘要。
+	// 例:["verify", "--key", "/etc/cosign/cosign.pub", "{image}@{digest}"]。
+	Args []string `koanf:"args"`
+	// Timeout 是单次验签命令的最长执行时长。<=0 时回退到默认值。
+	Timeout time.Duration `koanf:"timeout"`
+}
+
+// GitOpsPolicyConfig 控制发布前策略门禁的外部命令(如 conftest/opa)。Enabled 为 false 时
+// 使用内置 Noop 实现(恒放行)。命令退出码非 0 视为策略未通过,阻断发布。
+type GitOpsPolicyConfig struct {
+	// Enabled 为 true 时用外部命令做真实策略评估;false 时恒放行。
+	Enabled bool `koanf:"enabled"`
+	// Command 是策略命令可执行文件,如 "conftest"。Enabled 时必填。
+	Command string `koanf:"command"`
+	// Args 是命令参数模板,支持占位符 {image}、{digest}、{render_type}、{manifest_path}。
+	Args []string `koanf:"args"`
+	// Timeout 是单次策略命令的最长执行时长。<=0 时回退到默认值。
+	Timeout time.Duration `koanf:"timeout"`
 }
 
 // GitOpsWebhookConfig 控制 Flux notification-controller 的状态回流 webhook。
 type GitOpsWebhookConfig struct {
-	// Secret 是 webhook 的 HMAC-SHA256 验签密钥。为空时 webhook 端点拒绝一切请求
+	// Secret 是 Flux webhook 的 HMAC-SHA256 验签密钥。为空时 Flux webhook 端点拒绝一切请求
 	// (fail-closed),不影响其余功能。
 	Secret string `koanf:"secret"`
+	// GitLabSecret 是 GitLab MR webhook 的 X-Gitlab-Token 验签密钥。为空时 GitLab webhook
+	// 端点拒绝一切请求(fail-closed)。
+	GitLabSecret string `koanf:"gitlab_secret"`
 }
 
 // GitOpsActuatorConfig 控制把已审批(approved)发布单落地为 GitLab MR 的后台 worker。
@@ -81,6 +116,12 @@ type GitOpsActuatorConfig struct {
 	Enabled bool `koanf:"enabled"`
 	// Interval 是 actuator 扫描 approved 发布单的周期。<=0 时回退到默认值。
 	Interval time.Duration `koanf:"interval"`
+	// MergePendingTimeout 是发布单停留在 approved/merge_pending 的最长时长,超过则被 reaper
+	// 标记失败,避免 MR 始终建不出或始终无人合并导致永久挂起。<=0 表示不清理。
+	MergePendingTimeout time.Duration `koanf:"merge_pending_timeout"`
+	// SyncingTimeout 是发布单停留在 syncing(等待 Flux 回流)的最长时长,超过则被 reaper
+	// 标记失败。<=0 表示不清理。
+	SyncingTimeout time.Duration `koanf:"syncing_timeout"`
 }
 
 type AIConfig struct {
@@ -445,8 +486,10 @@ func Default() Config {
 		},
 		GitOps: GitOpsConfig{
 			Actuator: GitOpsActuatorConfig{
-				Enabled:  false,
-				Interval: 30 * time.Second,
+				Enabled:             false,
+				Interval:            30 * time.Second,
+				MergePendingTimeout: 24 * time.Hour,
+				SyncingTimeout:      1 * time.Hour,
 			},
 		},
 		Auth: AuthConfig{

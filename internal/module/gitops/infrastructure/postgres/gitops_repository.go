@@ -97,7 +97,9 @@ type releaseRecord struct {
 	Status         string    `gorm:"size:32;not null;index"`
 	Reason         string    `gorm:"size:512;not null;default:''"`
 	OperatorID     string    `gorm:"size:128;not null;default:''"`
+	ProjectID      string    `gorm:"size:128;not null;default:'';index"`
 	MRURL          string    `gorm:"size:512;not null;default:''"`
+	MRIID          int       `gorm:"not null;default:0;index"`
 	PipelineURL    string    `gorm:"size:512;not null;default:''"`
 	CommitSHA      string    `gorm:"size:128;not null;default:''"`
 	FluxRevision   string    `gorm:"size:128;not null;default:''"`
@@ -218,18 +220,34 @@ func (r *Repository) DashboardStats(ctx context.Context) (domain.DashboardStats,
 	if err := r.db.WithContext(queryCtx).Model(&environmentRecord{}).Count(&stats.EnvironmentCount).Error; err != nil {
 		return stats, err
 	}
-	if err := r.db.WithContext(queryCtx).Model(&releaseRecord{}).Count(&stats.ReleaseCount).Error; err != nil {
+	// 发布单的总数与各状态计数合并为单条扫描:COUNT(*) FILTER (WHERE ...) 一次性算出,
+	// 避免对同一张表重复 5 次全表 COUNT。approved 单列计数,使审批后到进入 syncing 前
+	// 在面板上不"消失"(actuator 未启用时尤其需要可见,以便运维告警)。
+	var releaseStats struct {
+		Total           int64
+		WaitingApproval int64
+		Approved        int64
+		Syncing         int64
+		Failed          int64
+	}
+	if err := r.db.WithContext(queryCtx).Model(&releaseRecord{}).
+		Select(`COUNT(*) AS total,
+			COUNT(*) FILTER (WHERE status = ?) AS waiting_approval,
+			COUNT(*) FILTER (WHERE status = ?) AS approved,
+			COUNT(*) FILTER (WHERE status = ?) AS syncing,
+			COUNT(*) FILTER (WHERE status = ?) AS failed`,
+			domain.RELEASE_STATUS_WAITING_APPROVAL,
+			domain.RELEASE_STATUS_APPROVED,
+			domain.RELEASE_STATUS_SYNCING,
+			domain.RELEASE_STATUS_FAILED,
+		).Scan(&releaseStats).Error; err != nil {
 		return stats, err
 	}
-	if err := r.db.WithContext(queryCtx).Model(&releaseRecord{}).Where("status = ?", domain.RELEASE_STATUS_WAITING_APPROVAL).Count(&stats.WaitingApprovalCount).Error; err != nil {
-		return stats, err
-	}
-	if err := r.db.WithContext(queryCtx).Model(&releaseRecord{}).Where("status = ?", domain.RELEASE_STATUS_SYNCING).Count(&stats.SyncingReleaseCount).Error; err != nil {
-		return stats, err
-	}
-	if err := r.db.WithContext(queryCtx).Model(&releaseRecord{}).Where("status = ?", domain.RELEASE_STATUS_FAILED).Count(&stats.FailedReleaseCount).Error; err != nil {
-		return stats, err
-	}
+	stats.ReleaseCount = releaseStats.Total
+	stats.WaitingApprovalCount = releaseStats.WaitingApproval
+	stats.ApprovedReleaseCount = releaseStats.Approved
+	stats.SyncingReleaseCount = releaseStats.Syncing
+	stats.FailedReleaseCount = releaseStats.Failed
 	if err := r.db.WithContext(queryCtx).Model(&syncRecord{}).Where("drifted = ?", true).Count(&stats.DriftedSyncCount).Error; err != nil {
 		return stats, err
 	}
@@ -281,7 +299,7 @@ func (r *Repository) CreateProvider(ctx context.Context, provider domain.Provide
 	return created, audit, err
 }
 
-func (r *Repository) UpdateProvider(ctx context.Context, provider domain.Provider, audit domain.Audit) (domain.Provider, domain.Audit, error) {
+func (r *Repository) UpdateProvider(ctx context.Context, provider domain.Provider, expectedUpdatedAt time.Time, audit domain.Audit) (domain.Provider, domain.Audit, error) {
 	if r.db == nil {
 		return provider, audit, nil
 	}
@@ -292,6 +310,9 @@ func (r *Repository) UpdateProvider(ctx context.Context, provider domain.Provide
 	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		var record providerRecord
 		if err := tx.First(&record, "id = ?", provider.ID).Error; err != nil {
+			return err
+		}
+		if err := ensureUnchanged(record.UpdatedAt, expectedUpdatedAt); err != nil {
 			return err
 		}
 		record.Name = provider.Name
@@ -407,7 +428,7 @@ func (r *Repository) CreateGitRepository(ctx context.Context, repository domain.
 	return created, audit, err
 }
 
-func (r *Repository) UpdateGitRepository(ctx context.Context, repository domain.GitRepository, audit domain.Audit) (domain.GitRepository, domain.Audit, error) {
+func (r *Repository) UpdateGitRepository(ctx context.Context, repository domain.GitRepository, expectedUpdatedAt time.Time, audit domain.Audit) (domain.GitRepository, domain.Audit, error) {
 	if r.db == nil {
 		return repository, audit, nil
 	}
@@ -418,6 +439,9 @@ func (r *Repository) UpdateGitRepository(ctx context.Context, repository domain.
 	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		var record gitRepositoryRecord
 		if err := tx.First(&record, "id = ?", repository.ID).Error; err != nil {
+			return err
+		}
+		if err := ensureUnchanged(record.UpdatedAt, expectedUpdatedAt); err != nil {
 			return err
 		}
 		record.ProviderID = repository.ProviderID
@@ -523,7 +547,7 @@ func (r *Repository) CreateApplication(ctx context.Context, application domain.A
 	return created, audit, err
 }
 
-func (r *Repository) UpdateApplication(ctx context.Context, application domain.Application, audit domain.Audit) (domain.Application, domain.Audit, error) {
+func (r *Repository) UpdateApplication(ctx context.Context, application domain.Application, expectedUpdatedAt time.Time, audit domain.Audit) (domain.Application, domain.Audit, error) {
 	if r.db == nil {
 		return application, audit, nil
 	}
@@ -534,6 +558,9 @@ func (r *Repository) UpdateApplication(ctx context.Context, application domain.A
 	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		var record applicationRecord
 		if err := tx.First(&record, "id = ?", application.ID).Error; err != nil {
+			return err
+		}
+		if err := ensureUnchanged(record.UpdatedAt, expectedUpdatedAt); err != nil {
 			return err
 		}
 		record.RepositoryID = application.RepositoryID
@@ -587,7 +614,7 @@ func (r *Repository) GetEnvironment(ctx context.Context, id string) (domain.Envi
 	return toDomainEnvironment(record), nil
 }
 
-func (r *Repository) FindEnvironmentByFluxResource(ctx context.Context, namespace string, name string) (domain.Environment, error) {
+func (r *Repository) FindEnvironmentByFluxResource(ctx context.Context, namespace string, name string, kind string) (domain.Environment, error) {
 	if r.db == nil {
 		return domain.Environment{}, errors.New("environment not found")
 	}
@@ -595,11 +622,19 @@ func (r *Repository) FindEnvironmentByFluxResource(ctx context.Context, namespac
 	defer cancel()
 
 	var record environmentRecord
-	// 资源名可能落在 Kustomization 或 HelmRelease 字段,任一命中即可;仅匹配启用中环境。
-	if err := r.db.WithContext(queryCtx).
-		Where("flux_namespace = ? AND (flux_kustomization = ? OR flux_helm_release = ?) AND status = ?",
-			namespace, name, name, domain.STATUS_ENABLED).
-		First(&record).Error; err != nil {
+	query := r.db.WithContext(queryCtx).
+		Where("flux_namespace = ? AND status = ?", namespace, domain.STATUS_ENABLED)
+	// kind 已知时精确匹配对应列,避免同命名空间下 kustomization 名与另一环境 helmrelease
+	// 名相同造成的串环境;未知时退化为两列任一命中(向后兼容)。
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "kustomization":
+		query = query.Where("flux_kustomization = ?", name)
+	case "helmrelease":
+		query = query.Where("flux_helm_release = ?", name)
+	default:
+		query = query.Where("flux_kustomization = ? OR flux_helm_release = ?", name, name)
+	}
+	if err := query.First(&record).Error; err != nil {
 		return domain.Environment{}, err
 	}
 	return toDomainEnvironment(record), nil
@@ -625,7 +660,7 @@ func (r *Repository) CreateEnvironment(ctx context.Context, environment domain.E
 	return created, audit, err
 }
 
-func (r *Repository) UpdateEnvironment(ctx context.Context, environment domain.Environment, audit domain.Audit) (domain.Environment, domain.Audit, error) {
+func (r *Repository) UpdateEnvironment(ctx context.Context, environment domain.Environment, expectedUpdatedAt time.Time, audit domain.Audit) (domain.Environment, domain.Audit, error) {
 	if r.db == nil {
 		return environment, audit, nil
 	}
@@ -636,6 +671,9 @@ func (r *Repository) UpdateEnvironment(ctx context.Context, environment domain.E
 	err := r.db.WithContext(queryCtx).Transaction(func(tx *gorm.DB) error {
 		var record environmentRecord
 		if err := tx.First(&record, "id = ?", environment.ID).Error; err != nil {
+			return err
+		}
+		if err := ensureUnchanged(record.UpdatedAt, expectedUpdatedAt); err != nil {
 			return err
 		}
 		record.ApplicationID = environment.ApplicationID
@@ -723,7 +761,75 @@ func (r *Repository) ListReleasesByStatus(ctx context.Context, status string, li
 	return items, nil
 }
 
-// attachReleaseRefs 为一批发布单批量填充所属应用与环境(各一次 IN 查询),避免 N+1。
+func (r *Repository) ListStaleReleases(ctx context.Context, status string, before time.Time, limit int) ([]domain.Release, error) {
+	if r.db == nil {
+		return []domain.Release{}, nil
+	}
+	if limit <= 0 || limit > listReleasesByStatusLimit {
+		limit = listReleasesByStatusLimit
+	}
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var records []releaseRecord
+	// 滞留最久的优先处理(updated_at 升序),与 actuator 的 FIFO 取向一致。
+	if err := r.db.WithContext(queryCtx).
+		Where("status = ? AND updated_at < ?", status, before).
+		Order("updated_at ASC").
+		Limit(limit).
+		Find(&records).Error; err != nil {
+		return nil, err
+	}
+	items := make([]domain.Release, 0, len(records))
+	for _, record := range records {
+		items = append(items, toDomainRelease(record))
+	}
+	return items, nil
+}
+
+func (r *Repository) FindReleaseByMRURL(ctx context.Context, mrURL string, expect []string) (domain.Release, error) {
+	if r.db == nil {
+		return domain.Release{}, errors.New("release not found")
+	}
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record releaseRecord
+	query := r.db.WithContext(queryCtx).Where("mr_url = ?", mrURL)
+	if len(expect) > 0 {
+		query = query.Where("status IN ?", expect)
+	}
+	// 同一 MR 地址理论上唯一对应一个发布单;按创建时间降序取最新一条以防历史脏数据。
+	if err := query.Order("created_at DESC").First(&record).Error; err != nil {
+		return domain.Release{}, err
+	}
+	return toDomainRelease(record), nil
+}
+
+func (r *Repository) FindReleaseByMRIID(ctx context.Context, projectID string, mrIID int, expect []string) (domain.Release, error) {
+	if r.db == nil {
+		return domain.Release{}, errors.New("release not found")
+	}
+	if mrIID <= 0 {
+		return domain.Release{}, errors.New("release not found")
+	}
+	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var record releaseRecord
+	query := r.db.WithContext(queryCtx).Where("mr_iid = ?", mrIID)
+	// project_id 非空时一并约束,确保跨项目 IID 复用时不串单;为空(历史数据)时仅按 IID。
+	if strings.TrimSpace(projectID) != "" {
+		query = query.Where("project_id = ?", strings.TrimSpace(projectID))
+	}
+	if len(expect) > 0 {
+		query = query.Where("status IN ?", expect)
+	}
+	if err := query.Order("created_at DESC").First(&record).Error; err != nil {
+		return domain.Release{}, err
+	}
+	return toDomainRelease(record), nil
+}
 func (r *Repository) attachReleaseRefs(ctx context.Context, releases []domain.Release) error {
 	if len(releases) == 0 {
 		return nil
@@ -777,9 +883,9 @@ func (r *Repository) GetRelease(ctx context.Context, id string) (domain.Release,
 	return toDomainRelease(record), nil
 }
 
-func (r *Repository) CreateRelease(ctx context.Context, release domain.Release, sync domain.SyncRecord, approval *domain.ReleaseApproval, audits []domain.Audit) (domain.Release, domain.SyncRecord, error) {
+func (r *Repository) CreateRelease(ctx context.Context, release domain.Release, sync *domain.SyncRecord, approval *domain.ReleaseApproval, audits []domain.Audit) (domain.Release, domain.SyncRecord, error) {
 	if r.db == nil {
-		return release, sync, nil
+		return release, domain.SyncRecord{}, nil
 	}
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -792,11 +898,15 @@ func (r *Repository) CreateRelease(ctx context.Context, release domain.Release, 
 			return err
 		}
 		created = toDomainRelease(releaseRecord)
-		syncRecord := fromDomainSyncRecord(sync)
-		if err := tx.Create(&syncRecord).Error; err != nil {
-			return err
+		// 同步记录仅在发布单进入 syncing 后才有意义;draft/approved 阶段不创建,避免
+		// "尚未同步却挂着等待同步记录"的语义错位。sync 为 nil 时跳过。
+		if sync != nil {
+			syncRecord := fromDomainSyncRecord(*sync)
+			if err := tx.Create(&syncRecord).Error; err != nil {
+				return err
+			}
+			createdSync = toDomainSyncRecord(syncRecord)
 		}
-		createdSync = toDomainSyncRecord(syncRecord)
 		if approval != nil {
 			approvalRecord := fromDomainApproval(*approval)
 			if err := tx.Create(&approvalRecord).Error; err != nil {
@@ -827,7 +937,9 @@ func (r *Repository) UpdateRelease(ctx context.Context, release domain.Release, 
 		record.ImageDigest = release.ImageDigest
 		record.Status = release.Status
 		record.Reason = release.Reason
+		record.ProjectID = release.ProjectID
 		record.MRURL = release.MRURL
+		record.MRIID = release.MRIID
 		record.PipelineURL = release.PipelineURL
 		record.CommitSHA = release.CommitSHA
 		record.FluxRevision = release.FluxRevision
@@ -843,9 +955,9 @@ func (r *Repository) UpdateRelease(ctx context.Context, release domain.Release, 
 	return updated, err
 }
 
-func (r *Repository) CreateReleaseApproval(ctx context.Context, approval domain.ReleaseApproval, release domain.Release, sync domain.SyncRecord, expect []string, audit domain.Audit) (domain.ReleaseApproval, domain.Release, domain.SyncRecord, error) {
+func (r *Repository) CreateReleaseApproval(ctx context.Context, approval domain.ReleaseApproval, release domain.Release, sync *domain.SyncRecord, expect []string, audit domain.Audit) (domain.ReleaseApproval, domain.Release, domain.SyncRecord, error) {
 	if r.db == nil {
-		return approval, release, sync, nil
+		return approval, release, domain.SyncRecord{}, nil
 	}
 	queryCtx, cancel := dbplatform.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -871,11 +983,15 @@ func (r *Repository) CreateReleaseApproval(ctx context.Context, approval domain.
 			return err
 		}
 		updatedRelease = toDomainRelease(record)
-		syncRecord := fromDomainSyncRecord(sync)
-		if err := tx.Create(&syncRecord).Error; err != nil {
-			return err
+		// 同步记录仅在进入 syncing 后才创建;审批(approve→approved、reject→rejected)
+		// 阶段尚未同步,sync 传 nil 即跳过。
+		if sync != nil {
+			syncRecord := fromDomainSyncRecord(*sync)
+			if err := tx.Create(&syncRecord).Error; err != nil {
+				return err
+			}
+			createdSync = toDomainSyncRecord(syncRecord)
 		}
-		createdSync = toDomainSyncRecord(syncRecord)
 		return tx.Create(fromDomainAudit(audit)).Error
 	})
 	return createdApproval, updatedRelease, createdSync, err
@@ -893,6 +1009,19 @@ func lockReleaseForUpdate(tx *gorm.DB, id string, expect []string) (releaseRecor
 		return releaseRecord{}, domain.ErrReleaseStatusConflict
 	}
 	return record, nil
+}
+
+// ensureUnchanged 实现配置实体的乐观锁:expected 为零值时不校验(向后兼容);否则要求库内
+// current(updated_at)与 expected 相等,不等说明在"读出→保存"间被并发改动,返回
+// ErrOptimisticConflict。时间比较用 Equal 以忽略单调时钟差异。
+func ensureUnchanged(current time.Time, expected time.Time) error {
+	if expected.IsZero() {
+		return nil
+	}
+	if !current.Equal(expected) {
+		return domain.ErrOptimisticConflict
+	}
+	return nil
 }
 
 func statusAllowed(current string, expect []string) bool {
@@ -937,6 +1066,10 @@ func (r *Repository) ListSyncRecords(ctx context.Context, opts domain.ListOption
 	return listRecords(query, opts, "updated_at DESC", toDomainSyncRecord, "resource_name", "revision", "message")
 }
 
+// UpsertSyncRecord 维护"每个发布单一条当前同步态":以 release_id 为冲突键,存在则原地
+// 更新同步字段(不新增行),不存在则插入。这使同一发布单的多次同步上报(actuator 进入
+// syncing、Flux 多次回流)收敛到同一行,避免事件流水式膨胀与 drift 重复计数。
+// release_id 为空(理论上不应出现)时退化为普通插入。
 func (r *Repository) UpsertSyncRecord(ctx context.Context, sync domain.SyncRecord) (domain.SyncRecord, error) {
 	if r.db == nil {
 		return sync, nil
@@ -945,8 +1078,29 @@ func (r *Repository) UpsertSyncRecord(ctx context.Context, sync domain.SyncRecor
 	defer cancel()
 
 	record := fromDomainSyncRecord(sync)
-	if err := r.db.WithContext(queryCtx).Save(&record).Error; err != nil {
+	tx := r.db.WithContext(queryCtx)
+	if strings.TrimSpace(record.ReleaseID) != "" {
+		// 命中 release_id 部分唯一索引时更新当前态字段;created_at / id 保持首次写入不变。
+		// TargetWhere 必须与索引的 WHERE 谓词一致,否则 Postgres 拒绝该 ON CONFLICT。
+		tx = tx.Clauses(clause.OnConflict{
+			Columns:     []clause.Column{{Name: "release_id"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "deleted_at IS NULL AND release_id <> ''"}}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"provider", "resource_namespace", "resource_name", "revision",
+				"status", "message", "drifted", "last_sync_at", "updated_at",
+			}),
+		})
+	}
+	if err := tx.Create(&record).Error; err != nil {
 		return domain.SyncRecord{}, err
+	}
+	// Create + OnConflict 后 record 可能仍持有"待插入"的 id;按 release_id 回读当前态,
+	// 确保返回的是库内实际行(含首次写入的 id/created_at)。
+	if strings.TrimSpace(record.ReleaseID) != "" {
+		var current syncRecord
+		if err := r.db.WithContext(queryCtx).First(&current, "release_id = ?", record.ReleaseID).Error; err == nil {
+			record = current
+		}
 	}
 	return toDomainSyncRecord(record), nil
 }
@@ -1041,6 +1195,9 @@ func listRecords[R any, D any](query *gorm.DB, opts domain.ListOptions, order st
 	return items, total, nil
 }
 
+// applyKeyword 对指定字段做大小写无关的模糊匹配。注意:LOWER(field) LIKE '%kw%' 的前置
+// 通配无法命中普通 B-tree 索引,数据量大时为顺序扫描;当前各表规模可控,如后续成为瓶颈
+// 可引入 pg_trgm GIN 索引或改为前缀匹配(需配套迁移)。
 func applyKeyword(query *gorm.DB, opts domain.ListOptions, keywordFields ...string) *gorm.DB {
 	if opts.Keyword == "" || len(keywordFields) == 0 {
 		return query
@@ -1279,7 +1436,9 @@ func toDomainRelease(record releaseRecord) domain.Release {
 		Status:         record.Status,
 		Reason:         record.Reason,
 		OperatorID:     record.OperatorID,
+		ProjectID:      record.ProjectID,
 		MRURL:          record.MRURL,
+		MRIID:          record.MRIID,
 		PipelineURL:    record.PipelineURL,
 		CommitSHA:      record.CommitSHA,
 		FluxRevision:   record.FluxRevision,
@@ -1304,7 +1463,9 @@ func fromDomainRelease(item domain.Release) releaseRecord {
 		Status:         item.Status,
 		Reason:         item.Reason,
 		OperatorID:     item.OperatorID,
+		ProjectID:      item.ProjectID,
 		MRURL:          item.MRURL,
+		MRIID:          item.MRIID,
 		PipelineURL:    item.PipelineURL,
 		CommitSHA:      item.CommitSHA,
 		FluxRevision:   item.FluxRevision,

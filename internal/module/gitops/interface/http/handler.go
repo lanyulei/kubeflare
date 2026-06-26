@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -20,8 +21,9 @@ import (
 const maxWebhookBodyBytes = 1 << 20 // 1 MiB
 
 type Handler struct {
-	service       *application.Service
-	webhookSecret string // Flux 状态回流 webhook 的 HMAC 验签密钥;为空时拒绝一切 webhook。
+	service            *application.Service
+	webhookSecret      string // Flux 状态回流 webhook 的 HMAC 验签密钥;为空时拒绝一切 Flux webhook。
+	gitlabWebhookToken string // GitLab MR webhook 的 X-Gitlab-Token 明文密钥;为空时拒绝一切 GitLab webhook。
 }
 
 func NewHandler(service *application.Service) *Handler {
@@ -31,6 +33,12 @@ func NewHandler(service *application.Service) *Handler {
 // SetWebhookSecret 注入 Flux webhook 验签密钥。空字符串表示未配置,FluxWebhook 将一律 401。
 func (h *Handler) SetWebhookSecret(secret string) {
 	h.webhookSecret = strings.TrimSpace(secret)
+}
+
+// SetGitLabWebhookSecret 注入 GitLab MR webhook 的 X-Gitlab-Token 密钥。空字符串表示未配置,
+// GitLabWebhook 将一律 401(fail-closed)。
+func (h *Handler) SetGitLabWebhookSecret(secret string) {
+	h.gitlabWebhookToken = strings.TrimSpace(secret)
 }
 
 func (h *Handler) Dashboard(c *gin.Context) {
@@ -483,4 +491,90 @@ func (h *Handler) verifyWebhookSignature(c *gin.Context, body []byte) bool {
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(provided), []byte(expected))
+}
+
+// gitlabWebhookPayload 是 GitLab Merge Request webhook 的原始结构(仅取所需字段)。
+type gitlabWebhookPayload struct {
+	ObjectKind string `json:"object_kind"`
+	Project    struct {
+		ID int `json:"id"`
+	} `json:"project"`
+	ObjectAttributes struct {
+		IID             int    `json:"iid"`
+		TargetProjectID int    `json:"target_project_id"`
+		Action          string `json:"action"`
+		State           string `json:"state"`
+		URL             string `json:"url"`
+		MergeCommitSHA  string `json:"merge_commit_sha"`
+		LastCommit      struct {
+			ID string `json:"id"`
+		} `json:"last_commit"`
+	} `json:"object_attributes"`
+}
+
+// GitLabWebhook 接收 GitLab 的 Merge Request 事件,把"MR 已合并"回流到发布单状态
+// (merge_pending → syncing)。该端点为公开路由(CSRF 豁免),用 GitLab 原生
+// X-Gitlab-Token 头做密钥校验(GitLab webhook 不发 HMAC):
+//   - 未配置密钥或 token 不匹配 → 401(fail-closed);
+//   - body 读取/解析失败 → 400;
+//   - 其余一律 200 ack(业务侧关联不到发布单时静默忽略,避免 GitLab 无限重投)。
+func (h *Handler) GitLabWebhook(c *gin.Context) {
+	if h.gitlabWebhookToken == "" {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
+	// X-Gitlab-Token 为明文比对,用常量时间比较防时序侧信道。
+	provided := strings.TrimSpace(c.GetHeader("X-Gitlab-Token"))
+	if provided == "" || !hmac.Equal([]byte(provided), []byte(h.gitlabWebhookToken)) {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxWebhookBodyBytes))
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	var payload gitlabWebhookPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	// target_project_id 优先(MR 合并入的目标项目),回退到 webhook 顶层 project.id。
+	projectID := payload.ObjectAttributes.TargetProjectID
+	if projectID == 0 {
+		projectID = payload.Project.ID
+	}
+	event := application.MergeEvent{
+		ProjectID:      projectIDString(projectID),
+		MRIID:          payload.ObjectAttributes.IID,
+		MRURL:          strings.TrimSpace(payload.ObjectAttributes.URL),
+		Action:         strings.TrimSpace(payload.ObjectAttributes.Action),
+		State:          strings.TrimSpace(payload.ObjectAttributes.State),
+		MergeCommitSHA: firstNonEmptyHTTP(payload.ObjectAttributes.MergeCommitSHA, payload.ObjectAttributes.LastCommit.ID),
+	}
+	if err := h.service.HandleMergeEvent(c.Request.Context(), event); err != nil {
+		response.Error(c, err)
+		return
+	}
+	c.Status(http.StatusOK)
+}
+
+// firstNonEmptyHTTP 返回首个非空字符串(去空白),用于在 GitLab 不同字段间取合并 commit。
+func firstNonEmptyHTTP(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// projectIDString 把 GitLab 数字 project_id 转为字符串;0(缺失)时返回空串。
+func projectIDString(id int) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.Itoa(id)
 }
