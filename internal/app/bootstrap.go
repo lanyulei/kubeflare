@@ -35,11 +35,6 @@ import (
 	clusterkubernetes "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/kubernetes"
 	clusterpostgres "github.com/lanyulei/kubeflare/internal/module/cluster/infrastructure/postgres"
 	clusterhttp "github.com/lanyulei/kubeflare/internal/module/cluster/interface/http"
-	gitopsapplication "github.com/lanyulei/kubeflare/internal/module/gitops/application"
-	gitopsgitlab "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/gitlab"
-	gitopspostgres "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/postgres"
-	gitopsverify "github.com/lanyulei/kubeflare/internal/module/gitops/infrastructure/verify"
-	gitopshttp "github.com/lanyulei/kubeflare/internal/module/gitops/interface/http"
 	iamapplication "github.com/lanyulei/kubeflare/internal/module/iam/application"
 	iamdomain "github.com/lanyulei/kubeflare/internal/module/iam/domain"
 	iamauthstate "github.com/lanyulei/kubeflare/internal/module/iam/infrastructure/authstate"
@@ -93,7 +88,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 
-	// 装配上传、集群、GitOps、AI 等核心业务服务。
+	// 装配上传、集群、AI 等核心业务服务。
 	core, err := newCoreServices(cfg, plat, repos)
 	if err != nil {
 		return nil, err
@@ -116,13 +111,13 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	})
 
 	// API handler 装配 Gin 路由和业务模块路由。
-	apiHandler, err := newAPIHandler(cfg, plat.logger, iam.authenticator, iam.service, iam.oidc, core.upload, core.cluster, core.ai, agentService, core.gitops)
+	apiHandler, err := newAPIHandler(cfg, plat.logger, iam.authenticator, iam.service, iam.oidc, core.upload, core.cluster, core.ai, agentService)
 	if err != nil {
 		return nil, err
 	}
 
 	// 启动后台周期任务与 MCP 生命周期,拿到统一的停止函数。
-	stopAuthCleanup := startBackgroundTasks(cfg, plat.logger, repos, core, agentService, mcpManager)
+	stopAuthCleanup := startBackgroundTasks(plat.logger, repos, core, agentService, mcpManager)
 
 	// 装配根 handler 与中间件链,并拿到健康检查管理器。
 	rootHandler, healthManager := newRootHTTPHandler(cfg, plat, apiHandler, kapiHandler)
@@ -233,7 +228,6 @@ type repositories struct {
 	clusterInspector *clusterkubernetes.Inspector       // 探测 Kubernetes 集群状态。
 	ai               *aipostgres.ChatRepository         // AI 聊天消息持久化。
 	agent            *agentpostgres.AgentRepository     // Agent 运行与配置持久化。
-	gitops           *gitopspostgres.Repository         // GitOps 资源持久化。
 }
 
 // newRepositories 基于平台连接装配各模块仓储,并把自定义验证码存储注入 captcha 库。
@@ -259,8 +253,6 @@ func newRepositories(plat *platform, cfg config.Config) *repositories {
 		ai: aipostgres.NewChatRepository(plat.gormDB, cfg.Database.QueryTimeout),
 		// Agent 仓储负责 Agent 运行和配置持久化。
 		agent: agentpostgres.NewAgentRepository(plat.gormDB, cfg.Database.QueryTimeout),
-		// GitOps 仓储负责 GitOps 资源持久化。
-		gitops: gitopspostgres.NewRepository(plat.gormDB, cfg.Database.QueryTimeout),
 	}
 }
 
@@ -344,17 +336,16 @@ func newIAMServices(ctx context.Context, cfg config.Config, plat *platform, repo
 	}, nil
 }
 
-// coreServices 聚合上传、集群、GitOps、AI 等核心业务服务。aiGenerator 单独保留,
+// coreServices 聚合上传、集群、AI 等核心业务服务。aiGenerator 单独保留,
 // 以便 Agent 复用同一实例(避免重复构造导致连接池/fallback 状态分裂)。
 type coreServices struct {
 	upload      *uploadapplication.Service       // 文件上传业务和访问路径。
 	cluster     *clusterapplication.Service      // 集群 CRUD、凭证加密和连通性检查。
 	ai          *aiapplication.Service           // 会话、消息流和系统提示词。
-	gitops      *gitopsapplication.Service       // 仓库配置、密钥加密和 GitLab 检查。
 	aiGenerator aiapplication.AssistantGenerator // AI 对话生成器;未启用时为 nil。
 }
 
-// newCoreServices 装配上传、集群、GitOps、AI 服务,并完成跨实例事件总线/缓存
+// newCoreServices 装配上传、集群、AI 服务,并完成跨实例事件总线/缓存
 // 失效总线的注入。AI 对话生成器在此构造一次,供 AI service 与后续 Agent 共享。
 func newCoreServices(cfg config.Config, plat *platform, repos *repositories) (*coreServices, error) {
 	// 创建 AI 对话生成器；AI 未启用时可能返回 nil。
@@ -369,31 +360,6 @@ func newCoreServices(cfg config.Config, plat *platform, repos *repositories) (*c
 	clusterService := clusterapplication.NewService(repos.cluster, plat.validator, plat.encryptor, repos.clusterInspector)
 	// 注册跨实例缓存失效总线，让集群变更能通知其他节点。
 	clusterService.SetCacheInvalidationBus(plat.coordinationClient)
-	// GitOps service 处理仓库配置、密钥加密和 GitLab 连通性检查。
-	gitopsService := gitopsapplication.NewService(repos.gitops, plat.validator, plat.encryptor, gitopsgitlab.NewChecker(cfg.Database.QueryTimeout))
-	// 注入写 Git 执行器(创建 MR)、跨实例准入信号量与日志,供后台 actuator 使用。
-	gitopsService.SetActuator(gitopsgitlab.NewMergeRequester(cfg.Database.QueryTimeout))
-	gitopsService.SetSemaphore(plat.coordinationClient)
-	gitopsService.SetLogger(plat.logger)
-	// 注入卡死清理超时阈值。
-	gitopsService.SetActuatorTimeouts(cfg.GitOps.Actuator.MergePendingTimeout, cfg.GitOps.Actuator.SyncingTimeout)
-	// 镜像签名校验:启用时用外部命令(如 cosign)做真实验签,否则退化为仅校验 digest 格式
-	// 并打印告警,避免 RequireSignedImage 给出"已强制验签"的安全错觉。
-	if cfg.GitOps.Signature.Enabled {
-		gitopsService.SetSignatureVerifier(gitopsverify.NewCommandSignatureVerifier(
-			cfg.GitOps.Signature.Command, cfg.GitOps.Signature.Args, cfg.GitOps.Signature.Timeout))
-	} else {
-		gitopsService.SetSignatureVerifier(gitopsapplication.NoopSignatureVerifier{})
-		plat.logger.Warn("gitops 镜像签名校验未启用(format-only):RequireSignedImage 仅校验 digest 格式,不做真实验签。生产环境请配置 gitops.signature")
-	}
-	// 策略门禁:启用时用外部命令(如 conftest/opa)做真实评估,否则恒放行并打印告警。
-	if cfg.GitOps.Policy.Enabled {
-		gitopsService.SetPolicyGate(gitopsverify.NewCommandPolicyGate(
-			cfg.GitOps.Policy.Command, cfg.GitOps.Policy.Args, cfg.GitOps.Policy.Timeout))
-	} else {
-		gitopsService.SetPolicyGate(gitopsapplication.NoopPolicyGate{})
-		plat.logger.Warn("gitops 策略门禁未启用:发布不做策略评估,一律放行。生产环境请配置 gitops.policy")
-	}
 	// AI service 处理会话、消息流和系统提示词。
 	aiService := aiapplication.NewService(repos.ai, plat.validator, aiGenerator, strings.TrimSpace(cfg.AI.SystemPrompt), plat.logger)
 	// 注入事件总线，用于跨实例广播 AI 状态变化。
@@ -403,7 +369,6 @@ func newCoreServices(cfg config.Config, plat *platform, repos *repositories) (*c
 		upload:      uploadService,
 		cluster:     clusterService,
 		ai:          aiService,
-		gitops:      gitopsService,
 		aiGenerator: aiGenerator,
 	}, nil
 }
@@ -516,7 +481,7 @@ func newAgentService(cfg config.Config, plat *platform, repos *repositories, cor
 
 // startBackgroundTasks 创建后台任务共享的取消上下文,启动各类周期任务与 MCP
 // 连接生命周期,并返回统一的停止函数(在关闭流程中调用以取消所有后台任务)。
-func startBackgroundTasks(cfg config.Config, logger *slog.Logger, repos *repositories, core *coreServices, agentService *agentapplication.Service, mcpManager *agentmcp.Manager) func() {
+func startBackgroundTasks(logger *slog.Logger, repos *repositories, core *coreServices, agentService *agentapplication.Service, mcpManager *agentmcp.Manager) func() {
 	// 后台任务共享 authCleanupCtx，关闭时统一取消。
 	authCleanupCtx, stopAuthCleanup := context.WithCancel(context.Background())
 	// 启动 Agent 运行配置监听。
@@ -527,13 +492,6 @@ func startBackgroundTasks(cfg config.Config, logger *slog.Logger, repos *reposit
 	safego.Go(logger, "auth state cleanup", func() { runAuthStateCleanup(authCleanupCtx, logger, repos.authState, repos.captcha) })
 	// 周期恢复重启后遗留的 AI/Agent 运行中状态。
 	safego.Go(logger, "ai state recovery", func() { runAIStateRecovery(authCleanupCtx, logger, core.ai, agentService) })
-	// 仅在配置启用时启动 GitOps actuator:周期把已审批发布单落地为 GitLab MR。
-	// 默认关闭,关闭时已审批发布单停留在 approved,无任何外部副作用。
-	if cfg.GitOps.Actuator.Enabled {
-		safego.Go(logger, "gitops release actuator", func() {
-			runGitopsActuator(authCleanupCtx, logger, core.gitops, cfg.GitOps.Actuator.Interval)
-		})
-	}
 
 	// 启动 MCP 连接生命周期(异步,不阻塞启动)并注入工具来源。server 就绪后经
 	// onReady 触发工具注册表增量重载,把其工具补入对外视图。SetToolProviders 先
@@ -983,7 +941,6 @@ func newAPIHandler(
 	clusterService *clusterapplication.Service,
 	aiService *aiapplication.Service,
 	agentService *agentapplication.Service,
-	gitopsService *gitopsapplication.Service,
 ) (http.Handler, error) {
 	// 生产环境关闭 Gin 调试输出。
 	if cfg.Service.Environment == "production" {
@@ -1067,16 +1024,6 @@ func newAPIHandler(
 	agentHandler := agenthttp.NewHandler(agentService)
 	// 注册 Agent 路由。
 	agenthttp.RegisterRoutes(protectedAPI, agentHandler)
-	// 创建 GitOps handler。
-	gitopsHandler := gitopshttp.NewHandler(gitopsService)
-	// 注入 Flux 状态回流 webhook 的验签密钥(为空时 webhook 端点 fail-closed)。
-	gitopsHandler.SetWebhookSecret(cfg.GitOps.Webhook.Secret)
-	// 注入 GitLab MR webhook 的 X-Gitlab-Token 验签密钥(为空时 fail-closed)。
-	gitopsHandler.SetGitLabWebhookSecret(cfg.GitOps.Webhook.GitLabSecret)
-	// 注册 GitOps 受保护路由。
-	gitopshttp.RegisterRoutes(protectedAPI, gitopsHandler)
-	// 注册 GitOps 公开路由(Flux 回流 webhook,CSRF 豁免,自带 HMAC 验签)。
-	gitopshttp.RegisterPublicRoutes(api, gitopsHandler)
 
 	// handler 从 Gin engine 开始，按需包裹标准 HTTP 中间件。
 	var handler http.Handler = engine
@@ -1194,34 +1141,6 @@ func runAIStateRecovery(ctx context.Context, logger *slog.Logger, aiService *aia
 		case <-ticker.C:
 			// 到达周期后执行恢复。
 			recover()
-		}
-	}
-}
-
-// runGitopsActuator 周期把已审批(approved)发布单落地为 GitLab MR。仅在
-// gitops.actuator.enabled 时由 startBackgroundTasks 启动。单次扫描的并发去重与状态
-// 推进由 service 内部用分布式信号量 + 行级锁保证,这里只负责按周期触发与启动即跑一次。
-func runGitopsActuator(ctx context.Context, logger *slog.Logger, gitopsService *gitopsapplication.Service, interval time.Duration) {
-	// 周期 <=0 时回退到安全默认值,避免 ticker panic。
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	logger.Info("gitops release actuator started", slog.Duration("interval", interval))
-	// 启动后立即处理一次，避免等待首个周期。
-	gitopsService.ActuateApprovedReleases(ctx)
-	// 后续按配置周期处理。
-	ticker := time.NewTicker(interval)
-	// 函数退出时停止 ticker。
-	defer ticker.Stop()
-	// 持续运行直到上下文取消。
-	for {
-		select {
-		case <-ctx.Done():
-			// 应用关闭时退出后台任务。
-			return
-		case <-ticker.C:
-			// 到达周期后执行一轮 actuation。
-			gitopsService.ActuateApprovedReleases(ctx)
 		}
 	}
 }
