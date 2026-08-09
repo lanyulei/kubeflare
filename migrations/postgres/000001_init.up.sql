@@ -149,31 +149,3 @@ CREATE INDEX IF NOT EXISTS idx_cluster_info_delete_time
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_info_name_active
     ON cluster_info (name)
     WHERE delete_time IS NULL;
-
-INSERT INTO iam_user (
-    username,
-    nickname,
-    password,
-    email,
-    phone,
-    avatar,
-    status,
-    created_at,
-    updated_at
-)
-SELECT
-    'admin',
-    'admin',
-    '$2a$12$ped6ldtK7wf2vUg8049AOe.8OxkwBnguQ0E4ttgpUlh.pESkt9fkq',
-    '',
-    '',
-    '',
-    1,
-    NOW(),
-    NOW()
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM iam_user
-    WHERE username = 'admin'
-      AND deleted_at IS NULL
-);

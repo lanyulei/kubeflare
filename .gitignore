@@ -35,6 +35,7 @@ Thumbs.db
 configs/config.yaml
 configs/config.yml
 !configs/config.example.yaml
+configs/config.local.yaml
 
 # Environment
 .env

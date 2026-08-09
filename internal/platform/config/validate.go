@@ -87,6 +87,16 @@ func Validate(cfg Config) error {
 	return nil
 }
 
+func ValidateForAdmin(cfg Config) error {
+	if !cfg.Database.Enabled {
+		return errors.New("database.enabled is required for admin credential management")
+	}
+	if err := validateDatabaseConfig(cfg.Database); err != nil {
+		return err
+	}
+	return validateRedisConfig(cfg.Redis)
+}
+
 func validateAIConfig(cfg AIConfig) error {
 	if !cfg.Enabled {
 		return nil

@@ -14,6 +14,14 @@ import (
 )
 
 func Load(configPath string, flags *pflag.FlagSet) (Config, error) {
+	return load(configPath, flags, Validate)
+}
+
+func LoadForAdmin(configPath string, flags *pflag.FlagSet) (Config, error) {
+	return load(configPath, flags, ValidateForAdmin)
+}
+
+func load(configPath string, flags *pflag.FlagSet, validate func(Config) error) (Config, error) {
 	k := koanf.New(".")
 	cfg := Default()
 
@@ -51,7 +59,7 @@ func Load(configPath string, flags *pflag.FlagSet) (Config, error) {
 		return Config{}, fmt.Errorf("unmarshal config: %w", err)
 	}
 
-	if err := Validate(cfg); err != nil {
+	if err := validate(cfg); err != nil {
 		return Config{}, err
 	}
 
