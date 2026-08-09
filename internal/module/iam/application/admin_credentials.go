@@ -14,7 +14,7 @@ import (
 
 const (
 	ADMIN_USERNAME                 = "admin"
-	MIN_ADMIN_PASSWORD_BYTES       = 12
+	MIN_ADMIN_PASSWORD_BYTES       = 8
 	MAX_ADMIN_PASSWORD_BYTES       = 72
 	DEFAULT_SESSION_REVOCATION_TTL = 7 * 24 * time.Hour
 )
@@ -135,7 +135,7 @@ func validateAdminPassword(password string) error {
 	if passwordLength < MIN_ADMIN_PASSWORD_BYTES || passwordLength > MAX_ADMIN_PASSWORD_BYTES {
 		return &sharedErrors.AppError{
 			Code:    sharedErrors.CodeValidation,
-			Message: "password must be between 12 and 72 bytes",
+			Message: "password must be between 8 and 72 bytes",
 			Status:  400,
 		}
 	}
